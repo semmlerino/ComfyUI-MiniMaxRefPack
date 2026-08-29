@@ -212,7 +212,9 @@ class MiniMaxH3ReferencePack:
                                "(0 = off). Never upscales. MiniMax sizes references off "
                                "their SHORT edge, so at ref_image_size=max a wide sheet "
                                "arrives huge and every sampling step pays for it. "
-                               "Reference videos are already capped by the core node.",
+                               "Reference VIDEOS are not covered: they are decoded and "
+                               "cached at source resolution, and the core node resizes "
+                               "them at encode time.",
                 }),
             },
         }

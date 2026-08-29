@@ -1,16 +1,23 @@
-"""Tests for minimax_refpack.media - the pure resample math and the ComfyUI-decoder
-seams (VideoFromFile / nodes_audio.load). comfy_api/comfy_extras are not importable
-outside a ComfyUI process (verified: bare `import comfy_api` raises ModuleNotFoundError
-in this venv), so the seams are monkeypatched at their accessor functions rather than at
-the real (unavailable) module path.
-"""
+"""Tests for minimax_refpack.media - the pure resample math, load_video against REAL
+clips, and the two seams a real file cannot stand in for.
 
-import sys
-import types
+There is no `VideoFromFile` left to fake: the decoder is ours (raw PyAV, one streaming
+pass), so every load_video test below drives it over a genuine container built by
+`tests/conftest.py`'s `write_clip`. That is strictly stronger than the fake it replaces -
+`marker='index'` on a LOSSLESS pixel format paints each source frame with its own index,
+so a selection assertion recovers the exact slot->source mapping out of the emitted
+pixels instead of trusting a stub's bookkeeping.
+
+Two seams remain, for reasons a fixture cannot remove. `_audio_load_fn` reaches
+`comfy_extras.nodes_audio`, which is not importable outside a ComfyUI process (verified:
+a bare `import comfy_extras` raises ModuleNotFoundError in this venv). `_open_container`
+is wrapped in the thumbnail seek tests for the reason `_FakeAv`'s docstring gives.
+"""
 
 import pytest
 
 from minimax_refpack import media
+from tests.conftest import marker_index
 
 
 # ---- resample_indices -------------------------------------------------------
@@ -67,82 +74,51 @@ def test_zero_or_negative_fps_is_rejected():
 
 
 # ---- load_video's >=5-frame guard and passthrough ---------------------------
+# Every one of these drives the real decoder over a real container. `write_clip` gives
+# exact control over both `n` and `fps`, which is what lets each expected frame count
+# below be a single unambiguous number rather than a range.
 
 
-class _ListFrames:
-    """Fake images tensor: .shape[0] + fancy list-indexing, no torch required."""
+def test_load_video_raises_when_resampled_clip_is_too_short(clip):
+    # 3 frames at 24fps -> 3 frames at the 24fps target, under the 5-frame floor
+    path = clip("clip_too_short", n=3, fps=24)
 
-    def __init__(self, n, first=0):
-        self.shape = (n,)
-        self._items = list(range(first, first + n))
-
-    def __getitem__(self, idx):
-        return [self._items[i] for i in idx]
-
-
-def _fake_video_from_file(images_n, frame_rate, audio=None):
-    class FakeVideoFromFile:
-        def __init__(self, path, *, start_time=0, duration=0):
-            self.path = path
-            self.start_time = start_time
-            self.duration = duration
-
-        def get_components(self):
-            import math
-
-            first = max(0, math.ceil(self.start_time * frame_rate - 1e-9))
-            stop = images_n
-            if self.duration:
-                stop = min(
-                    images_n,
-                    math.ceil((self.start_time + self.duration) * frame_rate - 1e-9),
-                )
-
-            window_audio = (
-                media._slice_audio(
-                    audio, [self.start_time, self.start_time + self.duration]
-                )
-                if audio is not None and self.duration
-                else audio
-            )
-
-            class FakeComponents:
-                def __init__(self):
-                    self.images = _ListFrames(max(0, stop - first), first=first)
-                    self.frame_rate = frame_rate
-                    self.audio = window_audio
-
-            return FakeComponents()
-
-    return FakeVideoFromFile
-
-
-def test_load_video_raises_when_resampled_clip_is_too_short(monkeypatch):
-    # 3 frames at 24fps -> 3 frames at target 24fps, under the 5-frame floor
-    monkeypatch.setattr(media, "_video_from_file_cls", lambda: _fake_video_from_file(3, 24))
     with pytest.raises(ValueError) as exc:
-        media.load_video("clip_too_short.mp4")
-    assert "clip_too_short.mp4" in str(exc.value)
+        media.load_video(path)
+
+    assert "clip_too_short.mkv" in str(exc.value)
 
 
-def test_load_video_does_not_pad_short_clips_up_to_five(monkeypatch):
-    # 4 frames is still under 5 - must raise, never silently duplicate up to 5
-    monkeypatch.setattr(media, "_video_from_file_cls", lambda: _fake_video_from_file(4, 24))
-    with pytest.raises(ValueError):
-        media.load_video("clip.mp4")
+def test_load_video_does_not_pad_short_clips_up_to_five(clip):
+    # 4 frames is still under 5 - must raise, never silently duplicate up to 5. The
+    # count in the message is what proves nothing was padded on the way to the check.
+    path = clip("four", n=4, fps=24)
+
+    with pytest.raises(ValueError) as exc:
+        media.load_video(path)
+
+    assert "has only 4 frame(s)" in str(exc.value)
 
 
-def test_load_video_passes_through_resampled_frames_and_audio(monkeypatch):
-    audio = {"waveform": "wf", "sample_rate": 48000}
-    monkeypatch.setattr(media, "_video_from_file_cls", lambda: _fake_video_from_file(30, 30, audio))
-    frames, out_audio = media.load_video("clip.mp4", target_fps=24)
-    assert len(frames) == 24
-    assert out_audio is audio
+def test_load_video_passes_through_resampled_frames_and_audio(clip):
+    # 30 frames at 30fps is 1.0s, which is 24 frames at the 24fps target - a count the
+    # source does not have, so a decoder that skipped the resample would emit 30.
+    path = clip("sound", n=30, fps=30, audio="pcm_s16le")
+
+    frames, audio = media.load_video(path, target_fps=24)
+
+    assert frames.shape == (24, 48, 64, 3)  # write_clip's default size is (w=64, h=48)
+    assert float(frames.min()) >= 0.0 and float(frames.max()) <= 1.0
+    assert audio is not None
+    assert audio["sample_rate"] == 44100
+    assert audio["waveform"].shape == (1, 1, 44100)  # the clip's own 1.0s of sound
 
 
-def test_load_video_with_no_soundtrack_returns_none_audio(monkeypatch):
-    monkeypatch.setattr(media, "_video_from_file_cls", lambda: _fake_video_from_file(30, 30, None))
-    _frames, out_audio = media.load_video("clip.mp4")
+def test_load_video_with_no_soundtrack_returns_none_audio(clip):
+    path = clip("silent", n=30, fps=30)
+
+    _frames, out_audio = media.load_video(path)
+
     assert out_audio is None
 
 
@@ -215,125 +191,101 @@ def test_crop_box_never_collapses_to_zero_area():
 # ---- load_video trim ----------------------------------------------------------
 
 
-def test_load_video_passes_trim_window_to_decoder(monkeypatch):
-    calls = {}
+def test_load_video_passes_trim_window_to_decoder(clip):
+    # The window is what the decoder reads, not the file. 7s at 24fps is 168 source
+    # frames; [2.0, 6.5) is 108 of them, and the same clip loaded whole is the control
+    # that says so - a decoder that ignored the trim would emit 168 for both.
+    path = clip("window", n=168, fps=24, pix_fmt="rgb24")
 
-    class Components:
-        images = _ListFrames(108)
-        frame_rate = 24
-        audio = None
+    windowed, _ = media.load_video(path, trim=[2.0, 6.5])
+    whole, _ = media.load_video(path)
 
-    class WindowedVideoFromFile:
-        def __init__(self, path, *, start_time=0, duration=0):
-            calls.update(path=path, start_time=start_time, duration=duration)
-
-        def get_components(self):
-            return Components()
-
-    monkeypatch.setattr(media, "_video_from_file_cls", lambda: WindowedVideoFromFile)
-
-    frames, _ = media.load_video("clip.mp4", trim=[2.0, 6.5])
-
-    assert calls == {"path": "clip.mp4", "start_time": 2.0, "duration": 4.5}
-    assert len(frames) == 108
+    assert len(whole) == 168
+    assert len(windowed) == 108
 
 
-def test_load_video_trim_selects_the_source_window(monkeypatch):
-    # 10s @ 24fps, trimmed to [2.0, 6.5): source frames 48..155 (start-inclusive,
-    # end-exclusive), resampled 24->24 so all 108 survive, in order.
-    monkeypatch.setattr(media, "_video_from_file_cls", lambda: _fake_video_from_file(240, 24))
-    frames, _ = media.load_video("clip.mp4", trim=[2.0, 6.5])
-    assert len(frames) == 108
-    assert frames[0] == 48
-    assert frames[-1] == 155
+def test_load_video_trim_selects_the_source_window(clip):
+    # 7s @ 24fps, trimmed to [2.0, 6.5): source frames 48..155 (start-inclusive,
+    # end-exclusive), resampled 24->24 so all 108 survive, in order. `marker='index'` on
+    # a lossless format means every emitted frame still names the source frame it was
+    # filled from, so this asserts the whole slot->source mapping, not two endpoints.
+    path = clip("window", n=168, fps=24, pix_fmt="rgb24")
+
+    frames, _ = media.load_video(path, trim=[2.0, 6.5])
+
+    assert [marker_index(f) for f in frames] == list(range(48, 156))
 
 
-def test_load_video_trim_then_resamples_the_span(monkeypatch):
-    # 60fps source, [1.0, 3.0) -> 120 source frames -> 48 output frames at 24fps,
-    # all drawn from inside the window.
-    monkeypatch.setattr(media, "_video_from_file_cls", lambda: _fake_video_from_file(600, 60))
-    frames, _ = media.load_video("clip.mp4", trim=[1.0, 3.0])
-    assert len(frames) == 48
-    assert min(frames) >= 60
-    assert max(frames) <= 179
+def test_load_video_trim_then_resamples_the_span(clip):
+    # 60fps source, [1.0, 3.0) -> 120 source frames -> 48 output frames at 24fps: the
+    # span's own 2.0s duration, preserved. Every one is drawn from inside the window.
+    path = clip("fast", n=240, fps=60, pix_fmt="rgb24")
+
+    frames, _ = media.load_video(path, trim=[1.0, 3.0])
+
+    assert len(frames) == 48  # 2.0s at 24fps, not the window's 120 source frames
+    sources = [marker_index(f) for f in frames]
+    assert sources == sorted(sources)
+    assert min(sources) >= 60 and max(sources) <= 179
 
 
-def test_load_video_too_short_trim_raises_naming_file_and_window(monkeypatch):
-    monkeypatch.setattr(media, "_video_from_file_cls", lambda: _fake_video_from_file(240, 24))
+def test_load_video_too_short_trim_raises_naming_file_and_window(clip):
+    path = clip("short_trim", n=48, fps=24)
+
     with pytest.raises(ValueError) as exc:
-        media.load_video("clip.mp4", trim=[1.0, 1.1])
+        media.load_video(path, trim=[1.0, 1.1])
+
     msg = str(exc.value)
-    assert "clip.mp4" in msg
+    assert "short_trim.mkv" in msg
     assert "1.00" in msg and "1.10" in msg
 
 
-def test_load_video_trim_entirely_outside_the_clip_raises(monkeypatch):
-    monkeypatch.setattr(media, "_video_from_file_cls", lambda: _fake_video_from_file(24, 24))
-    with pytest.raises(ValueError):
-        media.load_video("clip.mp4", trim=[5.0, 9.0])
+def test_load_video_trim_entirely_outside_the_clip_raises(clip):
+    path = clip("onesec", n=24, fps=24)  # 1.0s
+
+    with pytest.raises(ValueError) as exc:
+        media.load_video(path, trim=[5.0, 9.0])
+
+    assert "0 frame(s)" in str(exc.value)
 
 
-def test_load_video_trim_slices_the_soundtrack_to_the_same_window(monkeypatch):
-    import numpy as np
+def test_load_video_trim_slices_the_soundtrack_to_the_same_window(clip):
+    # The soundtrack has to be cut to the SAME window as the frames or it drifts out of
+    # sync with them. write_clip's audio is a ramp - sample j carries j/N - so a decoded
+    # sample names its own position in the source and the head of the window is
+    # checkable, not just its length.
+    path = clip("audiotrim", n=120, fps=24, audio="pcm_s16le")  # 5.0s @ 44100
 
-    sr = 1000
-    audio = {
-        "waveform": np.arange(10 * sr, dtype=np.float32).reshape(1, 1, -1),
-        "sample_rate": sr,
-    }
-    monkeypatch.setattr(media, "_video_from_file_cls", lambda: _fake_video_from_file(240, 24, audio))
-    _frames, out = media.load_video("clip.mp4", trim=[2.0, 6.5])
-    assert out["sample_rate"] == sr
-    assert out["waveform"].shape[-1] == int(6.5 * sr) - int(2.0 * sr)
-    assert out["waveform"][0, 0, 0] == int(2.0 * sr)
-    # the source dict is not mutated in place
-    assert audio["waveform"].shape[-1] == 10 * sr
+    _whole_frames, whole = media.load_video(path)
+    _frames, out = media.load_video(path, trim=[1.0, 3.5])
+
+    assert whole is not None and out is not None
+    assert whole["waveform"].shape[-1] == 5 * 44100
+    assert float(whole["waveform"][0, 0, 0]) == pytest.approx(0.0, abs=1e-3)
+
+    assert out["sample_rate"] == 44100
+    assert out["waveform"].shape[-1] == int(2.5 * 44100)
+    # 1.0s into a 5.0s ramp is 0.2; pcm_s16le quantises at ~3e-5.
+    assert float(out["waveform"][0, 0, 0]) == pytest.approx(0.2, abs=1e-3)
 
 
 # ---- load_video crop ----------------------------------------------------------
 
 
-def _fake_video_numpy(n, frame_rate, h, w, audio=None):
-    import numpy as np
+def test_load_video_crop_crops_every_frame(clip):
+    # 60x40 source; crop [0.5, 0.25, 0.5, 0.5] -> _crop_box (30, 10, 60, 30) = 30x20.
+    path = clip("crop", n=24, fps=24, size=(60, 40))
 
-    class FakeVideoFromFile:
-        def __init__(self, path, *, start_time=0, duration=0):
-            self.path = path
-            self.start_time = start_time
-            self.duration = duration
+    frames, _ = media.load_video(path, crop=[0.5, 0.25, 0.5, 0.5])
 
-        def get_components(self):
-            import math
-
-            first = max(0, math.ceil(self.start_time * frame_rate - 1e-9))
-            stop = n
-            if self.duration:
-                stop = min(
-                    n, math.ceil((self.start_time + self.duration) * frame_rate - 1e-9)
-                )
-
-            class FakeComponents:
-                def __init__(self):
-                    self.images = np.zeros(
-                        (max(0, stop - first), h, w, 3), dtype=np.float32
-                    )
-                    self.frame_rate = frame_rate
-                    self.audio = audio
-
-            return FakeComponents()
-
-    return FakeVideoFromFile
-
-
-def test_load_video_crop_crops_every_frame(monkeypatch):
-    monkeypatch.setattr(media, "_video_from_file_cls", lambda: _fake_video_numpy(24, 24, 40, 60))
-    frames, _ = media.load_video("clip.mp4", crop=[0.5, 0.25, 0.5, 0.5])
     assert frames.shape == (24, 20, 30, 3)
 
 
-def test_load_video_crop_and_trim_compose(monkeypatch):
-    monkeypatch.setattr(media, "_video_from_file_cls", lambda: _fake_video_numpy(240, 24, 40, 60))
-    frames, _ = media.load_video("clip.mp4", crop=[0.0, 0.0, 0.5, 0.5], trim=[2.0, 6.5])
+def test_load_video_crop_and_trim_compose(clip):
+    path = clip("croptrim", n=168, fps=24, size=(60, 40))
+
+    frames, _ = media.load_video(path, crop=[0.0, 0.0, 0.5, 0.5], trim=[2.0, 6.5])
+
     assert frames.shape == (108, 20, 30, 3)
 
 
@@ -386,9 +338,21 @@ def test_thumbnail_png_applies_the_crop(tmp_path):
 
 
 class _FakeAv:
-    """Stub of the av surface thumbnail_png's video branch touches. av is not
-    installed in this venv (same reason the ComfyUI decoders are stubbed), so the
-    seek arithmetic is proven against a recorder instead."""
+    """Stub of the av surface thumbnail_png's video branch touches.
+
+    NOT because av is missing - it is a hard dev dependency and is installed, and every
+    load_video test above runs on real containers. What this buys is the SEEK, which a
+    real decode cannot show: `thumbnail_png` is supposed to seek to the requested pts in
+    the stream's own time base and then decode only the GOP between the landed keyframe
+    and the target, and a decoder that ignored the seek entirely and read the clip from
+    frame 0 would return the byte-identical image. The recorded `seeks`/`decoded` lists
+    are the only instrument that can tell the two apart, so the three tests below assert
+    on them and not just on the pixel that comes back.
+
+    Deliberately NOT grown into a decoder fake for load_video: it has no `demux()`, no
+    packet layer, no `to_ndarray()` and no frame `format`, all of which the streaming
+    decoder uses, so it would only ever raise AttributeError there.
+    """
 
     def __init__(self, frame_times, time_base):
         from fractions import Fraction
@@ -400,14 +364,19 @@ class _FakeAv:
         self.decoded = []
         self._seek_to = 0
 
+        stream_time_base = Fraction(1, time_base)
+
         class FakeStream:
-            pass
+            time_base = stream_time_base
 
         stream = FakeStream()
-        stream.time_base = Fraction(1, time_base)
         self.stream = stream
 
         class FakeFrame:
+            # `rotation` because thumbnail_png rotates into DISPLAY orientation before
+            # the crop; 0 is "no display matrix", which is what these fixtures are.
+            rotation = 0
+
             def __init__(self, pts, color):
                 self.pts = pts
                 self._color = color
@@ -455,9 +424,21 @@ class _FakeAv:
 
 
 def _install_fake_av(monkeypatch, fake):
-    import sys
+    """Patch `media._open_container` - the seam media.py's own docstring names for this.
 
-    monkeypatch.setitem(sys.modules, "av", fake)
+    The `setitem(sys.modules, "av", fake)` this replaces does still reach thumbnail_png,
+    measured: `_open_container` (media.py:123-135) does a function-LOCAL `import av`,
+    which re-reads sys.modules on every call. But it works only for as long as that
+    import stays function-local, and it substitutes av for the whole process rather than
+    for one call site - a test that also touched a real container would get the stub.
+    Patching the named accessor is what media.py asks for and depends on nothing.
+
+    A fake that is never reached makes all three tests below vacuous, so each asserts on
+    `fake.seeks`/`fake.decoded`, which stay empty unless the fake really was the
+    container. Verified red: with this body stubbed out, all three fail on real av
+    trying to open the nonexistent 'clip.mp4'.
+    """
+    monkeypatch.setattr(media, "_open_container", fake.open)
 
 
 def test_thumbnail_png_seeks_video_to_at_seconds(monkeypatch):
@@ -488,6 +469,10 @@ def test_thumbnail_png_at_seconds_past_the_end_keeps_the_last_frame(monkeypatch)
 
     out = media.thumbnail_png("clip.mp4", at_seconds=99.0)
 
+    # it did seek past the end and did decode; the target pts is simply never reached,
+    # so the loop keeps the last frame it saw instead of failing the tile
+    assert fake.seeks == [(99 * 90000, fake.stream)]
+    assert fake.decoded == [90000]
     with Image.open(BytesIO(out)) as thumb:
         assert thumb.getpixel((5, 5)) == (0, 128, 0)  # the 1.0s frame (green)
 
@@ -507,18 +492,9 @@ def test_thumbnail_png_without_at_seconds_does_not_seek(monkeypatch):
 # REF_IMAGE_SHORT_EDGE = 2048 at :29), so a wide sheet reaches the VAE enormous at
 # ref_image_size="max". Capping the LONG edge here is the guard.
 #
-# torch is not installed in this venv (the module lazy-imports it, same reason
-# folder_paths and av get stubbed elsewhere in this file), so `fake_torch` stands in
-# with an identity from_numpy - the assertions are all about pixel dimensions, which
-# the numpy array carries unchanged.
-
-
-@pytest.fixture
-def fake_torch(monkeypatch):
-    module = types.ModuleType("torch")
-    module.from_numpy = lambda arr: arr
-    monkeypatch.setitem(sys.modules, "torch", module)
-    return module
+# These run against REAL torch (a dev dependency - see pyproject's `dev` group). The
+# assertions are about pixel dimensions and the 0..1 normalisation, both of which the
+# real `torch.from_numpy` carries through from the numpy array unchanged.
 
 
 def _png(tmp_path, name, size, color="red"):
@@ -529,31 +505,31 @@ def _png(tmp_path, name, size, color="red"):
     return str(p)
 
 
-def test_load_image_caps_the_long_edge(tmp_path, fake_torch):
+def test_load_image_caps_the_long_edge(tmp_path):
     out = media.load_image(_png(tmp_path, "wide.png", (500, 250)), max_edge=200)
 
     assert out.shape[1:3] == (100, 200)  # [1, H, W, 3]
 
 
-def test_load_image_caps_the_long_edge_of_a_tall_reference(tmp_path, fake_torch):
+def test_load_image_caps_the_long_edge_of_a_tall_reference(tmp_path):
     out = media.load_image(_png(tmp_path, "tall.png", (250, 500)), max_edge=200)
 
     assert out.shape[1:3] == (200, 100)
 
 
-def test_load_image_never_upscales_a_small_reference(tmp_path, fake_torch):
+def test_load_image_never_upscales_a_small_reference(tmp_path):
     out = media.load_image(_png(tmp_path, "small.png", (100, 50)), max_edge=2048)
 
     assert out.shape[1:3] == (50, 100)
 
 
-def test_load_image_cap_of_zero_is_off(tmp_path, fake_torch):
+def test_load_image_cap_of_zero_is_off(tmp_path):
     out = media.load_image(_png(tmp_path, "wide.png", (500, 250)), max_edge=0)
 
     assert out.shape[1:3] == (250, 500)
 
 
-def test_load_image_caps_the_cropped_size_not_the_source(tmp_path, fake_torch):
+def test_load_image_caps_the_cropped_size_not_the_source(tmp_path):
     """Crop first, then cap. A crop that already brings the long edge under the cap
     leaves the pixels alone - the cap must never see the pre-crop dimensions."""
     path = _png(tmp_path, "wide.png", (800, 400))
@@ -567,7 +543,7 @@ def test_load_image_caps_the_cropped_size_not_the_source(tmp_path, fake_torch):
     assert capped.shape[1:3] == (200, 200)
 
 
-def test_load_image_cap_keeps_the_pixels_normalised(tmp_path, fake_torch):
+def test_load_image_cap_keeps_the_pixels_normalised(tmp_path):
     out = media.load_image(_png(tmp_path, "wide.png", (600, 300), (255, 0, 0)), max_edge=100)
 
     assert out.min() >= 0.0 and out.max() <= 1.0
@@ -580,7 +556,7 @@ def _mmrp_lines(caplog):
     return [r.getMessage() for r in caplog.records if r.name == "MiniMaxRefPack"]
 
 
-def test_load_image_logs_what_it_emitted(tmp_path, fake_torch, caplog):
+def test_load_image_logs_what_it_emitted(tmp_path, caplog):
     import logging
 
     p = _png(tmp_path, "wide.png", (500, 250))
@@ -595,28 +571,29 @@ def test_load_image_logs_what_it_emitted(tmp_path, fake_torch, caplog):
     assert "ms=" in line
 
 
-def test_load_video_logs_the_trim_and_what_survived_it(monkeypatch, caplog):
+def test_load_video_logs_the_trim_and_what_survived_it(clip, caplog):
     import logging
 
-    monkeypatch.setattr(media, "_video_from_file_cls", lambda: _fake_video_from_file(240, 24))
+    path = clip("window", n=168, fps=24)   # 7s @ 24fps; [2.0, 6.5) leaves 108 frames
 
     with caplog.at_level(logging.INFO, logger="MiniMaxRefPack"):
-        media.load_video("clip.mp4", trim=[2.0, 6.5])
+        media.load_video(path, trim=[2.0, 6.5])
 
     line = next(ln for ln in _mmrp_lines(caplog) if "event=load_video" in ln)
+    assert "file=window.mkv" in line
     assert "trim=[2,6.5]" in line
     assert "frames=108" in line
     assert "ms=" in line
 
 
-def test_a_failed_load_is_logged_as_a_failure(monkeypatch, caplog):
+def test_a_failed_load_is_logged_as_a_failure(clip, caplog):
     import logging
 
-    monkeypatch.setattr(media, "_video_from_file_cls", lambda: _fake_video_from_file(240, 24))
+    path = clip("short_trim", n=48, fps=24)
 
     with caplog.at_level(logging.INFO, logger="MiniMaxRefPack"):
         with pytest.raises(ValueError):
-            media.load_video("clip.mp4", trim=[1.0, 1.1])   # under 5 frames at 24fps
+            media.load_video(path, trim=[1.0, 1.1])   # under 5 frames at 24fps
 
     line = next(ln for ln in _mmrp_lines(caplog) if "event=load_video" in ln)
     assert "ok=false" in line and "error=ValueError" in line

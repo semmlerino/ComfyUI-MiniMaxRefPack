@@ -14,9 +14,15 @@ plain `pytest tests/test_media.py` runs without ComfyUI installed (folder_paths,
 comfy_api, comfy_extras are not importable outside a ComfyUI process - verified: a bare
 `import folder_paths` in this venv raises ModuleNotFoundError).
 
-The two `_video_from_file_cls` / `_audio_load_fn` indirections below exist so tests can
-monkeypatch the ComfyUI-side decoder without comfy_api/comfy_extras being installed at
-all - they patch the accessor, not the (unimportable) real module.
+Video decoding is ours, on raw PyAV, and streams: one demux pass selects, rotates, crops
+and fills the output tensor in place. `VideoFromFile` materialised the whole trimmed
+window as a list of per-frame tensors, `torch.stack`ed it, and then `frames[indices]`
+copied it again - measured at 2.7-2.8x the final tensor in peak host RAM, which
+extrapolates to ~19 GB for a 10s 1080p reference on a 30 GB box.
+
+The `_open_container` / `_audio_load_fn` indirections below exist so tests can substitute
+or instrument the decoder without comfy_api/comfy_extras being installed at all - they
+patch the accessor, not the (unimportable) real module.
 """
 
 from __future__ import annotations
@@ -42,7 +48,41 @@ def resample_indices(n_src: int, src_fps: float, target_fps: int = 24) -> list[i
     if src_fps <= 0:
         raise ValueError(f"source fps must be positive, got {src_fps!r}")
     n_out = max(1, round(n_src * target_fps / src_fps))
-    return [min(max(round(i * src_fps / target_fps), 0), n_src - 1) for i in range(n_out)]
+    return [min(max(_source_index(i, src_fps, target_fps), 0), n_src - 1) for i in range(n_out)]
+
+
+def _source_index(i: int, src_fps: float, target_fps: int) -> int:
+    """Which SOURCE frame output frame `i` reads from, before the end-of-clip clamp.
+
+    Extracted so the streaming decoder's cursor cannot drift from `resample_indices`,
+    which stays the authority: the decoder asks, for the source frame it has just
+    decoded, how many output slots read it, and that has to be the same rule.
+
+    It does NOT depend on `n_src` - `n_src` only sets `n_out` and clamps the tail - so
+    the selection is prefix-determined and computable while decoding frame `j` from `j`
+    alone. That is what makes one pass possible.
+    """
+    return round(i * src_fps / target_fps)
+
+
+def _capacity_for(n_src: int, src_fps: float, target_fps: int) -> int:
+    """How many output slots the streaming cursor can REACH for `n_src` source frames.
+
+    Not `len(resample_indices(...))`, and the difference is the whole reason this
+    exists. The cursor advances while `_source_index(next_out) <= j`, so its reachable
+    maximum is max{i : _source_index(i) <= n_src-1}, which EXCEEDS n_out for real
+    inputs: 25fps - the library's most common rate, 45 of 175 clips - overruns at
+    n_src = 13, 63, 113, 163, ... (any n_src == 13 mod 50), and 50/59.94/60fps at 11-13.
+    Sized to n_out exactly, that write is out of bounds; with the slack it lands in the
+    tail and `buf[:n_out]` discards it.
+
+    Walked rather than solved in closed form, because `round()` is half-to-even and the
+    inverted inequality is wrong at exactly the ties this has to be right about.
+    """
+    capacity = max(1, round(n_src * target_fps / src_fps))
+    while _source_index(capacity, src_fps, target_fps) <= n_src - 1:
+        capacity += 1
+    return capacity
 
 
 def _crop_box(crop, width: int, height: int) -> tuple[int, int, int, int]:
@@ -68,7 +108,20 @@ def _slice_audio(audio: dict, trim) -> dict:
     dict - callers may still hold the unsliced original."""
     sr = audio["sample_rate"]
     start, end = trim
-    return {"waveform": audio["waveform"][..., int(start * sr):int(end * sr)], "sample_rate": sr}
+    waveform = audio["waveform"]
+    sliced = waveform[..., int(start * sr):int(end * sr)]
+    if sliced.shape[-1] != waveform.shape[-1]:
+        # Detach the window from its source when the slice really truncates: a torch
+        # view (like a numpy one) keeps its WHOLE storage alive, so a 2s window on a ten
+        # minute soundtrack would pin all ten minutes for as long as the MediaCache
+        # entry lives. Same defect the streaming decoder removes, one function along.
+        #
+        # Duck-typed for the same reason `_chunk_to_uint8` is: production always hands
+        # this a torch tensor, and the test stack reaches it with numpy.
+        release = getattr(sliced, "clone", None) or getattr(sliced, "copy", None)
+        if release is not None:
+            sliced = release()
+    return {"waveform": sliced, "sample_rate": sr}
 
 
 def _guess_kind(path: str) -> str:
@@ -80,11 +133,19 @@ def _guess_kind(path: str) -> str:
     return "image"
 
 
-def _video_from_file_cls():
-    """Indirection point so tests can substitute a fake without comfy_api installed."""
-    from comfy_api.latest._input_impl.video_types import VideoFromFile
+def _open_container(path: str):
+    """`av.open`, reached through a MODULE-LEVEL name so a test can wrap it.
 
-    return VideoFromFile
+    A function-local `import av; av.open(...)` is not patchable - `media.av` would not
+    exist - and the pre-roll/trim assertions need to count container opens, seek offsets
+    and decoded frames. Correct output does not prove bounded work: a decoder that
+    ignores the trim, reads to EOF and slices afterwards produces a byte-identical
+    tensor and the right `src_frames`, and the open/decode counts are the only
+    instrument that can tell the two apart.
+    """
+    import av
+
+    return av.open(path)
 
 
 def _audio_load_fn():
@@ -150,9 +211,9 @@ def load_audio(path: str, trim=None) -> dict:
 def load_video(path: str, target_fps: int = 24, crop=None, trim=None):
     """(frames [N,H,W,3] resampled to target_fps, audio dict or None).
 
-    CU/comfy_api/latest/_input_impl/video_types.py:118 VideoFromFile.get_components().
-    `.audio` is already built as {"waveform","sample_rate"} (video_types.py:445-448),
-    the same shape core AUDIO sockets use, so it's passed through unchanged.
+    Decoded by `_decode_pass`, not by ComfyUI. The audio dict is BUILT here, to the
+    {"waveform","sample_rate"} shape core AUDIO sockets use (the shape contract is still
+    video_types.py:445-448) - so getting it right is ours, not inherited.
 
     `trim` = [start, end] seconds. Cut on SOURCE frames first - a source frame is kept
     when its timestamp i/src_fps lands in [start, end) - then the usual resample runs
@@ -171,41 +232,602 @@ def load_video(path: str, target_fps: int = 24, crop=None, trim=None):
         return _decode_video(path, target_fps, crop, trim, fields)
 
 
-def _decode_video(path, target_fps, crop, trim, fields):
-    """The body of load_video. Split out only so the timing/logging wrapper above stays
-    a plain `with` block instead of wrapping 30 lines."""
-    video_cls = _video_from_file_cls()
+# ---- the streaming video decoder ---------------------------------------------------
+
+
+class DecodeBudgetExceeded(ValueError):
+    """A reference video whose decoded tensor would exceed the decode budget.
+
+    `ValueError` is the base so callers already catching it keep working, and
+    `logs.timed`'s failure branch records `error=DecodeBudgetExceeded`. The message
+    carries the stable token `decode budget` so a test has something to match that
+    prose cannot drift away from.
+    """
+
+
+# The largest tensor one reference video may decode to. 8 GiB clears the largest
+# legitimate case in the library by a wide margin - a 10s 1080p window is 5.6 GiB - and
+# sits under what this box could finish anyway (30 GB total, ~20 GB routinely in use).
+# Without a ceiling, a stream with no `average_rate` falls to Fraction(1)
+# (video_types.py:437), making n_out 24x n_src, and the failure arrives as an opaque
+# MemoryError or an OOM kill rather than as a named error naming the file.
+_MAX_DECODE_BYTES = 8.0 * 2**30
+_DECODE_BUDGET_ENV = "MINIMAX_REFPACK_MAX_DECODE_GIB"
+
+_decode_budget_cache: float | None = None
+
+
+def _reset_decode_budget() -> None:
+    """Drop the parsed budget so the next read re-consults the environment.
+
+    The parse is cached at first use rather than at import (a test has to be able to set
+    the variable), and a cache without this seam makes a parametrised matrix false-green:
+    seven env values in one session would all read the first one's answer and six cases
+    would pass against a stale limit while proving nothing.
+    """
+    global _decode_budget_cache
+    _decode_budget_cache = None
+
+
+def _decode_budget() -> float:
+    """The decode ceiling in bytes, parsed from the environment once per process."""
+    global _decode_budget_cache
+    if _decode_budget_cache is None:
+        import os
+
+        _decode_budget_cache = _parse_decode_budget(os.environ.get(_DECODE_BUDGET_ENV))
+    return _decode_budget_cache
+
+
+def _parse_decode_budget(raw) -> float:
+    """`MINIMAX_REFPACK_MAX_DECODE_GIB` (GiB, float) -> a byte ceiling, or the default.
+
+    The parsed float AND the scaled byte value are both checked, and the second check is
+    not redundant: `inf` parses and is positive, which is why the predicate is
+    `isfinite and > 0` rather than `> 0`; and `1e308` passes THAT check while
+    `1e308 * 2**30` is `inf`, which would silently disable every `bytes > limit`
+    comparison one layer down. Anything rejected is warned about and the default stands.
+    """
+    if raw is None or not str(raw).strip():
+        return _MAX_DECODE_BYTES
+    try:
+        gib = float(raw)
+    except ValueError:
+        logs.warn("decode_budget_ignored", value=str(raw), reason="not a number")
+        return _MAX_DECODE_BYTES
+    if not (math.isfinite(gib) and gib > 0):
+        logs.warn("decode_budget_ignored", value=str(raw), reason="not a positive finite size")
+        return _MAX_DECODE_BYTES
+    limit = gib * 2**30
+    if not math.isfinite(limit):
+        logs.warn("decode_budget_ignored", value=str(raw), reason="overflows to infinity in bytes")
+        return _MAX_DECODE_BYTES
+    return limit
+
+
+def _rotation_k(frame) -> int:
+    """A frame's display rotation as quarter-turns, ComfyUI's own spelling.
+
+    `// 90` is floor division verbatim, and PyAV reports rotation signed in (-180, 180],
+    so 270 arrives as -90 and floors to -1; `np.rot90` and PIL's `rotate` both take that
+    as three turns, and `% 4` is applied only where an index is wanted.
+
+    ONE definition, because `probe()`, `thumbnail_png()` and the decoder must agree about
+    which way is up - their docstrings claim exactly that - and three copies of the rule
+    would let them diverge silently.
+    """
+    return int(round(frame.rotation // 90)) if frame.rotation else 0
+
+
+def _image_format_for(frame) -> tuple[str, bool, bool]:
+    """(to_ndarray format, frame carries alpha, needs /255) - video_types.py:356-376.
+
+    The ladder's branch point. `yuvj420p`, `yuvj422p`, `yuvj444p`, `rgb24`, `rgba` and
+    `pal8` decode to 8-bit rgb24/rgba and get divided by 255; EVERYTHING else decodes to
+    gbrpf32le/gbrapf32le already in 0..1, and only that second group ever reaches
+    `align_graph`. Library clips are plain `yuv420p`, so the float path is production's.
+
+    Its own function because `pal8` - the one format that takes the alpha branch without
+    having an alpha COMPONENT - has no buildable video fixture in this FFmpeg build
+    (every encoder that could carry it refuses the pix_fmt, and the gif decoder hands
+    back bgra), so a unit test on a stub frame is the only thing that can reach it.
+
+    The `or name == "pal8"` sits inside the comprehension rather than beside it so a
+    format with no components behaves exactly as ComfyUI's loop does.
+    """
+    name = frame.format.name
+    alpha = any(comp.is_alpha or name == "pal8" for comp in frame.format.components)
+    if name in ("yuvj420p", "yuvj422p", "yuvj444p", "rgb24", "rgba", "pal8"):
+        return ("rgba" if alpha else "rgb24"), alpha, True
+    return ("gbrapf32le" if alpha else "gbrpf32le"), alpha, False
+
+
+class _FrameConverter:
+    """One decoded frame -> the [h, w, 3] array a slot is filled from.
+
+    video_types.py:356-406 a frame at a time instead of appended to a list: format
+    decision on the first kept frame, the 32-alignment filter graph, rotation, then the
+    alpha drop. The scale is reported rather than applied, because it belongs on the
+    tensor. Retained state is one filter graph.
+    """
+
+    def __init__(self, time_base):
+        self._time_base = time_base
+        self._image_format: str | None = None
+        self._alpha = False
+        self.scale = False
+        self._align = None
+
+    def convert(self, frame):
+        import numpy as np
+
+        if self._image_format is None:
+            self._image_format, self._alpha, self.scale = _image_format_for(frame)
+
+        if self._image_format in ("gbrpf32le", "gbrapf32le") and frame.width % 32 != 0:
+            img = np.ascontiguousarray(
+                self._aligned(frame).to_ndarray(format=self._image_format)[
+                    : frame.height, : frame.width
+                ]
+            )
+        else:
+            img = frame.to_ndarray(format=self._image_format)
+
+        if frame.rotation != 0:
+            img = np.rot90(img, k=_rotation_k(frame), axes=(0, 1)).copy()
+        if self._alpha:
+            img = img[..., :3]
+        return img
+
+    def _aligned(self, frame):
+        """Pad to a multiple of 32 and smear the border, video_types.py:381-397.
+
+        Not cosmetic: on a 66x34 frame, skipping it differs by max 0.372, and 56 of the
+        172 clips in the library are not a multiple of 32 wide.
+
+        The graph is built from the FIRST frame's format, so a mid-stream pix_fmt change
+        fails on `push()`. That is ComfyUI's bug, reproduced deliberately rather than
+        diverged from - the whole decoder is asserted against it frame for frame.
+        """
+        import av
+
+        if self._align is None:
+            pad_w = ((frame.width + 31) // 32) * 32
+            pad_h = ((frame.height + 31) // 32) * 32
+            graph = av.filter.Graph()
+            source = graph.add_buffer(
+                width=frame.width, height=frame.height,
+                format=frame.format.name, time_base=self._time_base,
+            )
+            pad = graph.add("pad", f"{pad_w}:{pad_h}:0:0")
+            fill = graph.add(
+                "fillborders",
+                f"left=0:right={pad_w - frame.width}:top=0:"
+                f"bottom={pad_h - frame.height}:mode=smear",
+            )
+            sink = graph.add("buffersink")
+            source.link_to(pad)
+            pad.link_to(fill)
+            fill.link_to(sink)
+            graph.configure()
+            self._align = (graph, source, sink)
+        self._align[1].push(frame)
+        return self._align[2].pull()
+
+
+class _FrameSink:
+    """The output tensor, filled in place.
+
+    Over-allocating is free in RSS - a torch CPU tensor's pages are not faulted in until
+    they are written (measured on this host: an 8.05 GB `torch.empty` added 0.001 GB
+    RSS, touching 0.74 GB of it added exactly 0.736 GB, and freeing returned it all) -
+    which is what lets the capacity be an over-estimate instead of a growing buffer.
+    Grow-and-copy would cost 2x the written prefix at the growth point, reintroducing
+    the multiplier this whole change exists to remove.
+
+    The frames are written already cropped, so the storage behind the returned tensor is
+    crop-sized. Filling a full-frame buffer and returning a crop VIEW would satisfy every
+    pixel assertion and every RSS budget while pinning full-frame storage for the
+    lifetime of the MediaCache entry - which is precisely the defect being removed.
+    """
+
+    def __init__(self, capacity: int, height: int, width: int, scale: bool):
+        import torch
+
+        # float32 explicitly, never inherited from the first frame: a float64 sink would
+        # satisfy `torch.equal` against the oracle while doubling the tensor and halving
+        # what the byte ceiling's `* 4` is counting.
+        self._buf = torch.empty((capacity, height, width, 3), dtype=torch.float32)
+        self._scale = scale
+        self.capacity = capacity
+        self.filled = 0
+
+    def write(self, img, count: int) -> None:
+        """Broadcast one [h, w, 3] frame into the next `count` slots."""
+        import torch
+
+        tensor = torch.from_numpy(img)
+        if self._scale:
+            tensor = tensor.float().div_(255.0)
+        self._buf[self.filled : self.filled + count] = tensor
+        self.filled += count
+
+    def take(self, n_out: int):
+        return self._buf[:n_out]
+
+
+class _PassResult:
+    """What one demux pass learned. `needs_recount` means the caller must run another."""
+
+    __slots__ = ("sink", "box", "audio", "n_src", "src_fps", "needs_recount", "reason")
+
+    def __init__(self):
+        self.sink = None
+        self.box = None
+        self.audio = None
+        self.n_src = 0
+        self.src_fps = 1.0
+        self.needs_recount = False
+        self.reason: str | None = None
+
+
+def _trim_window(trim) -> tuple[float, float]:
+    """`[start, end]` seconds -> `(start_time, duration)`, ComfyUI's own pair.
+
+    A NEGATIVE start is deliberately NOT reproduced. `get_active_trim_window`
+    (video_types.py:141-145) reads it as an offset from the end; `refs.validate_trim`
+    rejects `start < 0` before it can reach `load_video`, so that branch is unreachable
+    on the real path. Raising beats silently reinterpreting: a direct caller bypassing
+    `validate_trim` would otherwise get end-relative behaviour from one decoder and
+    absolute from the other.
+    """
     if trim is None:
-        source = video_cls(path)
+        return 0.0, 0.0
+    start, end = float(trim[0]), float(trim[1])
+    if start < 0:
+        raise ValueError(
+            f"trim start must be >= 0, got {start} - a negative start is an "
+            "end-relative offset to ComfyUI and is not reproduced here"
+        )
+    return start, end - start
+
+
+def _estimate_source_frames(container, stream, start_time: float, duration: float):
+    """How many source frames the requested window probably holds, from metadata only.
+
+    THE TWO DURATION FIELDS ARE IN DIFFERENT UNITS. `stream.duration` counts in
+    `stream.time_base`; `container.duration` counts in `av.time_base` (microseconds).
+    Multiplying either by `average_rate` without its own conversion is wrong by orders
+    of magnitude and the error is SILENT - the fallbacks absorb it, at the cost of a
+    recount on every clip, which reads as a mysterious performance regression rather
+    than as a bug.
+
+    Allowed to be wrong in either direction; `None` when metadata cannot answer.
+    """
+    import av
+
+    rate = stream.average_rate or stream.guessed_rate
+    if not rate:
+        return None
+    if not start_time and not duration and stream.frames:
+        return int(stream.frames)
+    if stream.duration is not None and stream.time_base:
+        src_seconds = float(stream.duration * stream.time_base)
+    elif container.duration:
+        src_seconds = container.duration / av.time_base
     else:
-        start, end = trim
-        # VideoFromFile seeks to the keyframe before start_time and stops decoding at
-        # duration. Passing the window here avoids materialising the whole source clip
-        # only to throw most of its frames away below.
-        source = video_cls(path, start_time=start, duration=end - start)
-    components = source.get_components()
-    frames = components.images
-    n_src = frames.shape[0]
-    src_fps = float(components.frame_rate)
-    audio = components.audio
+        return None
+    if duration:
+        usable = max(0.0, min(src_seconds, start_time + duration) - start_time)
+    else:
+        usable = max(0.0, src_seconds - start_time)
+    return math.ceil(usable * rate)
+
+
+def _last_decodable_audio_stream(container):
+    """video_types.py:65-74: backwards for the first stream with a codec context.
+
+    NOT `container.streams.audio[-1]`. Streams FFmpeg has no decoder for have no codec
+    context and decoding their packets crashes the process - the iPhone APAC
+    spatial-audio track this helper exists for. The shorthand passes a two-good-track
+    test and then takes the process down on a real file.
+    """
+    streams = container.streams.audio
+    stream = next((s for s in reversed(streams) if s.codec_context is not None), None)
+    if stream is None and len(streams):
+        logs.warn("video_audio_dropped", stage="select", error="no decodable audio stream")
+    return stream
+
+
+def _frame_start_seconds(frame, sample_rate: int) -> float:
+    """When a RESAMPLED audio frame starts, in seconds. `_save_transcoded`'s form (:741-745).
+
+    Two traps, and each one reintroduces the head-trim bug this replaces:
+
+    `frame.time` is the tempting shorthand and is wrong - a frame carrying a pts with no
+    time base yields NaN, `int(NaN)` raises rather than falling back, and every
+    comparison against NaN is false, so a tail check written on it never fires and audio
+    is retained to EOF.
+
+    The fallback must be `Fraction(1, sample_rate)` (video_types.py:561), NOT the
+    stream's time base. `AudioResampler(format='fltp')` REBASES pcm/mp2 pts into
+    1/sample_rate while passing AAC through, so multiplying a rebased pts by mkv's
+    1/1000 under-trims and by mpegts' 1/90000 over-trims. That is exactly the
+    miscalculation being removed, on exactly the containers it targets.
+
+    Its own function because neither state a fallback covers is reachable from a real
+    file: every measured mkv arm comes back out of the resampler carrying
+    `time_base=1/44100`, so an assertion placed on a container fixture could not fail.
+    """
+    from fractions import Fraction
+
+    if frame.pts is None:
+        return 0.0
+    time_base = frame.time_base if frame.time_base else Fraction(1, sample_rate)
+    return float(frame.pts * time_base)
+
+
+def _cropped(img, box):
+    if box is None:
+        return img
+    left, top, right, bottom = box
+    return img[top:bottom, left:right]
+
+
+def _decode_video(path, target_fps, crop, trim, fields):
+    """The body of load_video: one streaming pass, plus an exact second one if needed."""
+    import os
+
+    start_time, duration = _trim_window(trim)
+    result = _decode_pass(
+        path, target_fps, crop, start_time, duration, n_src_hint=None, want_audio=True
+    )
+    if result.needs_recount:
+        if result.reason is not None:
+            logs.warn(
+                "video_decode_recount",
+                file=os.path.basename(path),
+                reason=result.reason,
+                src_frames=result.n_src,
+            )
+        audio = result.audio
+        result = _decode_pass(
+            path, target_fps, crop, start_time, duration,
+            n_src_hint=result.n_src, want_audio=False,
+        )
+        result.audio = audio
+
+    n_src, src_fps = result.n_src, result.src_fps
     fields["src_frames"] = n_src
     fields["fps"] = src_fps
 
+    # On the RESULT, and never on the estimate: the estimate is explicitly allowed to be
+    # wrong, so moving this check onto it would reject valid clips off bad metadata. It
+    # looks like an obvious optimisation, which is why this says so.
     indices = resample_indices(n_src, src_fps, target_fps)
     if len(indices) < 5:
-        duration = (n_src / src_fps) if src_fps else 0.0
+        clip_seconds = (n_src / src_fps) if src_fps else 0.0
         window = f" trimmed to {trim[0]:.2f}-{trim[1]:.2f}s" if trim is not None else ""
         raise ValueError(
             f"reference video {path!r}{window} has only {len(indices)} frame(s) at {target_fps}fps "
-            f"(source: {n_src} frames, {duration:.2f}s) - MiniMax H3 needs at least 5"
+            f"(source: {n_src} frames, {clip_seconds:.2f}s) - MiniMax H3 needs at least 5"
         )
-    out = frames[indices]
-    if crop is not None:
-        left, top, right, bottom = _crop_box(crop, out.shape[2], out.shape[1])
-        out = out[:, top:bottom, left:right, :]
+
+    out = result.sink.take(len(indices))
     fields["frames"] = len(indices)
-    fields["audio"] = audio is not None
-    return out, audio
+    fields["audio"] = result.audio is not None
+    return out, result.audio
+
+
+def _decode_pass(path, target_fps, crop, start_time, duration, *, n_src_hint, want_audio):
+    """One demux pass: select, rotate, crop and fill, reproducing video_types.py:308-448.
+
+    `n_src_hint` is the true source-frame count when a previous pass counted it, else
+    None (the capacity comes from metadata, and may be absent or wrong). A pass with a
+    hint never asks for another.
+    """
+    import av
+    import numpy as np
+    import torch
+
+    result = _PassResult()
+    with _open_container(path) as container:
+        streams = container.streams.video
+        if not streams:
+            raise ValueError(f"no video stream found in {path!r}")
+        video_stream = streams[0]
+        # ONE Fraction -> float conversion. `round(i * Fraction(30000,1001) / 24)` rounds
+        # exactly while the float spelling rounds a double, and they disagree at ties.
+        src_fps = float(video_stream.average_rate) if video_stream.average_rate else 1.0
+        result.src_fps = src_fps
+
+        time_base = video_stream.time_base
+        # int(), not round(): it moves a boundary frame, which changes n_src, which
+        # changes the socket batch size. video_types.py:316-317.
+        start_pts = int(start_time / time_base)
+        end_pts = int((start_time + duration) / time_base)
+        if start_pts != 0:
+            container.seek(start_pts, stream=video_stream)
+
+        capacity = None
+        if n_src_hint is not None:
+            capacity = _capacity_for(n_src_hint, src_fps, target_fps)
+        else:
+            estimate = _estimate_source_frames(container, video_stream, start_time, duration)
+            if estimate is not None:
+                # 25% headroom (floor 8) on top of the reachable count, because the
+                # estimate is metadata and metadata is often a little short. Untouched
+                # slack costs nothing in RSS, while a recount costs a whole second decode
+                # - so the headroom is the cheaper side of that trade by a wide margin.
+                # It stays modest because `vm.overcommit_memory=0` refuses a single
+                # allocation exceeding RAM+swap outright.
+                reachable = _capacity_for(estimate, src_fps, target_fps)
+                capacity = reachable + max(8, reachable // 4)
+        if capacity is None:
+            # No usable metadata: count first, retaining nothing but the soundtrack,
+            # then allocate exactly. Still 1x the final tensor at worst, unlike growing.
+            result.needs_recount = True
+
+        audio_stream = _last_decodable_audio_stream(container) if want_audio else None
+        demuxed = [video_stream] if audio_stream is None else [video_stream, audio_stream]
+        # Falsiness, not `is None`: MPEG-TS carries audio parameters in-band, so a stream
+        # selected before any packet is decoded can present 0 (video_types.py:546 seeds
+        # it that way and branches on `if not sample_rate` at :552). `Fraction(1, None)`
+        # raises TypeError and `Fraction(1, 0)` raises ZeroDivisionError, so an `is None`
+        # check turns a clean "no audio" into a crash on exactly the shape it exists for.
+        sample_rate = 0
+        if audio_stream is not None and audio_stream.codec_context is not None:
+            sample_rate = audio_stream.codec_context.sample_rate or 0
+        resampler = None
+        audio_frames: list = []
+        has_first_audio = False
+
+        converter = _FrameConverter(time_base)
+        sink = None
+        box = None
+        n_seen = 0
+        next_out = 0
+        last_frame = None
+        video_done = False
+        audio_done = audio_stream is None
+
+        for packet in container.demux(*demuxed):
+            if video_done and audio_done:
+                break
+
+            if packet.stream.type == "video":
+                if video_done:
+                    continue
+                try:
+                    for frame in packet.decode():
+                        # Guarded `pts is None`, `_save_transcoded`'s form (:637):
+                        # `get_components_internal` compares unguarded and would TypeError.
+                        if frame.pts is not None and frame.pts < start_pts:
+                            continue
+                        if duration and frame.pts is not None and frame.pts >= end_pts:
+                            video_done = True
+                            break
+
+                        count = 0
+                        while _source_index(next_out + count, src_fps, target_fps) <= n_seen:
+                            count += 1
+                        if count and capacity is not None:
+                            if next_out + count > capacity:
+                                # The estimate was low. Release the buffer and keep
+                                # decoding purely to learn the true n_src.
+                                sink = None
+                                capacity = None
+                                result.needs_recount = True
+                                result.reason = "capacity"
+                            else:
+                                img = converter.convert(frame)
+                                if sink is None:
+                                    sink, box = _build_sink(
+                                        img, capacity, crop, converter.scale,
+                                        path=path, src_fps=src_fps,
+                                        estimated=n_src_hint is None,
+                                    )
+                                    if sink is None:
+                                        capacity = None
+                                        result.needs_recount = True
+                                        result.reason = "budget"
+                                if sink is not None:
+                                    sink.write(_cropped(img, box), count)
+                        # Retained unconditionally: the EOF clamp fills [next_out, n_out)
+                        # from source frame n_src-1, which is not always itself selected
+                        # (src_fps=12, target_fps=24, n_src=12 -> n_out=24, next_out=23).
+                        last_frame = frame
+                        next_out += count
+                        n_seen += 1
+                except av.error.InvalidDataError:
+                    logs.debug("video_decode_error", file=path)
+
+            elif packet.stream.type == "audio":
+                if audio_done:
+                    continue
+                for raw in packet.decode():
+                    if resampler is None:
+                        # Deferred initialisation, not a look-ahead: the rate arrives
+                        # WITH the first frame, so no frame can precede it. This is why
+                        # `probe_audio_params` (video_types.py:76-89) is not used - its
+                        # own docstring says "the caller must seek back afterwards", and
+                        # the seek it needs undone is what would break the one-pass claim.
+                        rate = sample_rate or raw.sample_rate
+                        if not rate:
+                            continue
+                        sample_rate = int(rate)
+                        resampler = av.audio.resampler.AudioResampler(format="fltp")
+                    for frame in resampler.resample(raw):
+                        frame_start = _frame_start_seconds(frame, sample_rate)
+                        if duration and frame_start > start_time + duration:
+                            audio_done = True
+                            break
+                        if not has_first_audio:
+                            to_skip = max(0, int((start_time - frame_start) * sample_rate))
+                            if to_skip < frame.samples:
+                                has_first_audio = True
+                                audio_frames.append(frame.to_ndarray()[..., to_skip:])
+                        else:
+                            audio_frames.append(frame.to_ndarray())
+                    if audio_done:
+                        break
+
+        result.n_src = n_seen
+        result.box = box
+        result.sink = sink
+
+        n_out = len(resample_indices(n_seen, src_fps, target_fps)) if n_seen else 0
+        if sink is not None and last_frame is not None and next_out < n_out:
+            sink.write(_cropped(converter.convert(last_frame), box), n_out - next_out)
+
+        if audio_frames and sample_rate:
+            data = np.concatenate(audio_frames, axis=1)
+            if duration:
+                limit = int(duration * sample_rate)
+                if limit < data.shape[1]:
+                    # .copy(), NOT np.ascontiguousarray: a (1, N) mono buffer sliced to
+                    # (1, M) is still flagged C_CONTIGUOUS - a leading axis of extent 1
+                    # makes its stride irrelevant to the check - so ascontiguousarray
+                    # returns the same VIEW and the whole concatenation stays alive
+                    # behind it. (2, N) stereo does get copied, so the leak is silent on
+                    # exactly the shape most fixtures use.
+                    data = data[..., :limit].copy()
+            result.audio = {
+                "waveform": torch.from_numpy(data).unsqueeze(0),
+                "sample_rate": int(sample_rate),
+            }
+        elif audio_stream is not None and not sample_rate:
+            logs.warn(
+                "video_audio_dropped", stage="decode",
+                error="stream never yielded a frame with a usable sample rate",
+            )
+    return result
+
+
+def _build_sink(img, capacity, crop, scale, *, path, src_fps, estimated):
+    """(sink, crop box), or (None, None) when the capacity busts the decode budget.
+
+    An INFLATED estimate must not reject a valid clip, so a bust on an estimated
+    capacity degrades to the count-first pass and the ceiling is enforced against the
+    true `n_src` on the next one.
+    """
+    height, width = int(img.shape[0]), int(img.shape[1])
+    box = _crop_box(crop, width, height) if crop is not None else None
+    if box is not None:
+        left, top, right, bottom = box
+        height, width = bottom - top, right - left
+
+    nbytes = capacity * height * width * 3 * 4
+    if nbytes > _decode_budget():
+        if estimated:
+            return None, None
+        raise DecodeBudgetExceeded(
+            f"reference video {path!r} exceeds the decode budget: {src_fps:g}fps implies "
+            f"{capacity} frames of {width}x{height}, {nbytes / 2**30:.2f} GiB, against a "
+            f"limit of {_decode_budget() / 2**30:.2f} GiB "
+            f"(raise {_DECODE_BUDGET_ENV} to override)"
+        )
+    return _FrameSink(capacity, height, width, scale), box
 
 
 # ---- one preparation per reference, per build ------------------------------------
@@ -498,6 +1120,26 @@ def _planar_waveform(waveform):
     return np.clip(arr, -1.0, 1.0)
 
 
+def _waveform_channels(waveform) -> int:
+    """How many channels a [1,C,L] / [C,L] / [L] waveform has, WITHOUT building one.
+
+    `_planar_waveform(...).shape[0]` answers the same question and costs a full clipped
+    float32 copy of the whole soundtrack, which is discarded and then rebuilt by
+    `_encode_audio` moments later. The shapes it collapses are the contract here: a
+    batch dim is dropped, a bare [L] is one channel.
+    """
+    shape = getattr(waveform, "shape", None)
+    if shape is None:
+        import numpy as np
+
+        shape = np.asarray(waveform).shape
+    if len(shape) == 3:
+        return int(shape[1])
+    if len(shape) == 2:
+        return int(shape[0])
+    return 1
+
+
 def _open_audio_stream(container, audio):
     """The AAC stream, or None if this soundtrack cannot get one.
 
@@ -506,7 +1148,7 @@ def _open_audio_stream(container, audio):
     the "NOT sent" note beside the tag instead of silently promising sound.
     """
     try:
-        channels = _planar_waveform(audio["waveform"]).shape[0]
+        channels = _waveform_channels(audio["waveform"])
         layout = _LAYOUTS.get(channels)
         if layout is None:
             raise ValueError(f"unsupported channel count {channels}")
@@ -571,22 +1213,97 @@ def probe(path: str) -> dict:
         return {"kind": "image", "width": w, "height": h, "fps": None, "duration": None, "has_audio": False}
 
     if kind == "video":
-        import av
-
-        v = _video_from_file_cls()(path)
-        w, h = v.get_dimensions()
-        fps = float(v.get_frame_rate())
-        duration = v.get_duration()
-        with av.open(path) as container:
-            has_audio = len(container.streams.audio) > 0
-        return {"kind": "video", "width": w, "height": h, "fps": fps, "duration": duration, "has_audio": has_audio}
+        return _probe_video(path)
 
     # audio
     import av
 
-    with av.open(path) as container:
+    with _open_container(path) as container:
         duration = float(container.duration / av.time_base) if container.duration else 0.0
     return {"kind": "audio", "width": None, "height": None, "fps": None, "duration": duration, "has_audio": True}
+
+
+def _probe_video(path: str) -> dict:
+    """One container open, raw PyAV, DISPLAY orientation.
+
+    THE METADATA CONTRACT IS PART OF THIS, not a detail. `VideoFromFile` supplied fps and
+    duration through a chain of fallbacks, so a straightforward one-open implementation
+    returns None for clips whose stream metadata is thin - a regression that surfaces as
+    a permanently pending tile rather than as an error, and only on the metadata-poor
+    files nobody has in a fixture. So the rungs are explicit:
+
+      fps       average_rate -> guessed_rate -> base_rate -> None
+      duration  stream.duration * stream.time_base -> container.duration / av.time_base
+                -> None                      (the two are in DIFFERENT units; see
+                                              _estimate_source_frames)
+      w/h       from the decoded keyframe, so a stale declared size still reports right
+
+    None is a legitimate answer for each and the route renders it. What is NOT legitimate
+    is a fabricated number - `frame_rate` degrades to Fraction(1) inside
+    `get_components_internal` (video_types.py:437), and reporting 1 fps as if it were
+    measured is worse than reporting nothing.
+
+    Dimensions are DISPLAY dimensions: `frame.to_image()` does not apply the display
+    matrix and `stream.width/height` stays raw, while the decoded tensor IS rotated and
+    the browser's <video> IS rotated. Reporting the raw pair is what made a crop rect
+    drawn on the tile disagree with the pixels `load_video` emitted.
+
+    The error contract covers `av.open` too, not just the rotation decode: a corrupt
+    container fails before any rotation fallback can run, `probe_route` (routes.py:69)
+    has no `try`, and anything escaping becomes a 500 that leaves the tile pending
+    forever. Every failure returns a complete, valid probe dict.
+    """
+    import os
+
+    empty = {"kind": "video", "width": None, "height": None,
+             "fps": None, "duration": None, "has_audio": False}
+    try:
+        import av
+
+        with _open_container(path) as container:
+            streams = container.streams.video
+            if not streams:
+                return empty
+            stream = streams[0]
+            rate = stream.average_rate or stream.guessed_rate or stream.base_rate
+            duration = None
+            if stream.duration is not None and stream.time_base:
+                duration = float(stream.duration * stream.time_base)
+            elif container.duration:
+                duration = container.duration / av.time_base
+            k, width, height = _first_frame_rotation_k(container, stream)
+            if width is None:
+                width, height = stream.width or None, stream.height or None
+            if k % 2 and width is not None and height is not None:
+                width, height = height, width
+            return {
+                "kind": "video",
+                "width": width,
+                "height": height,
+                "fps": float(rate) if rate else None,
+                "duration": duration,
+                "has_audio": len(container.streams.audio) > 0,
+            }
+    except Exception as e:
+        logs.warn("probe_failed", file=os.path.basename(path),
+                  error=f"{type(e).__name__}: {e}")
+        return empty
+
+
+def _first_frame_rotation_k(container, stream) -> tuple[int, int | None, int | None]:
+    """(rotation quarter-turns, decoded width, decoded height); (0, None, None) on failure.
+
+    A decode is the only route: PyAV 18.1.0 exposes no stream-level rotation getter and
+    the display matrix is not in `stream.metadata`. This runs on the aiohttp loop, so it
+    takes the thumb route's failure tolerance - a clip that will not decode still gets a
+    dict, and a scalar would break the route's dictionary indexing.
+    """
+    try:
+        frame = next(container.decode(stream))
+    except Exception as e:
+        logs.debug("probe_rotation_failed", error=f"{type(e).__name__}: {e}")
+        return 0, None, None
+    return _rotation_k(frame) % 4, int(frame.width), int(frame.height)
 
 
 def thumbnail_png(path: str, max_edge: int = 256, crop=None, at_seconds=None) -> bytes:
@@ -600,15 +1317,20 @@ def thumbnail_png(path: str, max_edge: int = 256, crop=None, at_seconds=None) ->
     decodes at most the GOP between the landed keyframe and the target, never the
     whole clip; without it, only frame 0 is decoded, exactly as before. A time past
     the end keeps the last decodable frame rather than failing the tile.
+
+    The frame is rotated into DISPLAY orientation before the crop. `frame.to_image()`
+    does not apply the display matrix, while `load_video` rotates and the browser's
+    <video> rotates, so without this a crop rect drawn on a portrait-shot phone clip
+    previewed one region and emitted another. `img.rotate(90*k, expand=True)` is
+    byte-identical to `np.rot90(a, k, axes=(0, 1))` - verified for every k the decoder
+    can produce, including the negative ones PyAV's signed rotation yields.
     """
     import io as _io
 
     from PIL import Image
 
     if _guess_kind(path) == "video":
-        import av
-
-        with av.open(path) as container:
+        with _open_container(path) as container:
             stream = container.streams.video[0]
             if at_seconds:
                 target_pts = int(at_seconds / stream.time_base)
@@ -621,7 +1343,10 @@ def thumbnail_png(path: str, max_edge: int = 256, crop=None, at_seconds=None) ->
                     raise ValueError(f"could not decode a frame of {path!r} at {at_seconds}s")
             else:
                 frame = next(container.decode(stream))
-        img = frame.to_image()
+            img = frame.to_image()
+            k = _rotation_k(frame) % 4
+            if k:
+                img = img.rotate(90 * k, expand=True)
     else:
         img = Image.open(path).convert("RGB")
 

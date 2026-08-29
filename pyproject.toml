@@ -15,7 +15,18 @@ dependencies = ["requests"]
 # (--no-install-project because this is a ComfyUI custom node loaded from its directory,
 # not an installable distribution - it declares no build backend.)
 [dependency-groups]
-dev = ["pytest", "numpy", "Pillow", "av", "aiohttp"]
+dev = ["pytest", "numpy", "Pillow", "av", "aiohttp", "torch"]
+
+# torch comes from the CPU wheel index: the decoder tests exercise the real tensor
+# path, and the default index would pull the ~2.5 GB CUDA wheel to do it. `explicit`
+# keeps this index from being consulted for anything but torch itself.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
 
 [project.urls]
 Repository = "https://github.com/Hearmeman24/ComfyUI-MiniMaxRefPack"
@@ -29,3 +40,6 @@ Icon = ""
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "--import-mode=importlib"
+markers = [
+    "slow: real-media decodes and subprocess RSS probes; deselect with `-m 'not slow'`",
+]
