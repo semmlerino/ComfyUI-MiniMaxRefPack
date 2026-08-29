@@ -156,6 +156,32 @@ def test_no_link_points_at_a_node_that_is_not_there(path):
     assert not dangling, f"{path.name}: {len(dangling)} link(s) reference a missing node"
 
 
+@pytest.mark.parametrize("path", WORKFLOWS, ids=lambda p: p.name)
+def test_video_save_uses_render_time_prefix_and_embeds_metadata(path):
+    """Example renders should be identifiable and reopenable after downloading."""
+    graph = json.loads(path.read_text())
+    by_type = {node["type"]: node for node in graph.get("nodes", [])}
+    timer = by_type.get("RenderTimeFilenamePrefix")
+    save = by_type.get("VHS_VideoCombine")
+
+    assert timer is not None, f"{path.name}: render-time filename node is missing"
+    assert save is not None, f"{path.name}: VHS video save node is missing"
+    assert save.get("widgets_values", {}).get("save_metadata") is True, (
+        f"{path.name}: VHS save_metadata must stay enabled"
+    )
+
+    links = {link[0]: link for link in graph.get("links", [])}
+    save_inputs = {entry["name"]: entry for entry in save.get("inputs", [])}
+    images_link = links[save_inputs["images"]["link"]]
+    prefix_link = links[save_inputs["filename_prefix"]["link"]]
+    assert images_link[1:3] == [timer["id"], 0], (
+        f"{path.name}: saved frames do not pass through the render timer"
+    )
+    assert prefix_link[1:3] == [timer["id"], 1], (
+        f"{path.name}: save filename_prefix is not driven by the render timer"
+    )
+
+
 # Preview nodes cache their last result INTO the saved graph. Whatever the author last
 # generated therefore ships with the workflow. On 2026-08-17 that was 2,910 characters of
 # explicit generated prose sitting in a Display Any node, which would have gone to a

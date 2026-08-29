@@ -1,8 +1,8 @@
 {
   "id": "f6c41c7f-009d-41d6-b0c9-d83b9d8ee121",
   "revision": 0,
-  "last_node_id": 192,
-  "last_link_id": 409,
+  "last_node_id": 193,
+  "last_link_id": 411,
   "nodes": [
     {
       "id": 121,
@@ -711,17 +711,17 @@
         4581.15511653993
       ],
       "size": [
-        697.8874926365747,
-        1364.831238954862
+        734.8562722532579,
+        746.9895473041439
       ],
       "flags": {},
-      "order": 22,
+      "order": 23,
       "mode": 0,
       "inputs": [
         {
           "name": "images",
           "type": "IMAGE",
-          "link": 253
+          "link": 410
         },
         {
           "name": "audio",
@@ -740,6 +740,14 @@
           "shape": 7,
           "type": "VAE",
           "link": null
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": 411
         }
       ],
       "outputs": [
@@ -758,28 +766,60 @@
       "widgets_values": {
         "frame_rate": 24,
         "loop_count": 0,
-        "filename_prefix": "AnimateDiff",
+        "filename_prefix": "video/r2v_auto",
         "format": "video/h264-mp4",
         "pix_fmt": "yuv420p",
         "crf": 12,
-        "save_metadata": false,
+        "save_metadata": true,
         "trim_to_audio": false,
         "pingpong": false,
-        "save_output": true,
-        "videopreview": {
-          "hidden": false,
-          "paused": false,
-          "params": {
-            "filename": "AnimateDiff_00186-audio.mp4",
-            "subfolder": "",
-            "type": "output",
-            "format": "video/h264-mp4",
-            "frame_rate": 24,
-            "workflow": "AnimateDiff_00186.png",
-            "fullpath": "/ComfyUI/output/AnimateDiff_00186-audio.mp4"
-          }
-        }
+        "save_output": true
       }
+    },
+    {
+      "id": 193,
+      "type": "RenderTimeFilenamePrefix",
+      "pos": [
+        -788.3343156266767,
+        4581.15511653993
+      ],
+      "size": [
+        300,
+        106
+      ],
+      "flags": {},
+      "order": 22,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "passthrough",
+          "type": "*",
+          "link": 253
+        }
+      ],
+      "outputs": [
+        {
+          "name": "passthrough",
+          "type": "*",
+          "links": [
+            410
+          ]
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING",
+          "links": [
+            411
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RenderTimeFilenamePrefix"
+      },
+      "widgets_values": [
+        "video/r2v_auto",
+        "s"
+      ]
     },
     {
       "id": 150,
@@ -1466,7 +1506,7 @@
       253,
       133,
       0,
-      119,
+      193,
       0,
       "IMAGE"
     ],
@@ -1845,6 +1885,22 @@
       190,
       0,
       "MODEL"
+    ],
+    [
+      410,
+      193,
+      0,
+      119,
+      0,
+      "IMAGE"
+    ],
+    [
+      411,
+      193,
+      1,
+      119,
+      4,
+      "STRING"
     ]
   ],
   "groups": [
