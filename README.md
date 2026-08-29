@@ -6,12 +6,13 @@ One node that manages every reference for **MiniMax H3 Reference to Video**, wri
 
 ## Features
 
-- **Upload instead of wiring.** Drop in images, videos and audio through the node's own UI. Preview them, play them, delete them, reorder nothing. No loader nodes, no links.
+- **Select or upload instead of wiring.** Use each asset's source dropdown for files already in ComfyUI's input directory, use the upload buttons for new files, or drop a mixed group anywhere on the node. Preview them, play them and delete them without loader nodes or links.
 - **20 outputs, wired once.** Connect the 18 reference sockets plus `prompt` into `MiniMax H3 Reference to Video` and save the workflow. Change your references as often as you like, the graph never changes.
 - **Auto prompting.** A multimodal model looks at your references, reads your direction text, and writes a full MiniMax H3 prompt in the exact six-section format the model expects.
 - **Run it on your own machine.** `prompt_provider: local` points the prompt writer at any OpenAI-compatible server, so auto prompting needs no account and no key, and your references never leave the machine. Ollama, LM Studio, llama.cpp, vLLM, or anything else that speaks the same API.
 - **It finds your server for you.** The **Local LLM** button sweeps the usual local ports, lists every server that answered and the models it holds, and fills in the URL and the model id in one click, so you never have to go looking for a base URL yourself. The scan is loopback-only and never resolves a hostname, so it cannot be turned into a port scanner.
-- **Two registers.** `standard` writes a scene. `replacement` swaps one object or character in a reference video for the thing in a reference image. `auto` lets a cheap classifier pick.
+- **Asset-first task plans.** Let the VLM infer relationships, or assign multiple official roles to every asset: reference generation, keyframe completion, video editing, video continuation, audio reuse and audio reference. The node derives the combined `summary` prefix and sends only the matching system-prompt overlays.
+- **Replacement specialization.** An explicit video-editing plan can add character- or object-replacement guidance without inventing a nonstandard task type.
 - **Portable configs.** **Save config** downloads a JSON file to your machine. **Load config** reads it back on any install, on any pod, and restores your direction text, model, reasoning effort and reference list.
 - **The tags are on the tiles.** Every asset shows the label MiniMax will actually give it: `<Picture 2>`, `<Video 1>`, `<Audio 1>`. What you see is what you address in the prompt.
 - **Video soundtracks come along.** A video's audio track is extracted and sent as its own reference by default. Toggle it off per video.
@@ -31,7 +32,15 @@ No. `prompt_provider` picks who writes the prompt, and two of its three settings
 
 Whichever you pick, you keep the whole reference manager: the uploads, the previews, the crop and trim editor, the `<Picture 2>` / `<Video 1>` / `<Audio 1>` tags, the portable configs, all 20 outputs wired once.
 
-**Don't like the prompt it writes?** Open the node's settings modal and edit `system_prompt`. It holds the full instructions the model gets. Rewrite it however you like, and it saves with the workflow. Leave it blank to use the packaged default.
+**Don't like the prompt it writes?** Open the node's settings modal and edit `system_prompt`. A nonblank value is a complete override and is saved with the workflow. Leave it blank to use the official shared base plus the overlays selected by the task plan.
+
+## Selecting references and roles
+
+The upload buttons and drag/drop behave as before. The small `+` at the end of each image, video or audio row now opens an input-directory picker; choose an existing file or use **Upload new…**. Mixed file drops are still sorted into their media rows automatically.
+
+Open **Plan** to work asset-first. Every attached asset has its own source dropdown and may have more than one role. When several videos are attached, designate the one that is directly edited or continued as the primary video. In explicit mode, the role set mechanically derives the prompt prefix; for example, a primary edit video, an appearance image and a retained soundtrack produce `[video editing + reference generation + audio reuse]`. Explicit plans skip the classifier call.
+
+Only one video may be the direct editing or continuation source. On **Apply plan**, the designated primary moves to the first video position so the official prompt can address it as `<Video 1>`; the other videos keep their relative order and can still provide reference-generation guidance for motion, camera or temporal structure. A video's audio roles apply to the synchronized soundtrack controlled by that tile's `♪` toggle.
 
 ## Running it locally
 
@@ -85,14 +94,15 @@ On `prompt_provider: local` the environment is never read. Only a key typed into
 
 | Setting | What it does |
 | --- | --- |
-| `job_type` | `standard` / `replacement` / `auto`. `auto` only classifies when at least one video and one image are attached, and falls back to `standard` on any failure. |
+| Task plan | **Infer roles** keeps automatic routing. **Set roles explicitly** derives the official combined prefix, selects composable system-prompt overlays and skips classification. Stored inside `references_json` with the assets. |
+| `job_type` | Legacy compatibility field for workflows saved before task plans. It is hidden by the current UI; untouched legacy workflows retain their previous `standard` / `replacement` / `auto` behavior. |
 | `reasoning_effort` | `none` / `low` / `medium` / `high`, default `medium`. Passed to OpenRouter, dropped for models that don't reason. |
 | `width` / `height` / `length_seconds` | Told to the model so it composes for the real frame and keeps its cut timestamps inside the real duration. `0` leaves one unspecified. These do not set the output size, `Empty MiniMax H3 AV Latent` does. |
 | `prompt_provider` | `openrouter` / `local` / `none`. See above. Replaces the old `use_openrouter` checkbox; workflows saved before 0.3.2 migrate automatically. |
 | `api_base` | Base URL of your OpenAI-compatible server, used only when `prompt_provider` is `local`. Must end in `/v1`. |
 | `openrouter_model` | The model that writes your prompt on `openrouter`. Ignored on every other provider. |
 | `local_model_slug` | The model id your own server reports, used only on `local`. Ignored on every other provider. The **Local LLM** button fills it in. |
-| `system_prompt` | The full instructions the model is given, editable in the settings modal and saved with the workflow. Blank uses the packaged default. Rewrite it if you want prompts in your own style. |
+| `system_prompt` | A complete workflow-specific override. Blank uses the packaged official base plus the role-derived overlays. |
 | `max_reference_edge` | Downscales a reference **image** whose long edge is bigger than this, `0` turns it off. Never upscales. Reference **videos** are not covered: they are decoded and cached at source resolution, and the core node resizes them at encode time. |
 
 ## The tag rule
@@ -115,11 +125,6 @@ Reference videos are decoded by a streaming pass of our own rather than through 
 - **A rotated clip crops where the tile showed it.** A clip carrying a display matrix (anything shot on a phone in portrait) is now reported and previewed in DISPLAY orientation, the same orientation the emitted frames and the browser's own player use. Before, `probe` reported the raw dimensions and the thumbnail was un-rotated, so a crop rect drawn on the tile selected a different region than the pack emitted.
 
 The version is deliberately NOT bumped here: `tests/test_example_workflows.py` requires every example workflow's `properties.ver` to match `pyproject.toml`, so the bump and the workflow re-stamp belong to whoever cuts the release, together.
-
-## Known issue
-
-The packaged system prompt asks the model to give every label it defines in `subject_definitions` exactly one `retention_analysis` line, while MiniMax's guide says newly invented content gets no retention entry at all. When the model invents something the references didn't supply, it sometimes resolves that by dropping a label or inventing a line for one it never defined. The `debug` socket shows exactly what it was told.
-
 ## Licence
 
 MIT. Free, and public on GitHub. Clone it, fork it, rip the prompt writer out and keep the reference manager, ship it inside something you sell. You do not need an account, and the node never calls home.

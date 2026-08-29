@@ -34,9 +34,88 @@ MAX_BY_KIND: dict[str, int] = {"image": MAX_IMAGES, "video": MAX_VIDEOS, "audio"
 
 KINDS: tuple[Kind, ...] = ("image", "video", "audio")
 
+# Persistent role ids use underscores; their official prompt spellings are owned by
+# task_plan.py. Keeping the transport ids free of spaces makes references_json easy to
+# validate without making it a second source of truth for prompt wording.
+REFERENCE_ROLES: tuple[str, ...] = (
+    "reference_generation",
+    "keyframe_completion",
+    "video_editing",
+    "video_continuation",
+    "audio_reuse",
+    "audio_reference",
+)
+ROLES_BY_KIND: dict[Kind, frozenset[str]] = {
+    "image": frozenset(("reference_generation", "keyframe_completion")),
+    "video": frozenset(
+        (
+            "reference_generation",
+            "video_editing",
+            "video_continuation",
+            "audio_reuse",
+            "audio_reference",
+        )
+    ),
+    "audio": frozenset(("audio_reuse", "audio_reference")),
+}
+TASK_PLAN_MODES = ("auto", "explicit")
+REPLACEMENT_SPECIALIZATIONS = ("none", "character_replacement", "object_replacement")
+
 
 class ReferenceError(ValueError):
     """A reference set that MiniMax could not accept."""
+
+
+def validate_roles(kind: Kind, roles: Any) -> list[str]:
+    """Return a stable role list or reject malformed/inapplicable task metadata."""
+    if roles is None:
+        return []
+    if not isinstance(roles, (list, tuple)):
+        raise ReferenceError(f"roles must be a list for reference {kind}, got {roles!r}")
+    if not all(isinstance(role, str) for role in roles):
+        raise ReferenceError(f"roles must contain strings for reference {kind}, got {roles!r}")
+    if len(set(roles)) != len(roles):
+        raise ReferenceError(f"roles must not contain duplicates, got {roles!r}")
+    unknown = [role for role in roles if role not in REFERENCE_ROLES]
+    if unknown:
+        raise ReferenceError(f"unknown reference role(s): {', '.join(unknown)}")
+    inapplicable = [role for role in roles if role not in ROLES_BY_KIND[kind]]
+    if inapplicable:
+        raise ReferenceError(
+            f"role(s) {', '.join(inapplicable)} do not apply to a reference {kind}"
+        )
+    return list(roles)
+
+
+@dataclass(frozen=True)
+class TaskPlan:
+    """Persistent ownership settings for inferred or explicit reference roles."""
+
+    mode: str = "auto"
+    specialization: str = "none"
+
+    def validate(self) -> None:
+        if self.mode not in TASK_PLAN_MODES:
+            raise ReferenceError(f"unknown task-plan mode {self.mode!r}")
+        if self.specialization not in REPLACEMENT_SPECIALIZATIONS:
+            raise ReferenceError(f"unknown replacement specialization {self.specialization!r}")
+        if self.mode != "explicit" and self.specialization != "none":
+            raise ReferenceError("replacement specialization requires explicit task-plan mode")
+
+    def to_dict(self) -> dict[str, str]:
+        self.validate()
+        out = {"mode": self.mode}
+        if self.specialization != "none":
+            out["specialization"] = self.specialization
+        return out
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "TaskPlan":
+        if not isinstance(data, dict):
+            raise ReferenceError("task_plan must be an object")
+        plan = cls(mode=data.get("mode", "auto"), specialization=data.get("specialization", "none"))
+        plan.validate()
+        return plan
 
 
 def validate_crop(crop: Any) -> list[float]:
@@ -93,6 +172,13 @@ class Reference:
     # v1 pack files keep loading and re-serialising unchanged (PACK_VERSION stays 1).
     crop: list[float] | None = None
     trim: list[float] | None = None
+    # Official relationships assigned by the user. Multiple roles are valid: an image
+    # can be both a concrete keyframe and appearance guidance, and a video's enabled
+    # soundtrack can be reused while its picture is the edit source.
+    roles: list[str] = field(default_factory=list)
+    # Video only. This is separate from the editing/continuation role so a user can
+    # designate the source explicitly when several video references are present.
+    primary: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"kind": self.kind, "file": self.file}
@@ -102,6 +188,10 @@ class Reference:
             d["crop"] = list(self.crop)
         if self.trim is not None:
             d["trim"] = list(self.trim)
+        if self.roles:
+            d["roles"] = list(self.roles)
+        if self.primary:
+            d["primary"] = True
         return d
 
     @classmethod
@@ -114,6 +204,11 @@ class Reference:
             raise ReferenceError("reference is missing a file name")
         crop = d.get("crop")
         trim = d.get("trim")
+        primary = d.get("primary", False)
+        if not isinstance(primary, bool):
+            raise ReferenceError(f"primary must be true or false, got {primary!r}")
+        if primary and kind != "video":
+            raise ReferenceError("primary applies only to a video reference")
         return cls(
             kind=kind,
             file=file.strip(),
@@ -121,6 +216,8 @@ class Reference:
             # like use_soundtrack, an inapplicable field is dropped rather than fatal
             crop=validate_crop(crop) if crop is not None and kind in ("image", "video") else None,
             trim=validate_trim(trim) if trim is not None and kind in ("video", "audio") else None,
+            roles=validate_roles(kind, d.get("roles")),
+            primary=primary,
         )
 
 
@@ -154,6 +251,9 @@ class ReferenceSet:
     """An ordered set of references. Order within a kind is the socket order."""
 
     references: list[Reference] = field(default_factory=list)
+    # None is deliberately different from TaskPlan(mode="auto"): None means a workflow
+    # saved before task plans existed, whose job_type widget must retain its old routing.
+    task_plan: TaskPlan | None = None
 
     # ---- construction -------------------------------------------------------
 
@@ -174,14 +274,23 @@ class ReferenceSet:
     @classmethod
     def from_obj(cls, data: Any) -> "ReferenceSet":
         """Accept either a bare list of references or a {"references": [...]} envelope."""
+        task_plan = None
         if isinstance(data, dict):
+            if "task_plan" in data:
+                task_plan = TaskPlan.from_dict(data["task_plan"])
             data = data.get("references", [])
         if not isinstance(data, list):
             raise ReferenceError("references must be a list")
-        return cls([Reference.from_dict(d) for d in data if isinstance(d, dict)])
+        return cls(
+            [Reference.from_dict(d) for d in data if isinstance(d, dict)],
+            task_plan=task_plan,
+        )
 
     def to_json(self) -> str:
-        return json.dumps({"references": [r.to_dict() for r in self.references]})
+        out: dict[str, Any] = {"references": [r.to_dict() for r in self.references]}
+        if self.task_plan is not None:
+            out["task_plan"] = self.task_plan.to_dict()
+        return json.dumps(out)
 
     # ---- queries ------------------------------------------------------------
 
@@ -196,6 +305,14 @@ class ReferenceSet:
 
     def validate(self) -> None:
         """Raise if the set exceeds MiniMax's hard caps."""
+        if self.task_plan is not None:
+            self.task_plan.validate()
+        for reference in self.references:
+            validate_roles(reference.kind, reference.roles)
+            if not isinstance(reference.primary, bool):
+                raise ReferenceError(f"primary must be true or false, got {reference.primary!r}")
+            if reference.primary and reference.kind != "video":
+                raise ReferenceError("primary applies only to a video reference")
         for kind in KINDS:
             n = len(self.of_kind(kind))
             cap = MAX_BY_KIND[kind]

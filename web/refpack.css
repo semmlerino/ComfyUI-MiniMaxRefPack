@@ -324,6 +324,190 @@
     flex-wrap: wrap;
 }
 
+/* ---- asset-first task planner + input-directory source picker ------------ */
+
+.mmrp-plan-btn {
+    max-width: 430px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.mmrp-plan-btn.mmrp-plan-error {
+    border-color: #d04a4a;
+    color: #ffb4b4;
+}
+
+.mmrp-planner-modal {
+    width: min(860px, 94vw);
+    max-height: 90vh;
+    overflow: auto;
+}
+
+.mmrp-add-modal {
+    width: min(620px, 92vw);
+}
+
+.mmrp-planner-header,
+.mmrp-plan-asset-head,
+.mmrp-source-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.mmrp-planner-header,
+.mmrp-plan-asset-head {
+    justify-content: space-between;
+}
+
+.mmrp-planner-close {
+    min-width: 30px;
+    font-size: 18px;
+    line-height: 1;
+}
+
+.mmrp-plan-controls {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.mmrp-plan-controls label,
+.mmrp-source-row {
+    color: #aaa;
+    font-size: 11px;
+}
+
+.mmrp-plan-controls label {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.mmrp-plan-controls select,
+.mmrp-source-select {
+    min-height: 32px;
+    box-sizing: border-box;
+    border: 1px solid #444;
+    border-radius: 4px;
+    background: #111;
+    color: #e0e0e0;
+    padding: 5px 8px;
+}
+
+.mmrp-source-select {
+    width: 100%;
+    min-width: 0;
+}
+
+.mmrp-source-row .mmrp-source-select {
+    flex: 1 1 auto;
+}
+
+.mmrp-plan-controls select:focus,
+.mmrp-source-select:focus {
+    outline: none;
+    border-color: #777;
+}
+
+.mmrp-plan-status {
+    min-height: 18px;
+    padding: 7px 9px;
+    border: 1px solid #343434;
+    border-radius: 4px;
+    background: #151515;
+    color: #c8c8c8;
+    overflow-wrap: anywhere;
+}
+
+.mmrp-plan-status-error {
+    border-color: #713737;
+    color: #ffb4b4;
+}
+
+.mmrp-plan-assets {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 52vh;
+    overflow-y: auto;
+    padding-right: 2px;
+}
+
+.mmrp-plan-asset {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid #3b3b3b;
+    border-radius: 6px;
+    background: #181818;
+}
+
+.mmrp-plan-asset-head span {
+    color: #888;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.mmrp-role-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 7px 14px;
+}
+
+.mmrp-role-grid label {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    color: #d0d0d0;
+    line-height: 1.3;
+}
+
+.mmrp-role-grid input {
+    margin: 2px 0 0;
+}
+
+.mmrp-primary-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    width: fit-content;
+    padding: 5px 8px;
+    border: 1px solid #454545;
+    border-radius: 4px;
+    background: #202020;
+    color: #eee;
+    font-size: 11px;
+}
+
+.mmrp-primary-row input {
+    margin: 0;
+}
+
+.mmrp-plan-empty {
+    padding: 18px;
+    border: 1px dashed #444;
+    border-radius: 6px;
+    color: #999;
+    text-align: center;
+}
+
+@media (max-width: 680px) {
+    .mmrp-plan-controls,
+    .mmrp-role-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .mmrp-source-row {
+        align-items: stretch;
+        flex-direction: column;
+        gap: 4px;
+    }
+}
+
 /* ---- local server picker (openLocalServerModal) ----
    Same modal family. The model rows are full-width buttons rather than a <select>
    because picking one is a commit, not a preference: it rewrites three widgets at

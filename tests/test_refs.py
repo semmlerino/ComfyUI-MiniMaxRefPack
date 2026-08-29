@@ -17,6 +17,7 @@ from minimax_refpack.refs import (
     Reference,
     ReferenceError,
     ReferenceSet,
+    TaskPlan,
     empty_outputs,
     output_names,
     output_types,
@@ -136,6 +137,69 @@ def test_json_round_trip():
     assert [r.to_dict() for r in again.references] == [r.to_dict() for r in s.references]
 
 
+def test_legacy_json_round_trip_does_not_gain_task_metadata():
+    raw = '{"references": [{"kind": "image", "file": "a.jpg"}]}'
+    assert json.loads(ReferenceSet.from_json(raw).to_json()) == json.loads(raw)
+
+
+def test_roles_and_task_plan_round_trip_without_moving_tags():
+    s = ReferenceSet(
+        [
+            Reference(
+                kind="image",
+                file="face.png",
+                roles=["reference_generation", "keyframe_completion"],
+            ),
+            Reference(
+                kind="video",
+                file="plate.mp4",
+                use_soundtrack=True,
+                primary=True,
+                roles=["video_editing", "audio_reuse"],
+            ),
+        ],
+        task_plan=TaskPlan(mode="explicit", specialization="character_replacement"),
+    )
+
+    again = ReferenceSet.from_json(s.to_json())
+
+    assert again.task_plan == s.task_plan
+    assert [r.roles for r in again.references] == [r.roles for r in s.references]
+    assert [r.primary for r in again.references] == [False, True]
+    assert [(t.tag, t.audio_tag) for t in again.assign_tags()] == [
+        ("<Picture 1>", None),
+        ("<Video 1>", "<Audio 1>"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        {"kind": "image", "file": "a.png", "roles": "reference_generation"},
+        {"kind": "image", "file": "a.png", "roles": ["made_up"]},
+        {"kind": "image", "file": "a.png", "roles": ["reference_generation", "reference_generation"]},
+        {"kind": "audio", "file": "a.wav", "roles": ["video_editing"]},
+    ],
+)
+def test_malformed_or_inapplicable_roles_are_rejected(reference):
+    with pytest.raises(ReferenceError):
+        ReferenceSet.from_obj({"references": [reference]})
+
+
+@pytest.mark.parametrize(
+    "task_plan",
+    [
+        "explicit",
+        {"mode": "guess"},
+        {"mode": "auto", "specialization": "character_replacement"},
+        {"mode": "explicit", "specialization": "face_swap"},
+    ],
+)
+def test_malformed_task_plan_is_rejected(task_plan):
+    with pytest.raises(ReferenceError):
+        ReferenceSet.from_obj({"references": [], "task_plan": task_plan})
+
+
 @pytest.mark.parametrize("raw", ["", "   ", None])
 def test_blank_widget_is_an_empty_set(raw):
     assert ReferenceSet.from_json(raw).is_empty()
@@ -166,6 +230,41 @@ def test_use_soundtrack_only_sticks_to_videos():
         json.dumps([{"kind": "image", "file": "a.jpg", "use_soundtrack": True}])
     )
     assert s.references[0].use_soundtrack is False
+
+
+def test_primary_is_optional_video_only_metadata():
+    raw = {
+        "references": [
+            {"kind": "video", "file": "plate.mp4", "primary": True},
+            {"kind": "video", "file": "guide.mp4"},
+        ]
+    }
+    again = ReferenceSet.from_obj(raw)
+
+    assert [reference.primary for reference in again.references] == [True, False]
+    assert json.loads(again.to_json()) == {
+        "references": [
+            {
+                "kind": "video",
+                "file": "plate.mp4",
+                "use_soundtrack": True,
+                "primary": True,
+            },
+            {"kind": "video", "file": "guide.mp4", "use_soundtrack": True},
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        {"kind": "video", "file": "plate.mp4", "primary": "yes"},
+        {"kind": "image", "file": "face.png", "primary": True},
+    ],
+)
+def test_malformed_or_inapplicable_primary_is_rejected(reference):
+    with pytest.raises(ReferenceError, match="primary"):
+        ReferenceSet.from_obj({"references": [reference]})
 
 
 # ---- resolution ------------------------------------------------------------

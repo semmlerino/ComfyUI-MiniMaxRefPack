@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 import requests
 
-from minimax_refpack import prompt
-from minimax_refpack.refs import Reference, ReferenceSet
+from minimax_refpack import prompt, task_plan
+from minimax_refpack.refs import Reference, ReferenceSet, TaskPlan
 
 
 # ---- fixtures ---------------------------------------------------------------
@@ -448,6 +448,7 @@ def test_reference_carrying_prompt_rules_are_untouched():
     assert "EXACT PAIRING, BOTH WAYS." in std
     assert "give each one exactly one line here" in std
     assert "No entries for newly generated content." in std
+    assert "wholly invented target content stays out of `subject_definitions`" in std
     assert "`newly_generated` does not exist." in std
     assert "[reference generation + audio reference]" in std  # the worked example
     for marker in ("fully_preserved", "partially_preserved", "attribute_transfer",
@@ -971,6 +972,60 @@ def test_each_job_type_loads_its_own_system_prompt():
     # and the replacement register must forbid the ten-section prose shape that the
     # source template produced, which returned headingless prose in eval/replacement
     assert "NEVER emit the ten-section prose format" in rep
+
+
+def test_explicit_task_plan_composes_only_its_task_overlays():
+    references = ReferenceSet(
+        [
+            Reference(kind="image", file="face.png", roles=["reference_generation"]),
+            Reference(kind="video", file="plate.mp4", roles=["video_editing"]),
+        ],
+        task_plan=TaskPlan(mode="explicit", specialization="character_replacement"),
+    )
+    resolved = task_plan.resolve(references)
+
+    system = prompt._system_prompt_for_plan(resolved)
+
+    assert "TASK OVERLAY: VIDEO EDITING" in system
+    assert "TASK OVERLAY: REFERENCE GENERATION" in system
+    assert "SPECIALIZATION: CHARACTER REPLACEMENT" in system
+    assert "TASK OVERLAY: KEYFRAME COMPLETION" not in system
+    assert "TASK OVERLAY: AUDIO REUSE" not in system
+
+
+def test_explicit_task_plan_skips_classifier_and_reaches_both_messages(monkeypatch):
+    references = ReferenceSet(
+        [Reference(kind="image", file="frame.png", roles=["keyframe_completion"])],
+        task_plan=TaskPlan(mode="explicit"),
+    )
+    captured = _capture_payload(monkeypatch)
+    monkeypatch.setattr(
+        prompt,
+        "_build_content",
+        lambda *args, **kwargs: [{"type": "text", "text": "content"}],
+    )
+    monkeypatch.setattr(
+        prompt,
+        "classify_mode",
+        lambda **kwargs: pytest.fail("explicit plans must not call the classifier"),
+    )
+
+    debug = []
+    prompt.write_prompt(
+        references=references,
+        input_dir="/unused",
+        direction="finish from the frame",
+        api_key="key",
+        model="model",
+        debug=debug,
+    )
+
+    system = captured["payload"]["messages"][0]["content"]
+    user = captured["payload"]["messages"][1]["content"][0]["text"]
+    assert "TASK OVERLAY: KEYFRAME COMPLETION" in system
+    assert "summary prefix: [keyframe completion]" in user
+    assert "<Picture 1>: keyframe completion" in user
+    assert debug[0].startswith("task_plan: explicit -> [keyframe completion]")
 
 
 def test_replacement_prompt_uses_minimax_tag_spelling():

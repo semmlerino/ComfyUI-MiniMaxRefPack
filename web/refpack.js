@@ -325,49 +325,233 @@ export function assignTags(refs) {
     return tagged;
 }
 
-// ---- references_json <-> working-state conversion --------------------
-// refs.py's Reference shape:
-//   {"kind": "image"|"video"|"audio", "file": str, [use_soundtrack], [crop], [trim]}
-// crop = [x, y, w, h] fractions (image/video), trim = [start, end] seconds
-// (video/audio) — both omitted when unset, mirroring refs.py's to_dict().
+// ---- references_json <-> working-state conversion + task planning ----------
+// This marked block is extracted by tests/test_task_plan_js.py and must stay free of DOM
+// and module imports. refs.py remains the backend authority; this copy gives the modal
+// immediate validation instead of waiting for a queued prompt to fail.
+// >>> MMRP-TASK-PLAN
+const TASK_ROLE_OPTIONS = {
+    image: [
+        ["reference_generation", "Generation guidance"],
+        ["keyframe_completion", "Keyframe anchor"],
+    ],
+    video: [
+        ["reference_generation", "Motion / camera / structure guidance"],
+        ["video_editing", "Edit source"],
+        ["video_continuation", "Continuation source"],
+        ["audio_reuse", "Soundtrack: reuse signal"],
+        ["audio_reference", "Soundtrack: reference qualities"],
+    ],
+    audio: [
+        ["audio_reuse", "Reuse signal"],
+        ["audio_reference", "Reference qualities"],
+    ],
+};
+const TASK_ROLE_TYPES = {
+    reference_generation: "reference generation",
+    keyframe_completion: "keyframe completion",
+    video_editing: "video editing",
+    video_continuation: "video continuation",
+    audio_reuse: "audio reuse",
+    audio_reference: "audio reference",
+};
+const TASK_TYPE_ORDER = [
+    "video editing", "video continuation", "keyframe completion",
+    "reference generation", "audio reuse", "audio reference",
+];
+const TASK_SPECIALIZATIONS = ["none", "character_replacement", "object_replacement"];
 
 function takeEdit(v) {
     return Array.isArray(v) ? v.slice() : null;
 }
 
+function takeRoles(kind, roles) {
+    const allowed = new Set((TASK_ROLE_OPTIONS[kind] || []).map(([id]) => id));
+    const out = [];
+    for (const role of Array.isArray(roles) ? roles : []) {
+        if (allowed.has(role) && !out.includes(role)) out.push(role);
+    }
+    return out;
+}
+
+function normalizeTaskPlan(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const mode = raw.mode === "explicit" ? "explicit" : raw.mode === "auto" ? "auto" : null;
+    if (!mode) return null;
+    let specialization = TASK_SPECIALIZATIONS.includes(raw.specialization)
+        ? raw.specialization
+        : "none";
+    if (mode !== "explicit") specialization = "none";
+    return { mode, specialization };
+}
+
 export function fromReferencesList(list) {
-    const refs = { images: [], videos: [], audios: [] };
+    const refs = { images: [], videos: [], audios: [], taskPlan: null };
     for (const r of list || []) {
         if (!r || typeof r.file !== "string") continue;
         if (r.kind === "image")
-            refs.images.push({ file: r.file, missing: !!r.missing, crop: takeEdit(r.crop) });
+            refs.images.push({
+                file: r.file, roles: takeRoles("image", r.roles),
+                missing: !!r.missing, crop: takeEdit(r.crop),
+            });
         else if (r.kind === "video")
             refs.videos.push({
                 file: r.file,
-                use_soundtrack: !!r.use_soundtrack,
+                // Backend and legacy workflow default: a video's soundtrack is on
+                // unless the serialized reference explicitly disables it.
+                use_soundtrack: r.use_soundtrack !== false,
+                primary: r.primary === true,
+                roles: takeRoles("video", r.roles),
                 missing: !!r.missing,
                 crop: takeEdit(r.crop),
                 trim: takeEdit(r.trim),
             });
         else if (r.kind === "audio")
-            refs.audios.push({ file: r.file, missing: !!r.missing, trim: takeEdit(r.trim) });
+            refs.audios.push({
+                file: r.file, roles: takeRoles("audio", r.roles),
+                missing: !!r.missing, trim: takeEdit(r.trim),
+            });
     }
+    return refs;
+}
+
+function fromReferencesEnvelope(data) {
+    const refs = fromReferencesList((data && data.references) || []);
+    refs.taskPlan = normalizeTaskPlan(data && data.task_plan);
     return refs;
 }
 
 export function toReferencesList(refs) {
     const out = [];
-    const withEdits = (d, r) => {
+    const withMetadata = (d, r) => {
         if (Array.isArray(r.crop)) d.crop = r.crop.slice();
         if (Array.isArray(r.trim)) d.trim = r.trim.slice();
+        if (Array.isArray(r.roles) && r.roles.length) d.roles = r.roles.slice();
         return d;
     };
-    for (const r of refs.images) out.push(withEdits({ kind: "image", file: r.file }, { crop: r.crop }));
-    for (const r of refs.videos)
-        out.push(withEdits({ kind: "video", file: r.file, use_soundtrack: !!r.use_soundtrack }, r));
-    for (const r of refs.audios) out.push(withEdits({ kind: "audio", file: r.file }, { trim: r.trim }));
+    for (const r of refs.images)
+        out.push(withMetadata({ kind: "image", file: r.file }, r));
+    for (const r of refs.videos) {
+        const video = withMetadata(
+            { kind: "video", file: r.file, use_soundtrack: !!r.use_soundtrack }, r
+        );
+        if (r.primary) video.primary = true;
+        out.push(video);
+    }
+    for (const r of refs.audios)
+        out.push(withMetadata({ kind: "audio", file: r.file }, r));
     return out;
 }
+
+function toReferencesEnvelope(refs) {
+    const envelope = { references: toReferencesList(refs) };
+    if (refs.taskPlan) {
+        envelope.task_plan = { mode: refs.taskPlan.mode };
+        if (refs.taskPlan.specialization && refs.taskPlan.specialization !== "none") {
+            envelope.task_plan.specialization = refs.taskPlan.specialization;
+        }
+    }
+    return envelope;
+}
+
+function newReference(kind, file) {
+    const reference = { file, roles: [] };
+    if (kind === "video") {
+        reference.use_soundtrack = true;
+        reference.primary = false;
+    }
+    return reference;
+}
+
+function deriveTaskPlanState(refs, allowPrimaryReorder = false) {
+    const plan = refs && refs.taskPlan;
+    if (!plan) return { mode: "legacy", prefix: "Legacy job type", taskTypes: [], error: null };
+    if (plan.mode === "auto") return { mode: "auto", prefix: "Auto detect", taskTypes: [], error: null };
+
+    const all = [
+        ...(refs.images || []).map((ref, index) => ({ kind: "image", index, ref })),
+        ...(refs.videos || []).map((ref, index) => ({ kind: "video", index, ref })),
+        ...(refs.audios || []).map((ref, index) => ({ kind: "audio", index, ref })),
+    ];
+    const roleCount = all.reduce((n, item) => n + (item.ref.roles || []).length, 0);
+    if (!roleCount) {
+        return { mode: "explicit", prefix: "No roles", taskTypes: [],
+                 error: "Assign at least one reference role." };
+    }
+
+    const drivers = [];
+    const primaries = [];
+    for (const item of all.filter((item) => item.kind === "video")) {
+        if (item.ref.primary) primaries.push(item.index);
+        for (const role of item.ref.roles || []) {
+            if (role === "video_editing" || role === "video_continuation") {
+                drivers.push({ index: item.index, role });
+            }
+        }
+        if (!item.ref.use_soundtrack && (item.ref.roles || []).some(
+            (role) => role === "audio_reuse" || role === "audio_reference"
+        )) {
+            return { mode: "explicit", prefix: "Invalid plan", taskTypes: [],
+                     error: `${item.ref.file}'s soundtrack is disabled.` };
+        }
+    }
+    if (primaries.length > 1) {
+        return { mode: "explicit", prefix: "Invalid plan", taskTypes: [],
+                 error: "Choose only one primary video." };
+    }
+    if (drivers.length > 1) {
+        return { mode: "explicit", prefix: "Invalid plan", taskTypes: [],
+                 error: "Choose only one primary video for editing or continuation." };
+    }
+    if (primaries.length && !drivers.length) {
+        return { mode: "explicit", prefix: "Invalid plan", taskTypes: [],
+                 error: "The primary video needs an editing or continuation role." };
+    }
+    if (primaries.length && drivers.length && primaries[0] !== drivers[0].index) {
+        return { mode: "explicit", prefix: "Invalid plan", taskTypes: [],
+                 error: "Put the primary designation and editing/continuation role on the same video." };
+    }
+    const primaryIndex = primaries.length ? primaries[0]
+        : drivers.length ? drivers[0].index : null;
+    if (primaryIndex !== null && primaryIndex !== 0 && !allowPrimaryReorder) {
+        return { mode: "explicit", prefix: "Invalid plan", taskTypes: [],
+                 error: "The primary edit/continuation source must be <Video 1>." };
+    }
+
+    const roles = new Set(all.flatMap((item) => item.ref.roles || []));
+    const specialization = plan.specialization || "none";
+    if (specialization !== "none" && !roles.has("video_editing")) {
+        return { mode: "explicit", prefix: "Invalid plan", taskTypes: [],
+                 error: "A replacement specialization requires video editing." };
+    }
+    if (specialization !== "none" && !(refs.images || []).some(
+        (ref) => (ref.roles || []).includes("reference_generation")
+    )) {
+        return { mode: "explicit", prefix: "Invalid plan", taskTypes: [],
+                 error: "A replacement specialization requires image generation guidance." };
+    }
+
+    const used = new Set([...roles].map((role) => TASK_ROLE_TYPES[role]).filter(Boolean));
+    const taskTypes = TASK_TYPE_ORDER.filter((taskType) => used.has(taskType));
+    return {
+        mode: "explicit",
+        prefix: `[${taskTypes.join(" + ")}]`,
+        taskTypes,
+        error: null,
+    };
+}
+
+function referencesFingerprint(refs) {
+    return JSON.stringify(toReferencesEnvelope(refs));
+}
+
+function normalizePrimaryVideo(refs) {
+    const videos = refs && Array.isArray(refs.videos) ? refs.videos : [];
+    const index = videos.findIndex((reference) => reference.primary === true);
+    if (index > 0) videos.unshift(...videos.splice(index, 1));
+    return refs;
+}
+// <<< MMRP-TASK-PLAN
 
 // ---------------------------------------------------------------------------
 // Crop/trim pure helpers — fraction-space math only, no DOM, so a node harness
@@ -492,14 +676,21 @@ export function cropPreviewBox(crop, dw, dh) {
 }
 
 function emptyRefs() {
-    return { images: [], videos: [], audios: [] };
+    return { images: [], videos: [], audios: [], taskPlan: null };
 }
 
 function cloneRefs(refs) {
+    const clone = (r) => ({
+        ...r,
+        roles: Array.isArray(r.roles) ? r.roles.slice() : [],
+        crop: Array.isArray(r.crop) ? r.crop.slice() : r.crop,
+        trim: Array.isArray(r.trim) ? r.trim.slice() : r.trim,
+    });
     return {
-        images: refs.images.map((r) => ({ ...r })),
-        videos: refs.videos.map((r) => ({ ...r })),
-        audios: refs.audios.map((r) => ({ ...r })),
+        images: refs.images.map(clone),
+        videos: refs.videos.map(clone),
+        audios: refs.audios.map(clone),
+        taskPlan: refs.taskPlan ? { ...refs.taskPlan } : null,
     };
 }
 
@@ -516,6 +707,13 @@ async function apiUpload(file) {
     if (!res.ok) throw new Error(`upload failed: ${res.status}`);
     const info = await res.json();
     return info.name;
+}
+
+async function apiListFiles(kind) {
+    const res = await fetch(`/minimax_refpack/files?kind=${encodeURIComponent(kind)}`);
+    if (!res.ok) throw new Error(`input listing failed: ${res.status}`);
+    const data = await res.json();
+    return Array.isArray(data.files) ? data.files.slice().sort((a, b) => a.localeCompare(b)) : [];
 }
 
 // The tile thumb: cropped by the route (media.thumbnail_png), and for a trimmed
@@ -592,9 +790,15 @@ function syncProbes(node) {
             probeResults.set(file, hasAudio);
             if (hasAudio === false) {
                 const cur = node._mmrpRefs.videos.find((v) => v.file === file);
-                if (cur && cur.use_soundtrack) {
+                if (cur && (cur.use_soundtrack || (cur.roles || []).some(
+                    (role) => role === "audio_reuse" || role === "audio_reference"
+                ))) {
                     const next = cloneRefs(node._mmrpRefs);
-                    next.videos.find((v) => v.file === file).use_soundtrack = false;
+                    const target = next.videos.find((v) => v.file === file);
+                    target.use_soundtrack = false;
+                    target.roles = (target.roles || []).filter(
+                        (role) => role !== "audio_reuse" && role !== "audio_reference"
+                    );
                     applyRefs(node, next);
                     return; // applyRefs already repaints
                 }
@@ -1319,7 +1523,7 @@ function onCanvasMouseDown(node, e) {
     } else if (hit.type === "edit") {
         openEditModal(node, hit.kind, hit.index);
     } else if (hit.type === "add") {
-        node._mmrpBody.fileInputs[hit.kind].click();
+        openAddReferenceModal(node, hit.kind);
     } else {
         node._mmrpSelected = { kind: hit.kind, index: hit.index };
         scheduleDraw(node);
@@ -1342,6 +1546,11 @@ function toggleSoundtrack(node, file) {
     const next = cloneRefs(node._mmrpRefs);
     const target = next.videos.find((v) => v.file === file);
     if (target) target.use_soundtrack = !target.use_soundtrack;
+    if (target && !target.use_soundtrack) {
+        target.roles = (target.roles || []).filter(
+            (role) => role !== "audio_reuse" && role !== "audio_reference"
+        );
+    }
     if (target) mlog("soundtrack", { file, on: target.use_soundtrack });
     applyRefs(node, next);
 }
@@ -1425,7 +1634,7 @@ function parseRefsValue(widget) {
     if (typeof raw !== "string" || !raw.trim()) return emptyRefs();
     try {
         const parsed = JSON.parse(raw);
-        return fromReferencesList((parsed && parsed.references) || []);
+        return fromReferencesEnvelope(parsed);
     } catch (e) {
         console.warn(
             "[MiniMaxRefPack] references_json held a value this build cannot read " +
@@ -1447,7 +1656,9 @@ function syncReferencesWidget(node) {
         const src = flat[i];
         return src && src.missing ? { ...r, missing: true } : r;
     });
-    w.value = JSON.stringify({ references: list });
+    const envelope = toReferencesEnvelope(node._mmrpRefs);
+    envelope.references = list;
+    w.value = JSON.stringify(envelope);
 }
 
 function applyRefs(node, refs) {
@@ -1474,7 +1685,7 @@ async function addFiles(node, kind, files) {
             const name = await apiUpload(file);
             mlog("uploaded", { kind, file: name, bytes: file.size });
             // soundtrack ON by default; the probe turns it back off for a silent clip
-            uploaded.push(kind === "video" ? { file: name, use_soundtrack: true } : { file: name });
+            uploaded.push(newReference(kind, name));
         } catch (e) {
             mwarn("upload_failed", { kind, file: file.name, error: e.message });
             alert(`Upload failed for ${file.name}: ${e.message}`);
@@ -1518,6 +1729,18 @@ function renderNodeBody(node) {
     const refs = node._mmrpRefs;
     for (const kind of KINDS) {
         body.uploadButtons[kind].disabled = refs[`${kind}s`].length >= CAPS[kind];
+    }
+    if (body.planButton) {
+        const state = deriveTaskPlanState(refs);
+        body.planButton.textContent = state.error
+            ? "Plan: needs attention"
+            : state.mode === "explicit"
+              ? `Plan: ${state.prefix}`
+              : state.mode === "auto"
+                ? "Plan: infer roles"
+                : "Plan: legacy";
+        body.planButton.classList.toggle("mmrp-plan-error", !!state.error);
+        body.planButton.title = state.error || "Choose what each reference contributes";
     }
     syncProbes(node);
     scheduleDraw(node);
@@ -1631,6 +1854,13 @@ function buildCustomBlock(node) {
         uploadButtons[kind] = btn;
         fileInputs[kind] = input; // the per-row "+" add slots click these too
     }
+
+    const planButton = document.createElement("button");
+    planButton.className = "mmrp-btn mmrp-upload-btn mmrp-plan-btn";
+    planButton.textContent = "Plan: legacy";
+    planButton.title = "Choose what each reference contributes";
+    planButton.onclick = () => openTaskPlanModal(node);
+    uploadRow.appendChild(planButton);
 
     const saveConfigBtn = document.createElement("button");
     saveConfigBtn.className = "mmrp-btn mmrp-upload-btn";
@@ -1807,6 +2037,7 @@ function buildCustomBlock(node) {
         root: container,
         uploadButtons,
         fileInputs,
+        planButton,
         canvas,
         ctx: canvas.getContext("2d"),
         directionInput,
@@ -1815,6 +2046,417 @@ function buildCustomBlock(node) {
         resizeObserver,
     };
     return container;
+}
+
+// ---------------------------------------------------------------------------
+// Input-directory picker + asset-first task plan
+// ---------------------------------------------------------------------------
+
+let plannerModalSerial = 0;
+
+function createPlannerModal(title, extraClass = "") {
+    document.querySelectorAll(".mmrp-overlay.mmrp-planner-overlay").forEach((el) => el.remove());
+    const previouslyFocused = document.activeElement;
+    const overlay = document.createElement("div");
+    overlay.className = "mmrp-overlay mmrp-planner-overlay";
+    const modal = document.createElement("div");
+    modal.className = `mmrp-modal mmrp-planner-modal ${extraClass}`.trim();
+    const header = document.createElement("div");
+    header.className = "mmrp-modal-header mmrp-planner-header";
+    const heading = document.createElement("span");
+    heading.id = `mmrp-planner-title-${++plannerModalSerial}`;
+    heading.textContent = title;
+    const closeButton = document.createElement("button");
+    closeButton.className = "mmrp-btn mmrp-planner-close";
+    closeButton.textContent = "×";
+    closeButton.setAttribute("aria-label", "Close");
+    header.appendChild(heading);
+    header.appendChild(closeButton);
+    modal.appendChild(header);
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-labelledby", heading.id);
+    overlay.appendChild(modal);
+
+    const onKey = (event) => {
+        if (event.key === "Escape") {
+            event.stopPropagation();
+            close();
+            return;
+        }
+        if (event.key === "Tab" && modal.contains(event.target)) {
+            const focusable = [...modal.querySelectorAll(
+                'button:not([disabled]), select:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])'
+            )].filter((element) => element.offsetParent !== null);
+            if (!focusable.length) return;
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+            }
+        }
+    };
+    const close = () => {
+        document.removeEventListener("keydown", onKey, true);
+        overlay.remove();
+        if (previouslyFocused && typeof previouslyFocused.focus === "function") {
+            previouslyFocused.focus();
+        }
+    };
+    closeButton.onclick = close;
+    overlay.onclick = (event) => {
+        if (event.target === overlay) close();
+    };
+    // Keep graph-level delete/queue shortcuts out while a select or checkbox owns focus,
+    // without intercepting the event before it reaches that control.
+    modal.addEventListener("keydown", (event) => event.stopPropagation());
+    document.addEventListener("keydown", onKey, true);
+    document.body.appendChild(overlay);
+    requestAnimationFrame(() => closeButton.focus());
+    return { overlay, modal, close };
+}
+
+function appendFileOptions(select, files, current = "") {
+    select.replaceChildren();
+    const names = [...new Set([current, ...(files || [])].filter(Boolean))];
+    for (const file of names) {
+        const option = document.createElement("option");
+        option.value = file;
+        option.textContent = file;
+        select.appendChild(option);
+    }
+    select.value = current || names[0] || "";
+}
+
+async function openAddReferenceModal(node, kind) {
+    if (node._mmrpRefs[`${kind}s`].length >= CAPS[kind]) return;
+    const { modal, close } = createPlannerModal(`Add ${kind} reference`, "mmrp-add-modal");
+
+    const hint = document.createElement("div");
+    hint.className = "mmrp-modal-hint";
+    hint.textContent = "Choose a file already in ComfyUI's input directory, or upload a new one.";
+    modal.appendChild(hint);
+
+    const select = document.createElement("select");
+    select.className = "mmrp-source-select";
+    select.disabled = true;
+    const loading = document.createElement("option");
+    loading.textContent = "Loading input directory…";
+    select.appendChild(loading);
+    modal.appendChild(select);
+
+    const status = document.createElement("div");
+    status.className = "mmrp-plan-status";
+    modal.appendChild(status);
+
+    const footer = document.createElement("div");
+    footer.className = "mmrp-modal-footer";
+    const upload = document.createElement("button");
+    upload.className = "mmrp-btn";
+    upload.textContent = "Upload new…";
+    upload.onclick = () => {
+        close();
+        node._mmrpBody.fileInputs[kind].click();
+    };
+    const cancel = document.createElement("button");
+    cancel.className = "mmrp-btn";
+    cancel.textContent = "Cancel";
+    cancel.onclick = close;
+    const add = document.createElement("button");
+    add.className = "mmrp-btn mmrp-btn-primary";
+    add.textContent = "Add selected";
+    add.disabled = true;
+    add.onclick = () => {
+        const file = select.value;
+        if (!file) return;
+        // Re-check after the async listing: a simultaneous drop/upload may have filled
+        // the last slot while this modal was open.
+        const next = cloneRefs(node._mmrpRefs);
+        const target = next[`${kind}s`];
+        if (target.length >= CAPS[kind]) {
+            status.textContent = `The ${kind} references are already at their ${CAPS[kind]}-asset limit.`;
+            add.disabled = true;
+            return;
+        }
+        target.push(newReference(kind, file));
+        close();
+        applyRefs(node, next);
+    };
+    footer.appendChild(upload);
+    footer.appendChild(cancel);
+    footer.appendChild(add);
+    modal.appendChild(footer);
+
+    try {
+        const files = await apiListFiles(kind);
+        appendFileOptions(select, files);
+        select.disabled = files.length === 0;
+        add.disabled = files.length === 0;
+        status.textContent = files.length
+            ? `${files.length} ${kind} file${files.length === 1 ? "" : "s"} available.`
+            : `No ${kind} files are in the input directory yet.`;
+    } catch (error) {
+        status.textContent = `Could not list the input directory: ${error.message}`;
+    }
+}
+
+async function openTaskPlanModal(node) {
+    const openedFingerprint = referencesFingerprint(node._mmrpRefs);
+    const working = cloneRefs(node._mmrpRefs);
+    const legacyJobType = String(widgetByName(node, "job_type")?.value || "auto");
+    if (!working.taskPlan) {
+        working.taskPlan = {
+            mode: legacyJobType === "auto" ? "auto" : "explicit",
+            specialization: "none",
+        };
+    }
+
+    const { modal, close } = createPlannerModal("Task plan", "mmrp-task-modal");
+    const hint = document.createElement("div");
+    hint.className = "mmrp-modal-hint";
+    hint.textContent = node._mmrpRefs.taskPlan
+        ? "Choose what each reference contributes. Roles determine the exact MiniMax task prefix. Changing a source clears that asset's crop/trim edits; a new video starts with soundtrack detection on."
+        : `This workflow currently uses legacy job_type=${legacyJobType}. Applying this dialog moves it to the asset-first plan; changing a source clears that asset's crop/trim edits, and a new video starts with soundtrack detection on.`;
+    modal.appendChild(hint);
+
+    const controls = document.createElement("div");
+    controls.className = "mmrp-plan-controls";
+    const modeLabel = document.createElement("label");
+    modeLabel.textContent = "Planning";
+    const mode = document.createElement("select");
+    mode.innerHTML = '<option value="auto">Infer roles</option><option value="explicit">Set roles explicitly</option>';
+    mode.value = working.taskPlan.mode;
+    modeLabel.appendChild(mode);
+    controls.appendChild(modeLabel);
+
+    const specializationLabel = document.createElement("label");
+    specializationLabel.textContent = "Replacement specialization";
+    const specialization = document.createElement("select");
+    specialization.innerHTML = [
+        ["none", "None / general"],
+        ["character_replacement", "Character replacement"],
+        ["object_replacement", "Object replacement"],
+    ].map(([value, label]) => `<option value="${value}">${label}</option>`).join("");
+    specialization.value = working.taskPlan.specialization || "none";
+    specializationLabel.appendChild(specialization);
+    controls.appendChild(specializationLabel);
+    modal.appendChild(controls);
+
+    const status = document.createElement("div");
+    status.className = "mmrp-plan-status";
+    modal.appendChild(status);
+
+    const assets = document.createElement("div");
+    assets.className = "mmrp-plan-assets";
+    modal.appendChild(assets);
+
+    const footer = document.createElement("div");
+    footer.className = "mmrp-modal-footer";
+    const cancel = document.createElement("button");
+    cancel.className = "mmrp-btn";
+    cancel.textContent = "Cancel";
+    cancel.onclick = close;
+    const save = document.createElement("button");
+    save.className = "mmrp-btn mmrp-btn-primary";
+    save.textContent = "Apply plan";
+    footer.appendChild(cancel);
+    footer.appendChild(save);
+    modal.appendChild(footer);
+
+    const fileLists = { image: [], video: [], audio: [] };
+    const listingErrors = [];
+    await Promise.all(KINDS.map(async (kind) => {
+        try {
+            fileLists[kind] = await apiListFiles(kind);
+        } catch (error) {
+            listingErrors.push(`${kind}: ${error.message}`);
+        }
+    }));
+
+    const update = () => {
+        working.taskPlan.mode = mode.value;
+        working.taskPlan.specialization = mode.value === "explicit" ? specialization.value : "none";
+        specialization.disabled = mode.value !== "explicit";
+        assets.querySelectorAll("input[type=checkbox], input[type=radio]").forEach((input) => {
+            input.disabled = mode.value !== "explicit" || input.dataset.unavailable === "true";
+        });
+        const stale = referencesFingerprint(node._mmrpRefs) !== openedFingerprint;
+        const state = deriveTaskPlanState(working, true);
+        status.textContent = stale
+            ? "References changed while this planner was open. Close it and reopen to keep the new assets."
+            : state.error || (
+            state.mode === "explicit"
+                ? `Derived prefix: ${state.prefix}`
+                : "The VLM will infer relationships; the existing classifier remains available for replacements."
+        );
+        status.classList.toggle("mmrp-plan-status-error", stale || !!state.error);
+        status.title = listingErrors.length
+            ? `Input listing warning — ${listingErrors.join("; ")}`
+            : "";
+        save.disabled = stale || !!state.error;
+    };
+
+    const assetRows = [];
+    const refreshTagLabels = () => {
+        const tagged = assignTags(working);
+        for (const item of assetRows) {
+            const taggedReference = tagged[`${item.kind}s`][item.index];
+            item.tag.textContent = taggedReference.audioTag
+                ? `${taggedReference.tag} · soundtrack ${taggedReference.audioTag}`
+                : taggedReference.tag;
+        }
+    };
+
+    for (const kind of KINDS) {
+        working[`${kind}s`].forEach((reference, index) => {
+            const row = document.createElement("section");
+            row.className = "mmrp-plan-asset";
+
+            const assetHead = document.createElement("div");
+            assetHead.className = "mmrp-plan-asset-head";
+            const tag = document.createElement("strong");
+            const kindLabel = document.createElement("span");
+            kindLabel.textContent = kind;
+            assetHead.appendChild(tag);
+            assetHead.appendChild(kindLabel);
+            row.appendChild(assetHead);
+            assetRows.push({ kind, index, tag });
+
+            const sourceLabel = document.createElement("label");
+            sourceLabel.className = "mmrp-source-row";
+            sourceLabel.textContent = "Source";
+            const source = document.createElement("select");
+            source.className = "mmrp-source-select";
+            appendFileOptions(source, fileLists[kind], reference.file);
+            source.onchange = () => {
+                const oldFile = reference.file;
+                if (!source.value || source.value === oldFile) return;
+                reference.file = source.value;
+                reference.missing = false;
+                delete reference.crop;
+                delete reference.trim;
+                if (kind === "video") {
+                    const knownSilent = probeResults.get(reference.file) === false;
+                    reference.use_soundtrack = !knownSilent;
+                    if (knownSilent) {
+                        reference.roles = (reference.roles || []).filter(
+                            (role) => role !== "audio_reuse" && role !== "audio_reference"
+                        );
+                    }
+                    row.querySelectorAll("input[data-audio-role='true']").forEach((checkbox) => {
+                        checkbox.dataset.unavailable = String(knownSilent);
+                        checkbox.checked = (reference.roles || []).includes(checkbox.value);
+                    });
+                }
+                dropThumb(oldFile);
+                refreshTagLabels();
+                update();
+            };
+            sourceLabel.appendChild(source);
+            row.appendChild(sourceLabel);
+
+            let primaryControl = null;
+            if (kind === "video") {
+                const primaryLabel = document.createElement("label");
+                primaryLabel.className = "mmrp-primary-row";
+                primaryControl = document.createElement("input");
+                primaryControl.type = "checkbox";
+                primaryControl.checked = reference.primary === true;
+                primaryControl.onchange = () => {
+                    if (primaryControl.checked) {
+                        for (const video of working.videos) video.primary = false;
+                        reference.primary = true;
+                        assets.querySelectorAll("input[data-primary-control='true']")
+                            .forEach((input) => { input.checked = input === primaryControl; });
+                    } else {
+                        reference.primary = false;
+                    }
+                    update();
+                };
+                primaryControl.dataset.primaryControl = "true";
+                primaryLabel.appendChild(primaryControl);
+                primaryLabel.appendChild(document.createTextNode("Primary edit / continuation video"));
+                row.appendChild(primaryLabel);
+            }
+
+            const roles = document.createElement("div");
+            roles.className = "mmrp-role-grid";
+            for (const [roleId, roleLabel] of TASK_ROLE_OPTIONS[kind]) {
+                const label = document.createElement("label");
+                const checkbox = document.createElement("input");
+                checkbox.type = "checkbox";
+                checkbox.value = roleId;
+                checkbox.checked = (reference.roles || []).includes(roleId);
+                const isUnavailableSoundtrack = kind === "video"
+                    && (roleId === "audio_reuse" || roleId === "audio_reference")
+                    && (!reference.use_soundtrack || probeResults.get(reference.file) === false);
+                checkbox.dataset.unavailable = String(isUnavailableSoundtrack);
+                checkbox.dataset.audioRole = String(
+                    kind === "video" && (roleId === "audio_reuse" || roleId === "audio_reference")
+                );
+                checkbox.onchange = () => {
+                    const current = new Set(reference.roles || []);
+                    if (checkbox.checked) current.add(roleId);
+                    else current.delete(roleId);
+                    reference.roles = TASK_ROLE_OPTIONS[kind]
+                        .map(([id]) => id)
+                        .filter((id) => current.has(id));
+                    if (kind === "video"
+                        && (roleId === "video_editing" || roleId === "video_continuation")) {
+                        if (checkbox.checked && !working.videos.some((video) => video.primary)) {
+                            reference.primary = true;
+                            if (primaryControl) primaryControl.checked = true;
+                        } else if (!checkbox.checked && reference.primary
+                            && !reference.roles.some(
+                                (role) => role === "video_editing" || role === "video_continuation"
+                            )) {
+                            reference.primary = false;
+                            if (primaryControl) primaryControl.checked = false;
+                        }
+                    }
+                    update();
+                };
+                label.appendChild(checkbox);
+                label.appendChild(document.createTextNode(roleLabel));
+                roles.appendChild(label);
+            }
+            row.appendChild(roles);
+            assets.appendChild(row);
+        });
+    }
+    refreshTagLabels();
+    if (!assets.children.length) {
+        const empty = document.createElement("div");
+        empty.className = "mmrp-plan-empty";
+        empty.textContent = "Add a reference first; the node-wide drop zone and upload buttons still work.";
+        assets.appendChild(empty);
+    }
+
+    mode.onchange = update;
+    specialization.onchange = update;
+    save.onclick = () => {
+        if (referencesFingerprint(node._mmrpRefs) !== openedFingerprint) {
+            update();
+            return;
+        }
+        if (working.taskPlan.mode === "explicit" && !working.videos.some((video) => video.primary)) {
+            const drivers = working.videos.filter((video) => (video.roles || []).some(
+                (role) => role === "video_editing" || role === "video_continuation"
+            ));
+            if (drivers.length === 1) drivers[0].primary = true;
+        }
+        normalizePrimaryVideo(working);
+        const state = deriveTaskPlanState(working);
+        if (state.error) return;
+        setWidget(node, "job_type", "auto");
+        close();
+        applyRefs(node, working);
+    };
+    update();
 }
 
 // ---------------------------------------------------------------------------
@@ -1837,14 +2479,17 @@ function buildConfig(node, name) {
         const widget = widgetByName(node, n);
         return widget ? widget.value || "" : "";
     };
-    return {
+    const envelope = toReferencesEnvelope(node._mmrpRefs);
+    const config = {
         version: 1,
         name,
         direction: w("direction"),
         model: w("model"),
         reasoning_effort: w("reasoning_effort"),
-        references: toReferencesList(node._mmrpRefs),
+        references: envelope.references,
     };
+    if (envelope.task_plan) config.task_plan = envelope.task_plan;
+    return config;
 }
 
 function downloadJson(filename, obj) {
@@ -1966,7 +2611,7 @@ async function applyConfig(node, data, sourceLabel) {
     const missing = await missingFiles(data.references);
     const list = data.references.map((r) => ({ ...r, missing: missing.has(r.file) }));
     node._mmrpSelected = null;
-    applyRefs(node, fromReferencesList(list));
+    applyRefs(node, fromReferencesEnvelope({ references: list, task_plan: data.task_plan }));
 
     const directionWidget = widgetByName(node, "direction");
     if (directionWidget && typeof data.direction === "string") {
@@ -2931,10 +3576,16 @@ app.registerExtension({
             const systemPromptWidget = widgetByName(node, "system_prompt");
             const ivSystemPrompt = hideWidget(systemPromptWidget);
 
+            // Kept in INPUT_TYPES only as a positional compatibility field for old
+            // workflows. New routing is owned by the asset-first Task plan button.
+            const jobTypeWidget = widgetByName(node, "job_type");
+            const ivJobType = hideWidget(jobTypeWidget);
+
             // Cleared early in installSelectionHandlers' onRemoved wrapper so a deleted
             // node doesn't leave a hide-poll timer running (they also self-clear after
             // 1s regardless, this just avoids the wait on an early delete).
-            node._mmrpHideIntervals = [ivRefs, ivDirection, ivSystemPrompt].filter((id) => id !== undefined);
+            node._mmrpHideIntervals = [ivRefs, ivDirection, ivSystemPrompt, ivJobType]
+                .filter((id) => id !== undefined);
 
             const bodyEl = buildCustomBlock(node);
             // hideOnZoom defaults to TRUE in addDOMWidget. Below the frontend's LOD scale
