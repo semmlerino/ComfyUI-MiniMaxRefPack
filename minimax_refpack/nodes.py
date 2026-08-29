@@ -184,11 +184,9 @@ class MiniMaxH3ReferencePack:
                 # --- what gets written (provider-neutral) -----------------------------
                 "job_type": (list(prompt.MODES), {
                     "default": "auto",
-                    "tooltip": "Which register to write in. standard = a scene (six-section "
-                               "Ref2VA). replacement = swap one thing in a reference video "
-                               "for the thing in a reference image. auto = a cheap classifier "
-                               "decides, and only runs when there is at least 1 video and "
-                               "1 image.",
+                    "tooltip": "Legacy routing retained for saved workflows. New workflows "
+                               "use the References Manager's Task plan: explicit asset roles "
+                               "skip classification, while Infer roles uses auto.",
                 }),
 
                 # --- the target video --------------------------------------------------
@@ -331,7 +329,11 @@ class MiniMaxH3ReferencePack:
             f"length_seconds: {length_seconds or '(unspecified)'}",
             f"reasoning_effort: {reasoning_effort}",
             f"max_reference_edge: {max_reference_edge or 'off'}",
-            f"job_type: {job_type}",   # rewritten below once auto has resolved
+            (
+                f"task_plan: {reference_set.task_plan.mode}"
+                if reference_set.task_plan is not None
+                else f"job_type: {job_type}"
+            ),   # rewritten below once auto/explicit routing has resolved
             f"system_prompt: {'workflow override' if (system_prompt or '').strip() else 'packaged default'}",
             f"references: {len(reference_set.references)} "
             f"({', '.join(f'{t.tag} {t.file}' for t in reference_set.assign_tags()) or 'none'})",
@@ -389,15 +391,25 @@ class MiniMaxH3ReferencePack:
                     msg = msg.replace(openrouter_api_key, "***")
                 raise ValueError(f"prompt generation failed: {msg}") from e
 
-        # Hoist the resolved mode into the header. With job_type=auto the header alone
-        # would only say "auto", and which register actually ran is the thing worth
-        # seeing at a glance - it decides the entire output format.
+        # Hoist the resolved route into the header. With auto the header alone would only
+        # say "auto"; with an explicit plan the derived prefix and overlays are the thing
+        # worth seeing at a glance.
         if debug_sink:
             routing = next(
-                (ln for ln in debug_sink[0].splitlines() if ln.startswith("job_type:")), ""
+                (
+                    ln
+                    for ln in debug_sink[0].splitlines()
+                    if ln.startswith(("job_type:", "task_plan:"))
+                ),
+                "",
             )
             if routing:
-                debug_header = [routing if ln.startswith("job_type:") else ln for ln in debug_header]
+                debug_header = [
+                    routing
+                    if ln.startswith(("job_type:", "task_plan:"))
+                    else ln
+                    for ln in debug_header
+                ]
 
         debug_text = "\n".join(debug_header)
         if debug_sink:

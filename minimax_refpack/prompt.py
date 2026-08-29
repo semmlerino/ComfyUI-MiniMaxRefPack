@@ -22,7 +22,7 @@ import requests
 from PIL import Image
 
 from . import endpoint as _endpoint
-from . import logs, media
+from . import logs, media, task_plan
 
 # Kept as a module-level default so every function that takes an Endpoint can be called
 # without one and behave exactly as it did before this module knew endpoints existed.
@@ -62,13 +62,26 @@ REASONING_EFFORTS = ("none", "low", "medium", "high")
 
 _SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "system_prompt.md")
 _REPLACEMENT_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "system_prompt_replacement.md")
+_OVERLAY_DIR = os.path.join(os.path.dirname(__file__), "system_prompt_overlays")
+_TASK_OVERLAY_PATHS = {
+    task_type: os.path.join(_OVERLAY_DIR, task_type + ".md")
+    for task_type in (
+        "reference_generation",
+        "keyframe_completion",
+        "video_editing",
+        "video_continuation",
+        "audio_reuse",
+        "audio_reference",
+    )
+}
+_SPECIALIZATION_OVERLAY_PATHS = {
+    specialization: os.path.join(_OVERLAY_DIR, specialization + ".md")
+    for specialization in ("character_replacement", "object_replacement")
+}
 
-# Two registers, one per job. "standard" is the six-section Ref2VA writer; "replacement"
-# swaps one thing in a reference video for the thing in a reference image and changes
-# nothing else. They are separate FILES, not two halves of one prompt: the Ref2VA rules
-# are ~22KB of hard formatting mandates and putting both in context produces hybrids.
+# Legacy job_type remains a three-value widget for saved-workflow compatibility. New
+# explicit plans compose the same official base with only the overlays their roles need.
 MODES = ("auto", "standard", "replacement")
-_PROMPT_PATHS = {"standard": _SYSTEM_PROMPT_PATH, "replacement": _REPLACEMENT_PROMPT_PATH}
 
 # Free models were measured and rejected for this job (2026-08-15): gemma-4-31b:free
 # returned HTTP 429 on every call, gpt-oss-20b:free returned no `content` field.
@@ -371,9 +384,27 @@ def _text_part(text: str) -> dict:
 
 
 def _read_system_prompt(mode: str = "standard") -> str:
-    path = _PROMPT_PATHS.get(mode, _SYSTEM_PROMPT_PATH)
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+    with open(_SYSTEM_PROMPT_PATH, "r", encoding="utf-8") as f:
+        base = f.read()
+    if mode != "replacement":
+        return base
+    with open(_REPLACEMENT_PROMPT_PATH, "r", encoding="utf-8") as f:
+        return base.rstrip() + "\n\n" + f.read()
+
+
+def _system_prompt_for_plan(resolved: task_plan.ResolvedTaskPlan) -> str:
+    """Compose the official base with deterministic role/specialization overlays."""
+    parts = [_read_system_prompt("standard").rstrip()]
+    for overlay_id in resolved.overlay_ids:
+        path = _TASK_OVERLAY_PATHS.get(overlay_id) or _SPECIALIZATION_OVERLAY_PATHS.get(overlay_id)
+        if path is None:  # resolve() owns the ids; this is a defensive packaging guard.
+            raise PromptError(f"no system-prompt overlay for task role {overlay_id!r}")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                parts.append(f.read().strip())
+        except OSError as e:
+            raise PromptError(f"could not load system-prompt overlay {overlay_id!r}: {e}") from e
+    return "\n\n".join(parts) + "\n"
 
 
 def classify_mode(*, direction: str, references, api_key: str, model: str = "", ep=None) -> str:
@@ -775,10 +806,20 @@ def write_prompt(
     ep = _endpoint.resolve(provider, api_base)
     key = _key_for(ep, api_key)
 
+    explicit_plan = task_plan.resolve(references)
+
     # job_type picks the register. "auto" asks a cheap classifier; anything else is taken
-    # at its word and makes no extra call. An explicit system_prompt overrides all of it.
-    resolved = job_type if job_type in ("standard", "replacement") else "standard"
-    if job_type == "auto":
+    # at its word and makes no extra call. A persisted task_plan owns routing once present;
+    # old references_json values have no plan and retain the widget's exact old behaviour.
+    effective_job_type = (
+        "auto"
+        if references.task_plan is not None and references.task_plan.mode == "auto"
+        else job_type
+    )
+    resolved = effective_job_type if effective_job_type in ("standard", "replacement") else "standard"
+    if explicit_plan is not None:
+        resolved = "explicit"
+    elif effective_job_type == "auto":
         # Off OpenRouter there is no cheap second model to reach for, so the writer's own
         # model classifies. Same endpoint, same key, so "local" stays local.
         classifier = classifier_model or ("" if ep.is_openrouter else model)
@@ -791,12 +832,19 @@ def write_prompt(
     # stripped). Blank -> fall back to the packaged file for the resolved job type, read
     # at call time (not import time) so an edit on disk lands on the next queue.
     if not (system_prompt and system_prompt.strip()):
-        system_prompt = _read_system_prompt(resolved)
+        system_prompt = (
+            _system_prompt_for_plan(explicit_plan)
+            if explicit_plan is not None
+            else _read_system_prompt(resolved)
+        )
     content = _build_content(
         references, input_dir, direction,
         width=width, height=height, length_seconds=length_seconds, accepts=ep.accepts,
         cache=cache, max_reference_edge=max_reference_edge,
     )
+    if explicit_plan is not None:
+        plan_text = task_plan.render_user_block(references, explicit_plan)
+        content[0] = {**content[0], "text": plan_text + "\n\n" + content[0]["text"]}
 
     payload = {
         "model": model,
@@ -820,7 +868,17 @@ def write_prompt(
     if debug is not None:
         # Exactly ONE entry: the node reads debug_sink[0]. The routing line rides on top
         # of the payload render rather than being a second entry.
-        routing = f"job_type: {job_type} -> {resolved} (system prompt: {resolved}.md)"
+        if explicit_plan is not None:
+            overlays = ", ".join(explicit_plan.overlay_ids)
+            routing = (
+                f"task_plan: explicit -> {explicit_plan.prefix} "
+                f"(system prompt: base + {overlays})"
+            )
+        else:
+            routing = (
+                f"job_type: {effective_job_type} -> {resolved} "
+                f"(system prompt: {resolved}.md)"
+            )
         routing += f"\nendpoint: {ep.describe()}"
         if ep.degrades:
             missing = ", ".join(sorted(_DEFAULT_ENDPOINT.accepts - ep.accepts))

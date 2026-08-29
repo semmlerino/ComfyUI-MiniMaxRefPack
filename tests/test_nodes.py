@@ -612,6 +612,39 @@ def test_debug_header_shows_what_auto_resolved_to(fake_folder_paths, monkeypatch
     assert "\njob_type: auto\n" not in header, "the unresolved line should be replaced"
 
 
+def test_debug_header_shows_an_explicit_plans_derived_prefix(fake_folder_paths, monkeypatch):
+    _touch(fake_folder_paths, "i1.jpg")
+    monkeypatch.setattr(nodes.media, "load_image", lambda path, crop=None, max_edge=0: f"IMG:{path}")
+
+    def fake_write_prompt(**kwargs):
+        kwargs["debug"].append(
+            "task_plan: explicit -> [keyframe completion] "
+            "(system prompt: base + keyframe_completion)\nmodel: m"
+        )
+        return "a prompt"
+
+    monkeypatch.setattr(nodes.prompt, "write_prompt", fake_write_prompt, raising=False)
+    references_json = json.dumps(
+        {
+            "references": [
+                {
+                    "kind": "image",
+                    "file": "i1.jpg",
+                    "roles": ["keyframe_completion"],
+                }
+            ],
+            "task_plan": {"mode": "explicit"},
+        }
+    )
+
+    out = nodes.MiniMaxH3ReferencePack().build(
+        direction="d", openrouter_api_key="", model="m", references_json=references_json
+    )
+    header = out[refs.slot_index("debug")].split("--- payload")[0]
+    assert "task_plan: explicit -> [keyframe completion]" in header
+    assert "\ntask_plan: explicit\n" not in header
+
+
 def test_debug_header_keeps_the_raw_job_type_when_no_call_is_made(fake_folder_paths, monkeypatch):
     """Nothing resolved, so nothing to hoist - the header still reports the setting."""
     _touch(fake_folder_paths, "i1.jpg")
