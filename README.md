@@ -117,14 +117,13 @@ So a video's soundtrack is `<Audio 1>` even if you added a standalone audio clip
 
 The model's limits, not the node's: 9 images, 3 videos, 3 soundtracks, 3 audio clips. Reference videos need at least 5 frames, get trimmed to MiniMax's 17k+5 frame grid, then capped to the length of the video you're generating. Clips are resampled to 24fps on the way in.
 
-## Changed in this release
+## Changed in 0.4.0
 
 Reference videos are decoded by a streaming pass of our own rather than through ComfyUI's `VideoFromFile`. Peak memory for one 10s 1080p reference goes from about 19 GB to about 5.7 GB, and two things about the OUTPUT change with it. **A saved workflow with a trim on one of those references will produce different frames or audio than it did before.**
 
 - **A trimmed soundtrack starts where you asked.** On mkv and webm references the head trim was computed against the container's time base while the audio had already been rebased to the sample rate, so the retained audio started too early and drifted out of sync with its frames. mp4/AAC references were never affected.
 - **A rotated clip crops where the tile showed it.** A clip carrying a display matrix (anything shot on a phone in portrait) is now reported and previewed in DISPLAY orientation, the same orientation the emitted frames and the browser's own player use. Before, `probe` reported the raw dimensions and the thumbnail was un-rotated, so a crop rect drawn on the tile selected a different region than the pack emitted.
 
-The version is deliberately NOT bumped here: `tests/test_example_workflows.py` requires every example workflow's `properties.ver` to match `pyproject.toml`, so the bump and the workflow re-stamp belong to whoever cuts the release, together.
 ## Licence
 
 MIT. Free, and public on GitHub. Clone it, fork it, rip the prompt writer out and keep the reference manager, ship it inside something you sell. You do not need an account, and the node never calls home.
