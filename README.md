@@ -117,6 +117,12 @@ So a video's soundtrack is `<Audio 1>` even if you added a standalone audio clip
 
 The model's limits, not the node's: 9 images, 3 videos, 3 soundtracks, 3 audio clips. Reference videos need at least 5 frames, get trimmed to MiniMax's 17k+5 frame grid, then capped to the length of the video you're generating. Clips are resampled to 24fps on the way in.
 
+## Changed in 0.4.1
+
+The task planner now shows the same image and video previews as the reference tiles,
+including the selected crop and video frame. Changing a planned row's source refreshes
+its preview immediately, so asset roles can be checked visually before saving the plan.
+
 ## Changed in 0.4.0
 
 Reference videos are decoded by a streaming pass of our own rather than through ComfyUI's `VideoFromFile`. Peak memory for one 10s 1080p reference goes from about 19 GB to about 5.7 GB, and two things about the OUTPUT change with it. **A saved workflow with a trim on one of those references will produce different frames or audio than it did before.**
