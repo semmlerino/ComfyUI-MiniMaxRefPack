@@ -21,7 +21,7 @@ def fake_media(monkeypatch):
     monkeypatch.setattr(prompt.media, "load_video", lambda *a, **k: ([object()] * 30, {"x": 1}))
     monkeypatch.setattr(prompt.media, "load_image", lambda *a, **k: object())
     monkeypatch.setattr(prompt.media, "load_audio", lambda *a, **k: {"x": 1})
-    monkeypatch.setattr(prompt.media, "video_clip_bytes", lambda *a, **k: (b"mp4", "video/mp4"))
+    monkeypatch.setattr(prompt.media, "encode_reference_mp4", lambda *a, **k: (b"mp4", True))
     monkeypatch.setattr(prompt, "_tensor_to_jpeg_b64", lambda t: "BASE64")
 
 

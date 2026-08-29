@@ -15,3 +15,7 @@ docs/
 
 # Artifact written by `comfy node publish`.
 node.zip
+
+# uv writes this when provisioning .venv from the dev dependency group; the node is
+# loaded from its directory, not installed, so a lock file is a local artifact only.
+uv.lock

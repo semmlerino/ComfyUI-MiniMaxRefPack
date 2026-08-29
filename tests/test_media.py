@@ -622,76 +622,14 @@ def test_a_failed_load_is_logged_as_a_failure(monkeypatch, caplog):
     assert "ok=false" in line and "error=ValueError" in line
 
 
-# ---- video bytes for the VLM ---------------------------------------------------
-# The VLM takes whole videos (OpenRouter `video_url` parts, verified live against
-# google/gemini-3-flash-preview: 10.12s clip -> 660 video tokens + 250 audio tokens).
-# An untouched clip is therefore sent as the FILE, which decodes nothing at all; a
-# cropped or trimmed one has to be re-encoded so the VLM sees what the socket emits.
-
-
-def test_an_untouched_clip_is_sent_as_the_file_itself(tmp_path):
-    p = tmp_path / "clip.mp4"
-    p.write_bytes(b"\x00\x01not-really-an-mp4\x02")
-
-    data, mime = media.video_clip_bytes(str(p))
-
-    assert data == p.read_bytes()
-    assert mime == "video/mp4"
-
-
-def test_the_file_path_carries_the_soundtrack_so_it_needs_no_re_encode(tmp_path):
-    """Documented as behaviour: nothing is decoded on this path."""
-    p = tmp_path / "clip.mp4"
-    p.write_bytes(b"x" * 32)
-
-    assert media.video_clip_bytes(str(p))[1] == "video/mp4"
-    assert media.video_clip_bytes(str(p), crop=None, trim=None)[0] == b"x" * 32
-
-
-@pytest.mark.parametrize("suffix,mime", [
-    (".mp4", "video/mp4"), (".mov", "video/mov"), (".webm", "video/webm"), (".mpeg", "video/mpeg"),
-])
-def test_containers_openrouter_accepts_pass_straight_through(tmp_path, suffix, mime):
-    p = tmp_path / f"clip{suffix}"
-    p.write_bytes(b"bytes")
-
-    assert media.video_clip_bytes(str(p)) == (b"bytes", mime)
-
-
-def test_a_container_openrouter_does_not_accept_is_re_encoded(tmp_path, monkeypatch):
-    called = {}
-
-    def fake_transcode(path, crop, trim):
-        called["args"] = (path, crop, trim)
-        return b"mp4"
-
-    monkeypatch.setattr(media, "_transcode_window", fake_transcode)
-    p = tmp_path / "clip.avi"
-    p.write_bytes(b"avi bytes")
-
-    data, mime = media.video_clip_bytes(str(p))
-
-    assert (data, mime) == (b"mp4", "video/mp4")
-    assert called["args"] == (str(p), None, None)
-
-
-@pytest.mark.parametrize("crop,trim", [
-    ([0.0, 0.0, 0.5, 1.0], None),
-    (None, [2.0, 6.5]),
-    ([0.0, 0.0, 0.5, 1.0], [2.0, 6.5]),
-])
-def test_an_edited_clip_is_re_encoded_so_the_vlm_sees_the_edit(tmp_path, monkeypatch, crop, trim):
-    seen = {}
-
-    def fake_transcode(path, c, t):
-        seen["args"] = (c, t)
-        return b"mp4"
-
-    monkeypatch.setattr(media, "_transcode_window", fake_transcode)
-    p = tmp_path / "clip.mp4"
-    p.write_bytes(b"original")
-
-    data, mime = media.video_clip_bytes(str(p), crop=crop, trim=trim)
-
-    assert data == b"mp4" and mime == "video/mp4"
-    assert seen["args"] == (crop, trim)
+# ---- the VLM's copy of a clip ---------------------------------------------------
+# This used to hold five tests for `video_clip_bytes`, which chose between inlining the
+# original FILE and re-encoding a cropped/trimmed window. That split is gone: every clip
+# is now encoded from the frames the sockets already decoded (media.encode_reference_mp4),
+# so there is no container-mime lookup left to test and no untouched fast path to protect.
+#
+# Those five tests all monkeypatched `_transcode_window` and asserted only on the
+# arguments it received, which meant the encoder itself had no regression net under it at
+# all. tests/test_media_encode.py is the replacement and it runs the real encoder: it
+# encodes, decodes the result back with PyAV, and asserts on structure - dimensions, frame
+# rate, frame count, and a soundtrack that actually carries samples.

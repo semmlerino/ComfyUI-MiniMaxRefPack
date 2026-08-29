@@ -289,6 +289,12 @@ class MiniMaxH3ReferencePack:
         )
 
         outputs = refs.empty_outputs()
+        # ONE cache for this build and no longer. The prompt writer needs the same pixels
+        # the sockets do, and before this it fetched its own copy of every one of them.
+        # It must not outlive the build: the browser re-uploads an edited reference under
+        # the same filename with overwrite=true, which is exactly why IS_CHANGED above
+        # hashes mtime+size rather than trusting the name.
+        cache = media.MediaCache()
         for tagged in reference_set.assign_tags():
             path = os.path.join(input_dir, tagged.file)
             logs.log(
@@ -301,16 +307,16 @@ class MiniMaxH3ReferencePack:
             # also ride inside references_json, so IS_CHANGED's key already moves on an
             # edit - confirmed by test_is_changed_key_moves_when_only_an_edit_changes.
             if tagged.kind == "image":
-                outputs[refs.slot_index(f"image_{tagged.slot}")] = media.load_image(
+                outputs[refs.slot_index(f"image_{tagged.slot}")] = cache.image(
                     path, crop=tagged.ref.crop, max_edge=max_reference_edge
                 )
             elif tagged.kind == "video":
-                frames, audio = media.load_video(path, crop=tagged.ref.crop, trim=tagged.ref.trim)
+                frames, audio = cache.video(path, crop=tagged.ref.crop, trim=tagged.ref.trim)
                 outputs[refs.slot_index(f"video_{tagged.slot}")] = frames
                 if tagged.ref.use_soundtrack and audio is not None:
                     outputs[refs.slot_index(f"video_audio_{tagged.slot}")] = audio
             else:  # audio
-                outputs[refs.slot_index(f"audio_{tagged.slot}")] = media.load_audio(
+                outputs[refs.slot_index(f"audio_{tagged.slot}")] = cache.audio(
                     path, trim=tagged.ref.trim
                 )
 
@@ -366,6 +372,8 @@ class MiniMaxH3ReferencePack:
                     debug=debug_sink,
                     provider=provider,
                     api_base=api_base,
+                    cache=cache,
+                    max_reference_edge=max_reference_edge,
                 )
             except ValueError as e:
                 # endpoint.resolve raises this for "local with no api_base". It is a user

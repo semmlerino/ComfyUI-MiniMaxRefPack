@@ -41,7 +41,7 @@ def test_slot_placement_for_a_mixed_set(fake_folder_paths, monkeypatch):
     _touch(tmp_path, "i1.jpg", "i2.jpg", "v1.mp4", "a1.wav")
 
     monkeypatch.setattr(nodes.media, "load_image", lambda path, crop=None, max_edge=0: f"IMG:{path}")
-    monkeypatch.setattr(nodes.media, "load_video", lambda path, crop=None, trim=None: (f"VIDEO:{path}", f"AUDIO:{path}"))
+    monkeypatch.setattr(nodes.media, "load_video", lambda path, target_fps=24, crop=None, trim=None: (f"VIDEO:{path}", f"AUDIO:{path}"))
     monkeypatch.setattr(nodes.media, "load_audio", lambda path, trim=None: f"AUD:{path}")
     _stub_prompt(monkeypatch)
 
@@ -73,7 +73,7 @@ def test_slot_placement_for_a_mixed_set(fake_folder_paths, monkeypatch):
 def test_video_without_use_soundtrack_leaves_video_audio_slot_empty(fake_folder_paths, monkeypatch):
     tmp_path = fake_folder_paths
     _touch(tmp_path, "v1.mp4")
-    monkeypatch.setattr(nodes.media, "load_video", lambda path, crop=None, trim=None: (f"VIDEO:{path}", f"AUDIO:{path}"))
+    monkeypatch.setattr(nodes.media, "load_video", lambda path, target_fps=24, crop=None, trim=None: (f"VIDEO:{path}", f"AUDIO:{path}"))
     _stub_prompt(monkeypatch)
 
     # use_soundtrack now defaults to True, so the OFF case has to be explicit
@@ -165,7 +165,7 @@ def test_crop_and_trim_reach_the_loaders(fake_folder_paths, monkeypatch):
         calls["image"] = crop
         return "IMG"
 
-    def lv(path, crop=None, trim=None):
+    def lv(path, target_fps=24, crop=None, trim=None):
         calls["video"] = (crop, trim)
         return ("V", None)
 
@@ -715,7 +715,10 @@ def test_the_cap_never_reaches_the_video_loader(fake_folder_paths, monkeypatch):
         references_json=references_json, max_reference_edge=1024,
     )
 
-    assert calls["kwargs"] == {}
+    # `max_edge is absent`, not `kwargs is empty`: MediaCache passes target_fps
+    # explicitly, so an empty-kwargs check would now fail for a reason that has nothing
+    # to do with the cap this test is about.
+    assert "max_edge" not in calls["kwargs"]
 
 
 def test_the_cap_moves_the_is_changed_key(fake_folder_paths):
@@ -744,7 +747,7 @@ def test_build_logs_a_summary_and_a_line_per_reference(fake_folder_paths, monkey
     tmp_path = fake_folder_paths
     _touch(tmp_path, "i1.jpg", "v1.mp4", "a1.wav")
     monkeypatch.setattr(nodes.media, "load_image", lambda path, crop=None, max_edge=0: "IMG")
-    monkeypatch.setattr(nodes.media, "load_video", lambda path, crop=None, trim=None: ("V", "A"))
+    monkeypatch.setattr(nodes.media, "load_video", lambda path, target_fps=24, crop=None, trim=None: ("V", "A"))
     monkeypatch.setattr(nodes.media, "load_audio", lambda path, trim=None: "AUD")
     _stub_prompt(monkeypatch)
 

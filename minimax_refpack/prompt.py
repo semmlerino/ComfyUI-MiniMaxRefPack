@@ -271,6 +271,14 @@ def _to_numpy(x):
 VLM_IMAGE_LONG_EDGE = 1536
 VLM_JPEG_QUALITY = 90
 
+# The video twins of the cap above, re-exported from the module that applies them so
+# there is exactly one number for each. Measured the same way: a live 10.12s 1080p clip
+# billed 660 video tokens, about 1fps at the provider's low media resolution, so a clip
+# sent at source resolution and source frame rate spends upload time on frames and
+# pixels the far side discards before it looks at any of them.
+VLM_VIDEO_LONG_EDGE = media.VLM_VIDEO_LONG_EDGE
+VLM_VIDEO_FPS = media.VLM_VIDEO_FPS
+
 
 def _tensor_to_jpeg_b64(tensor) -> str:
     """A [H,W,3] or [1,H,W,3] float tensor in 0..1 -> base64 JPEG bytes, long edge capped
@@ -339,15 +347,16 @@ def _evenly_spaced(n: int, count: int) -> list[int]:
     return [round(i * (n - 1) / (count - 1)) for i in range(count)]
 
 
-def _sampled_frame_b64s(path: str, crop=None, trim=None, count: int = _DEGRADED_FRAMES):
+def _sampled_frame_b64s(path: str, cache, crop=None, trim=None, count: int = _DEGRADED_FRAMES):
     """A clip reduced to stills, for an endpoint that cannot take video.
 
-    Goes through the same loader the sockets use, so the frames carry the reference's
-    crop and trim rather than the untouched original. The soundtrack load_video returns
-    is dropped on the floor here by design: this path exists precisely because the
-    endpoint takes neither video nor audio.
+    Goes through the same loader the sockets use - and now the same CACHE, so a degraded
+    run decodes the clip once rather than once per consumer. The frames carry the
+    reference's crop and trim rather than the untouched original. The soundtrack is
+    dropped on the floor here by design: this path exists precisely because the endpoint
+    takes neither video nor audio.
     """
-    frames, _audio = media.load_video(path, target_fps=24, crop=crop, trim=trim)
+    frames, _audio = cache.video(path, target_fps=24, crop=crop, trim=trim)
     n = len(frames)
     picked = _evenly_spaced(n, count)
     logs.log("degraded_video", file=os.path.basename(path), src_frames=n, sent=len(picked))
@@ -463,9 +472,19 @@ def _target_format_lines(width: int, height: int, length_seconds: float) -> list
 def _build_content(
     references, input_dir: str, direction: str,
     *, width: int = 0, height: int = 0, length_seconds: float = 0.0, accepts=None,
+    cache=None, max_reference_edge: int = 0,
 ) -> list[dict]:
     """`references` is a refs.ReferenceSet; untyped here to avoid importing refs.py
     for a type hint alone (nothing else in this module needs it).
+
+    `cache` is a media.MediaCache shared with the node's socket loop, so a reference is
+    decoded once for the whole build. It defaults HERE and not only in write_prompt
+    because the tests call this function directly 44 times; a None reaching the loader
+    calls would be an AttributeError in every one of them.
+
+    `max_reference_edge` is the node's own image cap, and passing it is what makes the
+    VLM's copy of a still the SAME load the image_N socket gets rather than a second one
+    differing only by that argument.
 
     Layout: one manifest text part, then every media part preceded by its own
     `<kind>_reference <Tag>` label line. The manifest alone is not enough - a model
@@ -479,6 +498,7 @@ def _build_content(
     # this prompt and the sockets the node emits - they must not move underneath a saved
     # workflow just because the user switched provider.
     tagged = references.assign_tags()
+    cache = media.MediaCache() if cache is None else cache
     accepts = _DEFAULT_ENDPOINT.accepts if accepts is None else accepts
     takes_video = "video" in accepts
     takes_audio = "audio" in accepts
@@ -509,7 +529,7 @@ def _build_content(
         # crop/trim go through the same loaders build() uses, so the VLM sees exactly
         # the media the pack's sockets will emit - never the untrimmed original.
         if t.kind == "image":
-            tensor = media.load_image(path, crop=t.ref.crop)
+            tensor = cache.image(path, crop=t.ref.crop, max_edge=max_reference_edge)
             if concise:
                 groups["Images"].append(t.tag)
                 parts.append(_text_part(f"{t.tag}:"))
@@ -522,7 +542,7 @@ def _build_content(
             # deliberately absent: the model can only ever address a reference by tag, so
             # repeating a 108-character name next to every frame is noise it has to read
             # past. It stays once, on the `files:` line, for whoever is reading `debug`.
-            b64s = _sampled_frame_b64s(path, crop=t.ref.crop, trim=t.ref.trim)
+            b64s = _sampled_frame_b64s(path, cache, crop=t.ref.crop, trim=t.ref.trim)
             groups["Videos"].append(f"{t.tag} ({len(b64s)} still frames, no sound)")
             parts.append(_text_part(
                 f"{t.tag} - the next {len(b64s)} images are still frames from ONE video, "
@@ -534,35 +554,34 @@ def _build_content(
                 groups["Audio"].append(f"{t.audio_tag} (not sent)")
 
         elif t.kind == "video":
-            # The whole clip, not stills. An untouched reference is the file itself,
-            # soundtrack included and nothing decoded; a cropped/trimmed one is the
-            # re-encoded window, which is video-only and therefore still needs its
-            # soundtrack sent separately below.
-            data, mime = media.video_clip_bytes(path, crop=t.ref.crop, trim=t.ref.trim)
-            edited = t.ref.crop is not None or t.ref.trim is not None
+            # The whole clip, not stills - and encoded from the frames the sockets are
+            # already getting, so the file is decoded once however many consumers want
+            # it. Edited and untouched clips take the SAME path now: the old untouched
+            # fast path inlined the original file, which sent a 22s plate as ~33MB of
+            # base64 to a provider that reads it at ~1fps and 768px anyway.
+            frames, audio = cache.video(path, target_fps=24, crop=t.ref.crop, trim=t.ref.trim)
+            data, muxed = media.encode_reference_mp4(
+                frames, 24, audio if t.audio_tag is not None else None
+            )
             parts.append(
                 _text_part(f"video_reference {t.tag} ({t.file}) - the next video, whole:")
             )
-            parts.append(_video_part(data, mime))
+            parts.append(_video_part(data, "video/mp4"))
             if t.audio_tag is not None:
-                if not edited:
-                    # Its own audio track rides inside the file - sending the WAV too
-                    # would bill the same sound twice.
+                if muxed:
+                    # The soundtrack rides INSIDE the mp4, so a separate part would bill
+                    # the same sound twice. This is new for an EDITED clip: the old
+                    # transcoder was video-only and its sound went as its own
+                    # uncompressed WAV, 12x the size of the AAC that now rides along.
                     manifest.append(f"  ({t.audio_tag}: the soundtrack inside {t.tag})")
                 else:
-                    _, audio = media.load_video(
-                        path, target_fps=24, crop=t.ref.crop, trim=t.ref.trim
+                    # assign_tags() has already minted this <Audio N>, so silence has to
+                    # be DECLARED rather than left to be inferred. The wording is what
+                    # both system prompts key their "invent nothing for it" rule off.
+                    reason = "could not be read" if audio is None else "could not be encoded"
+                    manifest.append(
+                        f"  ({t.audio_tag}: {t.file}'s soundtrack {reason} - NOT sent with {t.tag})"
                     )
-                    if audio is not None:
-                        parts.append(
-                            _text_part(
-                                f"audio_reference {t.audio_tag} - the soundtrack of {t.tag} "
-                                f"({t.file}), the next audio clip:"
-                            )
-                        )
-                        parts.append(_video_audio_part(audio, t.audio_tag, t.file))
-                    else:
-                        manifest.append(f"  ({t.audio_tag}: {t.file}'s soundtrack could not be read)")
 
         elif not takes_audio:  # standalone audio, endpoint cannot take it
             # The tag is still declared so numbering never shifts, but nothing goes on the
@@ -578,7 +597,7 @@ def _build_content(
                 # span the pack's audio_N socket emits; the decoded PCM rides the same
                 # WAV encoder the video soundtracks use (and degrades to text the same
                 # way if the encode fails).
-                parts.append(_video_audio_part(media.load_audio(path, trim=t.ref.trim), t.tag, t.file))
+                parts.append(_video_audio_part(cache.audio(path, trim=t.ref.trim), t.tag, t.file))
             else:
                 parts.append(_file_audio_part(path, t.tag, t.file))
 
@@ -739,13 +758,20 @@ def write_prompt(
     reasoning_effort: str = DEFAULT_REASONING_EFFORT, job_type: str = "auto",
     classifier_model: str = "", debug: list | None = None,
     provider: str = "openrouter", api_base: str = "",
+    cache=None, max_reference_edge: int = 0,
 ) -> str:
     """Pass a list as `debug` to have the rendered payload appended to it. A sink rather
     than a second return value, so the frozen `-> str` contract and every existing caller
     stay untouched, and so the payload survives a raised PromptError.
 
     `provider`/`api_base` default to today's behaviour, so every existing caller and test
-    that omits them posts to OpenRouter exactly as before."""
+    that omits them posts to OpenRouter exactly as before.
+
+    `cache`/`max_reference_edge` are the same: purely additive keyword-only parameters,
+    so no existing call site or test stub changes. This stays the single public seam on
+    purpose - routing build() through a private `_write_prompt` would bypass the 18
+    stubs in tests/test_nodes.py that patch THIS name, sending every one of them into
+    the real writer and out to live HTTP."""
     ep = _endpoint.resolve(provider, api_base)
     key = _key_for(ep, api_key)
 
@@ -769,6 +795,7 @@ def write_prompt(
     content = _build_content(
         references, input_dir, direction,
         width=width, height=height, length_seconds=length_seconds, accepts=ep.accepts,
+        cache=cache, max_reference_edge=max_reference_edge,
     )
 
     payload = {

@@ -6,6 +6,17 @@ license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = ["requests"]
 
+# What a clean test run needs, beyond what ComfyUI brings. `av` is not optional here:
+# tests/test_media_encode.py imports it outright rather than skip-guarding it, because a
+# skip-guarded encoder suite stays green when the dependency is what broke.
+#
+# Provision .venv from this file with:
+#     uv sync --no-install-project --group dev
+# (--no-install-project because this is a ComfyUI custom node loaded from its directory,
+# not an installable distribution - it declares no build backend.)
+[dependency-groups]
+dev = ["pytest", "numpy", "Pillow", "av", "aiohttp"]
+
 [project.urls]
 Repository = "https://github.com/Hearmeman24/ComfyUI-MiniMaxRefPack"
 

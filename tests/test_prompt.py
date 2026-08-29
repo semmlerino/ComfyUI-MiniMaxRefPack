@@ -56,13 +56,17 @@ def aud(name):
     return Reference(kind="audio", file=name)
 
 
-def fake_load_image(path, crop=None):
+def fake_load_image(path, crop=None, max_edge=0):
     return np.random.rand(1, 4, 4, 3).astype(np.float32)
 
 
-def fake_video_clip_bytes(path, crop=None, trim=None):
-    """The whole clip as bytes - what the VLM now receives instead of sampled stills."""
-    return b"\x00\x00\x00 ftypmp42 fake", "video/mp4"
+def fake_encode_reference_mp4(frames, src_fps=24, audio=None, **kwargs):
+    """The VLM's copy of a clip, built from the frames the sockets already have.
+
+    Returns muxed=True exactly when a soundtrack was handed in, which is what the real
+    encoder reports and what the manifest branches on.
+    """
+    return b"\x00\x00\x00 ftypmp42 fake", audio is not None
 
 
 def fake_load_video_with_audio(path, target_fps=24, crop=None, trim=None):
@@ -238,7 +242,7 @@ def test_mixed_set_manifest_matches_assign_tags(monkeypatch, tmp_path):
 
     monkeypatch.setattr(prompt.media, "load_image", fake_load_image, raising=False)
     monkeypatch.setattr(prompt.media, "load_video", fake_load_video_with_audio, raising=False)
-    monkeypatch.setattr(prompt.media, "video_clip_bytes", fake_video_clip_bytes, raising=False)
+    monkeypatch.setattr(prompt.media, "encode_reference_mp4", fake_encode_reference_mp4, raising=False)
 
     content = prompt._build_content(refset, str(tmp_path), "handheld, warm light")
     manifest_text = content[0]["text"]
@@ -260,7 +264,7 @@ def test_every_media_part_is_preceded_by_its_own_kind_label(monkeypatch, tmp_pat
 
     monkeypatch.setattr(prompt.media, "load_image", fake_load_image, raising=False)
     monkeypatch.setattr(prompt.media, "load_video", fake_load_video_with_audio, raising=False)
-    monkeypatch.setattr(prompt.media, "video_clip_bytes", fake_video_clip_bytes, raising=False)
+    monkeypatch.setattr(prompt.media, "encode_reference_mp4", fake_encode_reference_mp4, raising=False)
 
     content = prompt._build_content(refset, str(tmp_path), "direction")
 
@@ -283,7 +287,8 @@ def test_every_media_part_is_preceded_by_its_own_kind_label(monkeypatch, tmp_pat
 
 def test_the_video_label_sits_directly_before_its_clip(monkeypatch, tmp_path):
     refset = ReferenceSet([vid("clip.mp4", sound=False)])
-    monkeypatch.setattr(prompt.media, "video_clip_bytes", fake_video_clip_bytes, raising=False)
+    monkeypatch.setattr(prompt.media, "load_video", fake_load_video_with_audio, raising=False)
+    monkeypatch.setattr(prompt.media, "encode_reference_mp4", fake_encode_reference_mp4, raising=False)
 
     content = prompt._build_content(refset, str(tmp_path), "direction")
     # [0] manifest, [1] the video label, [2] the clip itself
@@ -298,7 +303,8 @@ def test_a_mixed_set_sends_stills_as_images_and_the_clip_as_a_video(monkeypatch,
     refset = ReferenceSet([img("a.jpg"), img("b.jpg"), vid("clip.mp4", sound=True), aud("vo.wav")])
 
     monkeypatch.setattr(prompt.media, "load_image", fake_load_image, raising=False)
-    monkeypatch.setattr(prompt.media, "video_clip_bytes", fake_video_clip_bytes, raising=False)
+    monkeypatch.setattr(prompt.media, "load_video", fake_load_video_with_audio, raising=False)
+    monkeypatch.setattr(prompt.media, "encode_reference_mp4", fake_encode_reference_mp4, raising=False)
 
     content = prompt._build_content(refset, str(tmp_path), "direction")
 
@@ -314,7 +320,7 @@ def test_a_mixed_set_sends_stills_as_images_and_the_clip_as_a_video(monkeypatch,
 def test_video_without_soundtrack_emits_no_audio_part(monkeypatch, tmp_path):
     refset = ReferenceSet([vid("clip.mp4", sound=False)])
     monkeypatch.setattr(prompt.media, "load_video", fake_load_video_with_audio, raising=False)
-    monkeypatch.setattr(prompt.media, "video_clip_bytes", fake_video_clip_bytes, raising=False)
+    monkeypatch.setattr(prompt.media, "encode_reference_mp4", fake_encode_reference_mp4, raising=False)
 
     content = prompt._build_content(refset, str(tmp_path), "direction")
     assert not any(p.get("type") == "input_audio" for p in content)
@@ -327,7 +333,7 @@ def test_video_soundtrack_missing_from_media_degrades_to_text(monkeypatch, tmp_p
     refset = ReferenceSet([Reference(kind="video", file="clip.mp4", use_soundtrack=True,
                                      trim=[1.0, 3.0])])
     monkeypatch.setattr(prompt.media, "load_video", fake_load_video_no_audio, raising=False)
-    monkeypatch.setattr(prompt.media, "video_clip_bytes", fake_video_clip_bytes, raising=False)
+    monkeypatch.setattr(prompt.media, "encode_reference_mp4", fake_encode_reference_mp4, raising=False)
 
     content = prompt._build_content(refset, str(tmp_path), "direction")
     assert not any(p.get("type") == "input_audio" for p in content)
@@ -543,7 +549,7 @@ def _decode_part(part):
     return head[len("data:") : head.find(";")], Image.open(io.BytesIO(base64.b64decode(b64)))
 
 
-def _oversized_image(path, crop=None):
+def _oversized_image(path, crop=None, max_edge=0):
     return np.random.rand(1, 1000, 2000, 3).astype(np.float32)
 
 
@@ -557,16 +563,17 @@ def _oversized_video(path, target_fps=24, crop=None, trim=None):
 def test_build_content_passes_crop_and_trim_to_the_loaders(monkeypatch, tmp_path):
     calls = {}
 
-    def li(path, crop=None):
+    def li(path, crop=None, max_edge=0):
         calls["image"] = crop
         return np.random.rand(1, 4, 4, 3).astype(np.float32)
 
-    def lv(path, crop=None, trim=None):
+    def lv(path, target_fps=24, crop=None, trim=None):
         calls["video"] = (crop, trim)
-        return b"clip bytes", "video/mp4"
+        return np.random.rand(9, 4, 4, 3).astype(np.float32), None
 
     monkeypatch.setattr(prompt.media, "load_image", li, raising=False)
-    monkeypatch.setattr(prompt.media, "video_clip_bytes", lv, raising=False)
+    monkeypatch.setattr(prompt.media, "load_video", lv, raising=False)
+    monkeypatch.setattr(prompt.media, "encode_reference_mp4", fake_encode_reference_mp4, raising=False)
 
     refset = ReferenceSet([
         Reference(kind="image", file="a.jpg", crop=[0.1, 0.1, 0.8, 0.8]),
@@ -1049,9 +1056,20 @@ def test_a_failed_openrouter_call_is_logged_as_a_failure(monkeypatch, tmp_path, 
 # ---- videos go whole, not as sampled frames -------------------------------------
 
 
-def _fake_video_bytes(monkeypatch, data=b"MP4DATA", mime="video/mp4"):
-    monkeypatch.setattr(prompt.media, "video_clip_bytes",
-                        lambda path, crop=None, trim=None: (data, mime), raising=False)
+def _fake_video_bytes(monkeypatch, data=b"MP4DATA", audio=None):
+    """Stand in for the whole video path: one decode, then one encode of those frames."""
+    monkeypatch.setattr(
+        prompt.media, "load_video",
+        lambda path, target_fps=24, crop=None, trim=None: (
+            np.random.rand(9, 4, 4, 3).astype(np.float32), audio
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        prompt.media, "encode_reference_mp4",
+        lambda frames, src_fps=24, audio=None, **k: (data, audio is not None),
+        raising=False,
+    )
 
 
 def test_a_video_reference_goes_as_one_video_part(monkeypatch, tmp_path):
@@ -1090,10 +1108,14 @@ def test_the_manifest_says_a_clip_follows_not_a_frame_count(monkeypatch, tmp_pat
 
 
 def test_an_untouched_clip_does_not_send_its_soundtrack_twice(monkeypatch, tmp_path):
-    """The file itself carries its audio - a separate WAV part would be the same sound
-    paid for twice (the live probe billed 250 audio tokens for the video's own track)."""
-    _fake_video_bytes(monkeypatch)
-    monkeypatch.setattr(prompt.media, "load_video", _never_load_video, raising=False)
+    """The mp4 carries its audio - a separate WAV part would be the same sound paid for
+    twice (the live probe billed 250 audio tokens for the video's own track).
+
+    The clip IS decoded now, where it used to be inlined as its own file bytes. That is
+    the deliberate trade: one decode and an encode, against ~33MB of base64 for a 22s
+    plate that the provider reads at ~1fps and 768px regardless.
+    """
+    _fake_video_bytes(monkeypatch, audio={"waveform": None, "sample_rate": 48000})
     refset = ReferenceSet([Reference(kind="video", file="v.mp4", use_soundtrack=True)])
 
     parts = prompt._build_content(refset, str(tmp_path), "d")
@@ -1101,28 +1123,47 @@ def test_an_untouched_clip_does_not_send_its_soundtrack_twice(monkeypatch, tmp_p
     assert [p for p in parts if p["type"] == "input_audio"] == []
     text = parts[0]["text"]
     assert "<Audio 1>" in text   # the tag still exists, the payload just isn't duplicated
+    assert "the soundtrack inside <Video 1>" in text
 
 
-def _never_load_video(*a, **k):
-    raise AssertionError("an untouched clip must not be decoded")
-
-
-def test_an_edited_clip_still_sends_its_soundtrack_separately(monkeypatch, tmp_path):
-    """The re-encoded window is video-only, so the sound has to come the old way."""
-    _fake_video_bytes(monkeypatch)
-    monkeypatch.setattr(
-        prompt.media, "load_video",
-        lambda path, target_fps=24, crop=None, trim=None: (None, {"waveform": None, "sample_rate": 48000}),
-        raising=False,
-    )
-    monkeypatch.setattr(prompt, "_video_audio_part",
-                        lambda audio, tag, name: {"type": "input_audio", "input_audio": {"data": "x", "format": "wav"}})
+def test_an_edited_clip_carries_its_soundtrack_inside_the_video(monkeypatch, tmp_path):
+    """It used to arrive as a separate uncompressed WAV, because the old transcoder was
+    video-only. Now it is muxed in as AAC - 12x smaller for the same sound - so an edited
+    clip and an untouched one report the soundtrack the same way."""
+    _fake_video_bytes(monkeypatch, audio={"waveform": None, "sample_rate": 48000})
     refset = ReferenceSet([Reference(kind="video", file="v.mp4", use_soundtrack=True, trim=[1.0, 3.0])])
 
     parts = prompt._build_content(refset, str(tmp_path), "d")
 
-    assert len([p for p in parts if p["type"] == "input_audio"]) == 1
+    assert [p for p in parts if p["type"] == "input_audio"] == []
     assert len([p for p in parts if p["type"] == "video_url"]) == 1
+    assert "the soundtrack inside <Video 1>" in parts[0]["text"]
+
+
+def test_a_soundtrack_that_could_not_be_encoded_is_declared_not_sent(monkeypatch, tmp_path):
+    """assign_tags() has already minted <Audio 1> by the time the encode fails, so the
+    manifest has to say the sound never arrived. Both system prompts key their "invent
+    nothing for it" rule off this wording, and a silent omission would leave the model
+    free to describe a soundtrack it was never given."""
+    monkeypatch.setattr(
+        prompt.media, "load_video",
+        lambda path, target_fps=24, crop=None, trim=None: (
+            np.random.rand(9, 4, 4, 3).astype(np.float32), {"waveform": None, "sample_rate": 48000}
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        prompt.media, "encode_reference_mp4",
+        lambda frames, src_fps=24, audio=None, **k: (b"MP4DATA", False),
+        raising=False,
+    )
+    refset = ReferenceSet([Reference(kind="video", file="v.mp4", use_soundtrack=True)])
+
+    text = prompt._build_content(refset, str(tmp_path), "d")[0]["text"]
+
+    assert "NOT sent" in text
+    assert "<Audio 1>" in text
+    assert "could not be encoded" in text
 
 
 def test_the_logged_payload_size_counts_the_video():
@@ -1133,3 +1174,82 @@ def test_the_logged_payload_size_counts_the_video():
     ]
 
     assert prompt._payload_bytes(parts) == 10 + len("data:video/mp4;base64,") + 1000
+
+
+# ---- the three soundtrack states a clip can be in --------------------------------
+# system_prompt.md promises the model exactly three, and the model can only tell them
+# apart by the manifest line. A state the code emits and the prompt does not describe is
+# how you get an invented voice timbre for sound that was never sent.
+
+
+def _video_manifest(monkeypatch, tmp_path, *, use_soundtrack, audio, muxed):
+    monkeypatch.setattr(
+        prompt.media, "load_video",
+        lambda path, target_fps=24, crop=None, trim=None: (
+            np.random.rand(9, 4, 4, 3).astype(np.float32), audio
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        prompt.media, "encode_reference_mp4",
+        lambda frames, src_fps=24, audio=None, **k: (b"MP4DATA", muxed),
+        raising=False,
+    )
+    refset = ReferenceSet([
+        Reference(kind="video", file="v.mp4", use_soundtrack=use_soundtrack)
+    ])
+    return prompt._build_content(refset, str(tmp_path), "d")[0]["text"]
+
+
+def test_state_one_a_silent_clip_gets_no_audio_tag_at_all(monkeypatch, tmp_path):
+    """use_soundtrack off: the sound was withheld deliberately and no tag is minted, so
+    there is nothing for the model to account for or to wonder about."""
+    text = _video_manifest(monkeypatch, tmp_path, use_soundtrack=False,
+                           audio={"waveform": None, "sample_rate": 48000}, muxed=False)
+
+    assert "<Audio" not in text
+    assert "<Video 1>" in text
+
+
+def test_state_two_a_muxed_soundtrack_is_named_as_being_inside_the_video(
+    monkeypatch, tmp_path
+):
+    text = _video_manifest(monkeypatch, tmp_path, use_soundtrack=True,
+                           audio={"waveform": None, "sample_rate": 48000}, muxed=True)
+
+    assert "<Audio 1>: the soundtrack inside <Video 1>" in text
+    assert "NOT sent" not in text
+
+
+def test_state_three_an_unencodable_soundtrack_is_marked_not_sent(monkeypatch, tmp_path):
+    text = _video_manifest(monkeypatch, tmp_path, use_soundtrack=True,
+                           audio={"waveform": None, "sample_rate": 48000}, muxed=False)
+
+    assert "<Audio 1>" in text
+    assert "NOT sent" in text
+
+
+def test_the_three_states_are_the_three_the_system_prompt_documents(monkeypatch, tmp_path):
+    """The other half of the pin, in the shape test_prompt_degraded.py already uses: what
+    the code writes, checked against the .md that tells the model how to read it."""
+    rules = prompt._read_system_prompt("standard")
+
+    muxed = _video_manifest(monkeypatch, tmp_path, use_soundtrack=True,
+                            audio={"waveform": None, "sample_rate": 48000}, muxed=True)
+    withheld = _video_manifest(monkeypatch, tmp_path, use_soundtrack=True,
+                               audio=None, muxed=False)
+    silent = _video_manifest(monkeypatch, tmp_path, use_soundtrack=False,
+                             audio=None, muxed=False)
+
+    assert "the soundtrack inside" in muxed
+    assert "NOT sent" in withheld
+    assert "<Audio" not in silent
+
+    # The prompt has to describe all three, or a state the code emits reaches a model
+    # with no rule for it.
+    assert "three states" in rules
+    assert "No `<Audio N>` beside `<Video N>`" in rules
+    assert "An unmarked `<Audio N>`" in rules
+    assert "marked as not sent" in rules
+    # ...and it must no longer promise sound that a silent or failed clip does not carry.
+    assert "arrives, whole, with its sound" not in rules

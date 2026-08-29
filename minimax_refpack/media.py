@@ -1,7 +1,14 @@
-"""File -> ComfyUI tensor/audio loading, 24fps resample, and probe metadata.
+"""File -> ComfyUI tensor/audio loading, 24fps resample, the VLM's copy, probe metadata.
 
-FROZEN CONTRACT: nodes.py, routes.py and prompt.py all import these
-five names directly. Only `resample_indices` is pure/torch-free by requirement (it must
+FROZEN CONTRACT: nodes.py, routes.py and prompt.py all import these names directly -
+`resample_indices`, `load_image`, `load_audio`, `load_video`, `MediaCache`,
+`encode_reference_mp4`, `probe`, `thumbnail_png`.
+
+A reference is decoded ONCE per build: `MediaCache` memoises the three loaders and both
+the node's sockets and the prompt payload draw from it, and `encode_reference_mp4` builds
+the VLM's copy out of those already-decoded frames rather than reading the file again.
+
+Only `resample_indices` is pure/torch-free by requirement (it must
 be exhaustively unit-testable); everything else lazy-imports torch/av/PIL/comfy so a
 plain `pytest tests/test_media.py` runs without ComfyUI installed (folder_paths,
 comfy_api, comfy_extras are not importable outside a ComfyUI process - verified: a bare
@@ -16,6 +23,7 @@ from __future__ import annotations
 
 import math
 import mimetypes
+from typing import Any
 
 from . import logs
 
@@ -200,95 +208,355 @@ def _decode_video(path, target_fps, crop, trim, fields):
     return out, audio
 
 
-# Containers OpenRouter forwards as-is for a `video_url` part. Anything else is
-# re-encoded to mp4 rather than gambling on the provider accepting it.
-VLM_VIDEO_MIMES = {
-    ".mp4": "video/mp4",
-    ".mov": "video/mov",
-    ".webm": "video/webm",
-    ".mpeg": "video/mpeg",
-    ".mpg": "video/mpeg",
-}
+# ---- one preparation per reference, per build ------------------------------------
 
 
-def video_clip_bytes(path: str, crop=None, trim=None) -> tuple[bytes, str]:
-    """(bytes, mime) of the WHOLE clip, for the VLM's `video_url` part.
+def _cache_key(value):
+    """A crop/trim list -> something hashable. `None` is the common path and stays None;
+    `tuple(None)` raises TypeError, which is the whole reason this exists."""
+    return None if value is None else tuple(value)
 
-    The VLM reads video natively - one 10s 1080p clip cost 660 video tokens plus 250
-    audio tokens on google/gemini-3-flash-preview - so it gets the clip, not stills.
 
-    Untouched references take the fast path: the file's own bytes, nothing decoded,
-    soundtrack included. A crop or a trim means the file no longer matches what the
-    node's sockets emit, so that window is re-encoded (video only - its soundtrack is
-    still sent as its own labelled part, exactly as before).
-    """
+def _abspath(path: str) -> str:
     import os
 
-    with logs.timed("video_bytes", file=os.path.basename(path), crop=crop, trim=trim) as fields:
-        mime = VLM_VIDEO_MIMES.get(os.path.splitext(path)[1].lower())
-        if crop is None and trim is None and mime is not None:
-            with open(path, "rb") as f:
-                data = f.read()
-            fields["mode"] = "file"
-            fields["bytes"] = len(data)
-            return data, mime
-        data = _transcode_window(path, crop, trim)
-        fields["mode"] = "re-encoded"
-        fields["bytes"] = len(data)
-        return data, "video/mp4"
+    return os.path.abspath(path)
 
 
-def _transcode_window(path: str, crop, trim) -> bytes:
-    """The cropped/trimmed window as an in-memory mp4, video only.
+class MediaCache:
+    """Decode each reference once, then hand the same result to every consumer.
 
-    Decodes only the window: `container.seek` lands on the keyframe at or before the
-    in-point (the same seek-then-skip-to-pts core uses,
-    CU/comfy_api/latest/_input_impl/video_types.py:316-325) and decoding stops at the
-    out-point, so a 4s window out of a 10 minute file costs 4s of decoding.
+    The node's sockets and the VLM payload need the same pixels, and before this existed
+    they each fetched their own - an edited clip with a soundtrack was decoded twice
+    through `load_video` (the second call reached only for `audio` and discarded its
+    frames) on top of a third, independent decode inside the VLM transcoder.
+
+    PER BUILD, NEVER MODULE-LEVEL. The browser re-uploads an edited reference under the
+    same filename with `overwrite=true` - which is exactly why `nodes.IS_CHANGED` hashes
+    mtime+size rather than trusting the name - so a cache that outlived one build would
+    serve pixels from a file that no longer exists.
+
+    Keyed on field VALUES, not object identity: `assign_tags()` runs three times per
+    build and returns fresh `TaggedReference` objects each time, so two lookups for the
+    same reference never see the same object.
     """
+
+    def __init__(self):
+        self._entries: dict[tuple[Any, ...], Any] = {}
+
+    def image(self, path: str, *, crop=None, max_edge: int = 0):
+        key = ("image", _abspath(path), _cache_key(crop), int(max_edge))
+        return self._get(
+            key, path, lambda: load_image(path, crop=crop, max_edge=max_edge)
+        )
+
+    def video(self, path: str, *, target_fps: int = 24, crop=None, trim=None):
+        key = (
+            "video",
+            _abspath(path),
+            int(target_fps),
+            _cache_key(crop),
+            _cache_key(trim),
+        )
+        return self._get(
+            key,
+            path,
+            lambda: load_video(path, target_fps=target_fps, crop=crop, trim=trim),
+        )
+
+    def audio(self, path: str, *, trim=None) -> dict:
+        key = ("audio", _abspath(path), _cache_key(trim))
+        return self._get(key, path, lambda: load_audio(path, trim=trim))
+
+    def _get(self, key, path: str, load):
+        """A line of its own rather than a `cached=` field on the loader's `logs.timed`
+        span: a hit never enters `load_image`/`load_video`/`load_audio`, so there is no
+        span to carry the field, and emitting one anyway would contradict the
+        one-line-per-real-decode reading this change is measured by."""
+        import os
+
+        hit = key in self._entries
+        logs.log("media_cache", kind=key[0], file=os.path.basename(path), hit=hit)
+        if not hit:
+            self._entries[key] = load()
+        return self._entries[key]
+
+
+# ---- the VLM's copy of a reference ------------------------------------------------
+
+# The video twins of prompt.VLM_IMAGE_LONG_EDGE, and measured the same way. A live
+# 10.12s 1080p clip billed 660 video tokens on google/gemini-3-flash-preview - about
+# 1fps at the provider's low media resolution - so every pixel and every frame above
+# these numbers is decoded, paid for in upload time, and discarded on the far side.
+VLM_VIDEO_LONG_EDGE = 768
+VLM_VIDEO_FPS = 8
+
+# Frames are converted a chunk at a time rather than in one batched op. The prepared
+# 24fps stack for one 10s 1080p reference is ~6GB of float32 and build() holds it live
+# until the node returns, so a batched mul() over an 80-frame selection would put ~2GB
+# more beside it. 16 1080p frames is ~35MB.
+_ENCODE_CHUNK = 16
+
+# resample_indices(5, 24, 8) is exactly 2, so a clip that only just cleared load_video's
+# >=5-frame minimum would otherwise reach the VLM as a 2-frame video. Below this many
+# selected frames every frame is kept and the clip goes out at its own rate.
+_MIN_VLM_FRAMES = 5
+
+# h264 first - it is what the providers take, and the PyPI PyAV wheel bundles an FFmpeg
+# built with it (verified: av 18.1.0 ships ffmpeg 8.1.2 with libx264 usable). A PyAV
+# linked against an FFmpeg WITHOUT it is rare but real, and it matters more than it used
+# to: an untouched mp4 used to skip encoding altogether, so a bare add_stream failure
+# would take away a path that worked before. The old transcoder already needed libx264
+# for every cropped, trimmed or odd-container reference, so this widens an existing
+# dependency rather than inventing one - but widening it silently is not acceptable.
+# mpeg4 is core FFmpeg and present in every build, so the list ends somewhere real.
+_VIDEO_ENCODERS = ("libx264", "libopenh264", "mpeg4")
+
+_AUDIO_CHUNK = 4096
+# av.AudioLayout takes a name, not a channel count (verified, PyAV 18.1.0: passing an
+# int raises TypeError). Anything not in here loses its soundtrack rather than being
+# silently downmixed, and the manifest says so.
+_LAYOUTS = {1: "mono", 2: "stereo"}
+
+
+class _AudioMuxFailed(Exception):
+    """AAC encoding failed after the mp4 header had already been written.
+
+    A stream cannot be withdrawn once the header is out - adding one after the first
+    `mux()` fails with `ValueError: Cannot rebase to zero time` - so the only honest
+    recovery is to throw the container away and build a video-only one from scratch.
+    """
+
+
+def encode_reference_mp4(
+    frames,
+    src_fps: float = 24,
+    audio=None,
+    *,
+    long_edge: int = VLM_VIDEO_LONG_EDGE,
+    target_fps: int = VLM_VIDEO_FPS,
+) -> tuple[bytes, bool]:
+    """(mp4 bytes, whether the soundtrack is really inside it).
+
+    `frames` is the [N,H,W,3] 0..1 stack `load_video` already produced for the node's
+    sockets, so the VLM's copy costs an encode and not a second decode. Frame selection
+    goes through `resample_indices`, the same duration-preserving rule the loader uses.
+
+    The `muxed` half of the return is not decoration: an `<Audio N>` tag has already
+    been minted by `assign_tags()` by the time this runs, so a soundtrack that could not
+    be encoded has to be reported, not assumed - `_build_content` turns a False here
+    into the manifest's "NOT sent" note, which both system prompts already handle.
+    """
+    n_src = len(frames)
+    if n_src == 0:
+        raise ValueError("cannot encode a reference video with no frames")
+
+    indices = resample_indices(n_src, src_fps, target_fps)
+    fps: float = target_fps
+    if len(indices) < _MIN_VLM_FRAMES:
+        indices = list(range(n_src))
+        fps = src_fps
+
+    height, width = int(frames[0].shape[0]), int(frames[0].shape[1])
+    scale = min(1.0, long_edge / max(width, height))
+    # h264 needs even dimensions. `dim & ~1` rather than `dim - dim % 2` because
+    # _crop_box guarantees only that a box is never zero-width: a legal 1px crop would
+    # build a 0-sized encoder through the subtraction and avcodec_open2 fails EINVAL.
+    out_w = max(2, int(width * scale) & ~1)
+    out_h = max(2, int(height * scale) & ~1)
+
+    with logs.timed(
+        "video_bytes", w=out_w, h=out_h, fps=fps, frames=len(indices)
+    ) as fields:
+        try:
+            data, muxed = _encode_mp4(frames, indices, fps, out_w, out_h, audio)
+        except _AudioMuxFailed as e:
+            logs.warn("video_audio_dropped", stage="encode", error=str(e))
+            data, muxed = _encode_mp4(frames, indices, fps, out_w, out_h, None)
+        fields["bytes"] = len(data)
+        fields["audio"] = muxed
+        return data, muxed
+
+
+def _encode_mp4(frames, indices, fps, out_w, out_h, audio) -> tuple[bytes, bool]:
+    """One pass: build the container, declare every stream, then write."""
     import io
+    from fractions import Fraction
 
     import av
     import numpy as np
 
-    out_buf = io.BytesIO()
-    start, end = (trim if trim is not None else (0.0, None))
+    buf = io.BytesIO()
+    container = av.open(buf, "w", format="mp4")
+    try:
+        video = _add_video_stream(
+            container, Fraction(fps).limit_denominator(1000), out_w, out_h
+        )
 
-    with av.open(path) as src:
-        stream = src.streams.video[0]
-        rate = stream.average_rate or stream.guessed_rate or 24
-        if start:
-            src.seek(int(start / stream.time_base), stream=stream)
+        # EVERY output stream must exist before the first mux(). See _AudioMuxFailed.
+        sound = None if audio is None else _open_audio_stream(container, audio)
 
-        out = av.open(out_buf, "w", format="mp4")
-        enc = None
+        for start in range(0, len(indices), _ENCODE_CHUNK):
+            block = _chunk_to_uint8(frames[indices[start : start + _ENCODE_CHUNK]])
+            for i in range(block.shape[0]):
+                # Downscale with swscale, AFTER the uint8 conversion: measured 3.97s for
+                # 80 1080p frames against 6.35s for a resize-first OpenCV variant on the
+                # same real data, and PyAV is already a hard dependency where OpenCV is
+                # not a ComfyUI core one.
+                frame = av.VideoFrame.from_ndarray(
+                    np.ascontiguousarray(block[i]), format="rgb24"
+                ).reformat(width=out_w, height=out_h, format="yuv420p")
+                for packet in video.encode(frame):
+                    container.mux(packet)
+        for packet in video.encode():
+            container.mux(packet)
+
+        if sound is not None:
+            try:
+                _encode_audio(container, sound, audio)
+            except Exception as e:
+                raise _AudioMuxFailed(f"{type(e).__name__}: {e}") from e
+    except BaseException:
+        # This container is being discarded, so closing it is best effort: a muxer that
+        # cannot write its trailer after a half-encoded audio stream must not replace the
+        # _AudioMuxFailed the caller is waiting to catch. Swallowing it there would turn a
+        # recoverable "encode the video without sound" into a failed build.
         try:
-            for frame in src.decode(stream):
-                t = float(frame.pts * stream.time_base) if frame.pts is not None else 0.0
-                if t < start - 1e-9:
-                    continue
-                if end is not None and t >= end - 1e-9:
-                    break
-                arr = frame.to_ndarray(format="rgb24")
-                if crop is not None:
-                    left, top, right, bottom = _crop_box(crop, arr.shape[1], arr.shape[0])
-                    arr = arr[top:bottom, left:right]
-                if enc is None:
-                    enc = out.add_stream("libx264", rate=rate)
-                    # h264 needs even dimensions; a crop can land on an odd pixel count
-                    enc.width = arr.shape[1] - (arr.shape[1] % 2)
-                    enc.height = arr.shape[0] - (arr.shape[0] % 2)
-                    enc.pix_fmt = "yuv420p"
-                arr = np.ascontiguousarray(arr[: enc.height, : enc.width])
-                for packet in enc.encode(av.VideoFrame.from_ndarray(arr, format="rgb24")):
-                    out.mux(packet)
-            if enc is not None:
-                for packet in enc.encode():
-                    out.mux(packet)
-        finally:
-            out.close()
+            container.close()
+        except Exception:
+            pass
+        raise
+    container.close()
 
-    return out_buf.getvalue()
+    return buf.getvalue(), sound is not None
+
+
+def _add_video_stream(container, rate, out_w, out_h):
+    """The video stream, on the first encoder this FFmpeg build actually has.
+
+    Raises rather than returning None: unlike the soundtrack, there is no meaningful
+    reference left without a video stream, and a named failure beats an add_stream
+    traceback that says only "Unknown encoder".
+    """
+    tried: list[str] = []
+    for name in _VIDEO_ENCODERS:
+        try:
+            stream = container.add_stream(name, rate=rate)
+        except Exception as e:
+            tried.append(f"{name} ({type(e).__name__})")
+            continue
+        stream.width = out_w
+        stream.height = out_h
+        stream.pix_fmt = "yuv420p"
+        if tried:
+            logs.warn("video_encoder_fallback", encoder=name, unavailable=tried)
+        return stream
+    raise RuntimeError(
+        "this PyAV build has no usable video encoder for the VLM's copy of a reference "
+        f"(tried {', '.join(tried)}). PyAV's own wheels bundle an FFmpeg with libx264: "
+        "`pip install --force-reinstall av` in the ComfyUI environment."
+    )
+
+
+def _chunk_to_uint8(chunk):
+    """A [n,H,W,3] float chunk in 0..1 -> uint8 ndarray.
+
+    Duck-typed rather than branched on an import: production always hands this torch
+    tensors, and the test stack has numpy and no torch at all. Verified byte-identical
+    between the two branches on in-range and out-of-range input (max-diff 0) - torch
+    clamps after scaling, numpy clips before it, and both land on the same 0..255.
+    """
+    import numpy as np
+
+    if getattr(chunk, "mul", None) is None:
+        return (np.clip(np.asarray(chunk, dtype=np.float32), 0.0, 1.0) * 255.0).astype(
+            np.uint8
+        )
+
+    import torch
+
+    return chunk.mul(255).clamp_(0, 255).to(torch.uint8).cpu().numpy()
+
+
+def _planar_waveform(waveform):
+    """A [1,C,L] / [C,L] / [L] float waveform -> contiguous float32 [C,L] in -1..1.
+
+    The batch dimension is the trap: the cached waveform is batch-first and PyAV's
+    AudioFrame is not, so passing it through unchanged produces a stream that is present
+    in the container and carries nothing.
+    """
+    import numpy as np
+
+    arr = waveform
+    if getattr(arr, "detach", None) is not None:
+        arr = arr.detach().cpu().numpy()
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 3:
+        arr = arr[0]
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    return np.clip(arr, -1.0, 1.0)
+
+
+def _open_audio_stream(container, audio):
+    """The AAC stream, or None if this soundtrack cannot get one.
+
+    Returns None rather than raising: nothing has been muxed yet, so a video-only file
+    is still the right answer, and the caller reports muxed=False - which is what puts
+    the "NOT sent" note beside the tag instead of silently promising sound.
+    """
+    try:
+        channels = _planar_waveform(audio["waveform"]).shape[0]
+        layout = _LAYOUTS.get(channels)
+        if layout is None:
+            raise ValueError(f"unsupported channel count {channels}")
+        return container.add_stream(
+            "aac", rate=int(audio["sample_rate"]), layout=layout
+        )
+    except Exception as e:
+        logs.warn(
+            "video_audio_dropped", stage="setup", error=f"{type(e).__name__}: {e}"
+        )
+        return None
+
+
+def _encode_audio(container, stream, audio) -> None:
+    """Feed the waveform through a resampler into the AAC stream.
+
+    Chunked with an explicit monotonic pts in the source's own time base; the resampler
+    rebases onto the encoder's layout, format and rate.
+    """
+    from fractions import Fraction
+
+    import av
+    import numpy as np
+
+    arr = _planar_waveform(audio["waveform"])
+    sample_rate = int(audio["sample_rate"])
+    layout = _LAYOUTS[arr.shape[0]]
+    resampler = av.AudioResampler(
+        format=stream.format, layout=stream.layout, rate=stream.rate
+    )
+    time_base = Fraction(1, sample_rate)
+
+    def _mux(resampled_frames):
+        for resampled in resampled_frames:
+            for packet in stream.encode(resampled):
+                container.mux(packet)
+
+    for start in range(0, arr.shape[1], _AUDIO_CHUNK):
+        frame = av.AudioFrame.from_ndarray(
+            np.ascontiguousarray(arr[:, start : start + _AUDIO_CHUNK]),
+            format="fltp",
+            layout=layout,
+        )
+        frame.sample_rate = sample_rate
+        frame.pts = start
+        frame.time_base = time_base
+        _mux(resampler.resample(frame))
+    _mux(resampler.resample(None))
+    for packet in stream.encode(None):
+        container.mux(packet)
 
 
 def probe(path: str) -> dict:
