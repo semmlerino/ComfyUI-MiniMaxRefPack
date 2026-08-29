@@ -166,7 +166,16 @@ def load_video(path: str, target_fps: int = 24, crop=None, trim=None):
 def _decode_video(path, target_fps, crop, trim, fields):
     """The body of load_video. Split out only so the timing/logging wrapper above stays
     a plain `with` block instead of wrapping 30 lines."""
-    components = _video_from_file_cls()(path).get_components()
+    video_cls = _video_from_file_cls()
+    if trim is None:
+        source = video_cls(path)
+    else:
+        start, end = trim
+        # VideoFromFile seeks to the keyframe before start_time and stops decoding at
+        # duration. Passing the window here avoids materialising the whole source clip
+        # only to throw most of its frames away below.
+        source = video_cls(path, start_time=start, duration=end - start)
+    components = source.get_components()
     frames = components.images
     n_src = frames.shape[0]
     src_fps = float(components.frame_rate)
@@ -174,16 +183,7 @@ def _decode_video(path, target_fps, crop, trim, fields):
     fields["src_frames"] = n_src
     fields["fps"] = src_fps
 
-    first = 0
-    n_sel = n_src
-    if trim is not None:
-        start, end = trim
-        # The 1e-9 keeps a frame that lands exactly on a boundary from flipping sides
-        # over float noise (e.g. end=2.0 at 24fps must exclude frame 48, include 47).
-        first = max(0, math.ceil(start * src_fps - 1e-9))
-        n_sel = max(0, min(n_src, math.ceil(end * src_fps - 1e-9)) - first)
-
-    indices = resample_indices(n_sel, src_fps, target_fps)
+    indices = resample_indices(n_src, src_fps, target_fps)
     if len(indices) < 5:
         duration = (n_src / src_fps) if src_fps else 0.0
         window = f" trimmed to {trim[0]:.2f}-{trim[1]:.2f}s" if trim is not None else ""
@@ -191,12 +191,10 @@ def _decode_video(path, target_fps, crop, trim, fields):
             f"reference video {path!r}{window} has only {len(indices)} frame(s) at {target_fps}fps "
             f"(source: {n_src} frames, {duration:.2f}s) - MiniMax H3 needs at least 5"
         )
-    out = frames[[first + i for i in indices]]
+    out = frames[indices]
     if crop is not None:
         left, top, right, bottom = _crop_box(crop, out.shape[2], out.shape[1])
         out = out[:, top:bottom, left:right, :]
-    if trim is not None and audio is not None:
-        audio = _slice_audio(audio, trim)
     fields["frames"] = len(indices)
     fields["audio"] = audio is not None
     return out, audio

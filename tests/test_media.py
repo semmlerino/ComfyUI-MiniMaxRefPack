@@ -72,26 +72,46 @@ def test_zero_or_negative_fps_is_rejected():
 class _ListFrames:
     """Fake images tensor: .shape[0] + fancy list-indexing, no torch required."""
 
-    def __init__(self, n):
+    def __init__(self, n, first=0):
         self.shape = (n,)
-        self._items = list(range(n))
+        self._items = list(range(first, first + n))
 
     def __getitem__(self, idx):
         return [self._items[i] for i in idx]
 
 
 def _fake_video_from_file(images_n, frame_rate, audio=None):
-    class FakeComponents:
-        images = _ListFrames(images_n)
-
-    FakeComponents.frame_rate = frame_rate
-    FakeComponents.audio = audio
-
     class FakeVideoFromFile:
-        def __init__(self, path):
+        def __init__(self, path, *, start_time=0, duration=0):
             self.path = path
+            self.start_time = start_time
+            self.duration = duration
 
         def get_components(self):
+            import math
+
+            first = max(0, math.ceil(self.start_time * frame_rate - 1e-9))
+            stop = images_n
+            if self.duration:
+                stop = min(
+                    images_n,
+                    math.ceil((self.start_time + self.duration) * frame_rate - 1e-9),
+                )
+
+            window_audio = (
+                media._slice_audio(
+                    audio, [self.start_time, self.start_time + self.duration]
+                )
+                if audio is not None and self.duration
+                else audio
+            )
+
+            class FakeComponents:
+                def __init__(self):
+                    self.images = _ListFrames(max(0, stop - first), first=first)
+                    self.frame_rate = frame_rate
+                    self.audio = window_audio
+
             return FakeComponents()
 
     return FakeVideoFromFile
@@ -195,6 +215,29 @@ def test_crop_box_never_collapses_to_zero_area():
 # ---- load_video trim ----------------------------------------------------------
 
 
+def test_load_video_passes_trim_window_to_decoder(monkeypatch):
+    calls = {}
+
+    class Components:
+        images = _ListFrames(108)
+        frame_rate = 24
+        audio = None
+
+    class WindowedVideoFromFile:
+        def __init__(self, path, *, start_time=0, duration=0):
+            calls.update(path=path, start_time=start_time, duration=duration)
+
+        def get_components(self):
+            return Components()
+
+    monkeypatch.setattr(media, "_video_from_file_cls", lambda: WindowedVideoFromFile)
+
+    frames, _ = media.load_video("clip.mp4", trim=[2.0, 6.5])
+
+    assert calls == {"path": "clip.mp4", "start_time": 2.0, "duration": 4.5}
+    assert len(frames) == 108
+
+
 def test_load_video_trim_selects_the_source_window(monkeypatch):
     # 10s @ 24fps, trimmed to [2.0, 6.5): source frames 48..155 (start-inclusive,
     # end-exclusive), resampled 24->24 so all 108 survive, in order.
@@ -253,17 +296,30 @@ def test_load_video_trim_slices_the_soundtrack_to_the_same_window(monkeypatch):
 def _fake_video_numpy(n, frame_rate, h, w, audio=None):
     import numpy as np
 
-    class FakeComponents:
-        images = np.zeros((n, h, w, 3), dtype=np.float32)
-
-    FakeComponents.frame_rate = frame_rate
-    FakeComponents.audio = audio
-
     class FakeVideoFromFile:
-        def __init__(self, path):
+        def __init__(self, path, *, start_time=0, duration=0):
             self.path = path
+            self.start_time = start_time
+            self.duration = duration
 
         def get_components(self):
+            import math
+
+            first = max(0, math.ceil(self.start_time * frame_rate - 1e-9))
+            stop = n
+            if self.duration:
+                stop = min(
+                    n, math.ceil((self.start_time + self.duration) * frame_rate - 1e-9)
+                )
+
+            class FakeComponents:
+                def __init__(self):
+                    self.images = np.zeros(
+                        (max(0, stop - first), h, w, 3), dtype=np.float32
+                    )
+                    self.frame_rate = frame_rate
+                    self.audio = audio
+
             return FakeComponents()
 
     return FakeVideoFromFile
