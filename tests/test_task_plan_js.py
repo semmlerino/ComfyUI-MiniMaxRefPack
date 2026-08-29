@@ -10,6 +10,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REFPACK_JS = REPO_ROOT / "web" / "refpack.js"
+REFPACK_CSS = REPO_ROOT / "web" / "refpack.css"
 NODE = shutil.which("node")
 requires_node = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
@@ -32,6 +33,19 @@ def _run(expression: str):
     )
     assert proc.returncode == 0, f"node failed: {proc.stderr}"
     return json.loads(proc.stdout.strip())
+
+
+def test_task_plan_shows_and_refreshes_picture_and_video_thumbnails():
+    text = REFPACK_JS.read_text()
+    start = text.index("async function openTaskPlanModal(node)")
+    end = text.index("// Config (reference pack) save/load", start)
+    modal = text[start:end]
+
+    assert 'if (kind === "image" || kind === "video")' in modal
+    assert 'thumbnail.className = "mmrp-plan-thumbnail-image"' in modal
+    assert "thumbnail.src = thumbUrl(reference.file, reference)" in modal
+    assert modal.count("refreshThumbnail();") == 2  # initial render + Source change
+    assert ".mmrp-plan-thumbnail-image" in REFPACK_CSS.read_text()
 
 
 @requires_node

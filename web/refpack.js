@@ -2318,13 +2318,39 @@ async function openTaskPlanModal(node) {
 
             const assetHead = document.createElement("div");
             assetHead.className = "mmrp-plan-asset-head";
+            const identity = document.createElement("div");
+            identity.className = "mmrp-plan-asset-identity";
+            let thumbnail = null;
+            if (kind === "image" || kind === "video") {
+                const thumbnailFrame = document.createElement("div");
+                thumbnailFrame.className = "mmrp-plan-thumbnail";
+                const thumbnailFallback = document.createElement("span");
+                thumbnailFallback.textContent = "No preview";
+                thumbnail = document.createElement("img");
+                thumbnail.className = "mmrp-plan-thumbnail-image";
+                thumbnail.loading = "lazy";
+                thumbnail.decoding = "async";
+                thumbnail.onload = () => thumbnailFrame.classList.add("mmrp-plan-thumbnail-ready");
+                thumbnail.onerror = () => thumbnailFrame.classList.remove("mmrp-plan-thumbnail-ready");
+                thumbnailFrame.appendChild(thumbnailFallback);
+                thumbnailFrame.appendChild(thumbnail);
+                identity.appendChild(thumbnailFrame);
+            }
             const tag = document.createElement("strong");
             const kindLabel = document.createElement("span");
             kindLabel.textContent = kind;
-            assetHead.appendChild(tag);
+            identity.appendChild(tag);
+            assetHead.appendChild(identity);
             assetHead.appendChild(kindLabel);
             row.appendChild(assetHead);
             assetRows.push({ kind, index, tag });
+
+            const refreshThumbnail = () => {
+                if (!thumbnail) return;
+                thumbnail.alt = `${kind === "image" ? "Picture" : "Video"} preview: ${reference.file}`;
+                thumbnail.src = thumbUrl(reference.file, reference);
+            };
+            refreshThumbnail();
 
             const sourceLabel = document.createElement("label");
             sourceLabel.className = "mmrp-source-row";
@@ -2353,6 +2379,7 @@ async function openTaskPlanModal(node) {
                     });
                 }
                 dropThumb(oldFile);
+                refreshThumbnail();
                 refreshTagLabels();
                 update();
             };
