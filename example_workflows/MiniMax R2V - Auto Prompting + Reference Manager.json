@@ -1,8 +1,8 @@
 {
   "id": "f6c41c7f-009d-41d6-b0c9-d83b9d8ee121",
   "revision": 0,
-  "last_node_id": 193,
-  "last_link_id": 411,
+  "last_node_id": 194,
+  "last_link_id": 413,
   "nodes": [
     {
       "id": 121,
@@ -658,14 +658,14 @@
         "Node name for S&R": "UNETLoader",
         "models": [
           {
-            "name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
             "directory": "diffusion_models"
           }
         ]
       },
       "widgets_values": [
-        "diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors",
+        "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
         "default"
       ]
     },
@@ -715,13 +715,13 @@
         746.9895473041439
       ],
       "flags": {},
-      "order": 23,
+      "order": 24,
       "mode": 0,
       "inputs": [
         {
           "name": "images",
           "type": "IMAGE",
-          "link": 410
+          "link": 412
         },
         {
           "name": "audio",
@@ -819,6 +819,49 @@
       "widgets_values": [
         "video/r2v_auto",
         "s"
+      ]
+    },
+    {
+      "id": 194,
+      "type": "PromptToWorkflow",
+      "pos": [
+        -788.3343156266767,
+        4781.15511653993
+      ],
+      "size": [
+        300,
+        180
+      ],
+      "flags": {},
+      "order": 23,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "passthrough",
+          "type": "IMAGE",
+          "link": 410
+        },
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "link": 413
+        }
+      ],
+      "outputs": [
+        {
+          "name": "passthrough",
+          "type": "IMAGE",
+          "links": [
+            412
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PromptToWorkflow"
+      },
+      "widgets_values": [
+        "",
+        "improved_prompt"
       ]
     },
     {
@@ -1035,13 +1078,7 @@
           "type": "PowerLoraLoaderHeaderWidget"
         },
         {
-          "on": false,
-          "lora": "HMCumshot_v1_e120.safetensors",
-          "strength": 1,
-          "strengthTwo": null
-        },
-        {
-          "on": false,
+          "on": true,
           "lora": "HMNSFW_AIO_V2.safetensors",
           "strength": 0.4,
           "strengthTwo": null
@@ -1050,30 +1087,6 @@
           "on": false,
           "lora": "HMBreasts_085e0750_e40.safetensors",
           "strength": 0.75,
-          "strengthTwo": null
-        },
-        {
-          "on": false,
-          "lora": "hmcumshot3_minimax-h3_epoch15.safetensors",
-          "strength": 1,
-          "strengthTwo": null
-        },
-        {
-          "on": false,
-          "lora": "hmcumshot3_minimax-h3_epoch35.safetensors",
-          "strength": 0.5,
-          "strengthTwo": null
-        },
-        {
-          "on": false,
-          "lora": "hmcumshot3_minimax-h3_epoch50.safetensors",
-          "strength": 0.6,
-          "strengthTwo": null
-        },
-        {
-          "on": true,
-          "lora": "hmmotion_minimax-h3_epoch40.safetensors",
-          "strength": 1,
           "strengthTwo": null
         },
         {},
@@ -1890,7 +1903,7 @@
       410,
       193,
       0,
-      119,
+      194,
       0,
       "IMAGE"
     ],
@@ -1900,6 +1913,22 @@
       1,
       119,
       4,
+      "STRING"
+    ],
+    [
+      412,
+      194,
+      0,
+      119,
+      0,
+      "IMAGE"
+    ],
+    [
+      413,
+      185,
+      18,
+      194,
+      1,
       "STRING"
     ]
   ],

@@ -162,9 +162,11 @@ def test_video_save_uses_render_time_prefix_and_embeds_metadata(path):
     graph = json.loads(path.read_text())
     by_type = {node["type"]: node for node in graph.get("nodes", [])}
     timer = by_type.get("RenderTimeFilenamePrefix")
+    stamper = by_type.get("PromptToWorkflow")
     save = by_type.get("VHS_VideoCombine")
 
     assert timer is not None, f"{path.name}: render-time filename node is missing"
+    assert stamper is not None, f"{path.name}: generated-prompt metadata node is missing"
     assert save is not None, f"{path.name}: VHS video save node is missing"
     assert save.get("widgets_values", {}).get("save_metadata") is True, (
         f"{path.name}: VHS save_metadata must stay enabled"
@@ -174,12 +176,47 @@ def test_video_save_uses_render_time_prefix_and_embeds_metadata(path):
     save_inputs = {entry["name"]: entry for entry in save.get("inputs", [])}
     images_link = links[save_inputs["images"]["link"]]
     prefix_link = links[save_inputs["filename_prefix"]["link"]]
-    assert images_link[1:3] == [timer["id"], 0], (
-        f"{path.name}: saved frames do not pass through the render timer"
+    assert images_link[1:3] == [stamper["id"], 0], (
+        f"{path.name}: saved frames do not pass through the prompt metadata node"
     )
     assert prefix_link[1:3] == [timer["id"], 1], (
         f"{path.name}: save filename_prefix is not driven by the render timer"
     )
+
+    stamper_inputs = {entry["name"]: entry for entry in stamper.get("inputs", [])}
+    passthrough_link = links[stamper_inputs["passthrough"]["link"]]
+    prompt_link = links[stamper_inputs["prompt"]["link"]]
+    pack = by_type["MiniMaxH3ReferencePack"]
+    assert passthrough_link[1:3] == [timer["id"], 0], (
+        f"{path.name}: metadata node does not receive the timer's frames"
+    )
+    assert prompt_link[1:3] == [pack["id"], 18], (
+        f"{path.name}: metadata node does not receive the generated Auto Prompt"
+    )
+
+
+@pytest.mark.parametrize("path", WORKFLOWS, ids=lambda p: p.name)
+def test_runtime_models_match_the_supported_pod_pack(path):
+    graph = json.loads(path.read_text())
+    by_type = {node["type"]: node for node in graph.get("nodes", [])}
+
+    unet = by_type["UNETLoader"]
+    expected_unet = "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+    assert unet["widgets_values"][0] == expected_unet
+    assert unet["properties"]["models"][0]["name"] == expected_unet
+
+    power_lora = by_type["Power Lora Loader (rgthree)"]
+    choices = [
+        value
+        for value in power_lora["widgets_values"]
+        if isinstance(value, dict) and "lora" in value
+    ]
+    assert [choice["lora"] for choice in choices] == [
+        "HMNSFW_AIO_V2.safetensors",
+        "HMBreasts_085e0750_e40.safetensors",
+    ]
+    assert choices[0]["on"] is True
+    assert choices[0]["strength"] == 0.4
 
 
 # Preview nodes cache their last result INTO the saved graph. Whatever the author last
