@@ -15,7 +15,7 @@ dependencies = ["requests"]
 # (--no-install-project because this is a ComfyUI custom node loaded from its directory,
 # not an installable distribution - it declares no build backend.)
 [dependency-groups]
-dev = ["pytest", "numpy", "Pillow", "av", "aiohttp", "torch"]
+dev = ["pytest", "pytest-xdist", "numpy", "Pillow", "av", "aiohttp", "torch"]
 
 # torch comes from the CPU wheel index: the decoder tests exercise the real tensor
 # path, and the default index would pull the ~2.5 GB CUDA wheel to do it. `explicit`

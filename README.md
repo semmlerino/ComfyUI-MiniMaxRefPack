@@ -78,6 +78,18 @@ pip install -r ComfyUI-MiniMaxRefPack/requirements.txt
 
 Restart ComfyUI.
 
+## Test checks
+
+After provisioning the development environment with `uv sync --no-install-project --group dev`, use the bundled runner for consistent gates:
+
+```bash
+./scripts/check_tests.sh changed  # changed tests, or all fast tests when code changed
+./scripts/check_tests.sh fast     # all tests except the four slow RSS/media tests
+./scripts/check_tests.sh full     # fast tests in parallel, then slow tests serially
+```
+
+The fast gate uses up to four pytest workers; set `REFPACK_WORKERS` to a lower positive integer on a memory-constrained machine. Direct `pytest` usage remains supported, including `pytest -m slow` when focused debugging is useful.
+
 ## Example workflow
 
 A complete Reference-to-Video graph ships with the pack: **Workflow → Browse Templates → ComfyUI-MiniMaxRefPack**, or drag `example_workflows/MiniMax R2V - Auto Prompting + Reference Manager.json` onto the canvas.
