@@ -48,6 +48,18 @@ def test_task_plan_shows_and_refreshes_picture_and_video_thumbnails():
     assert ".mmrp-plan-thumbnail-image" in REFPACK_CSS.read_text()
 
 
+def test_task_plan_primary_video_control_explains_and_requires_a_driver_role():
+    text = REFPACK_JS.read_text()
+    start = text.index("async function openTaskPlanModal(node)")
+    end = text.index("// Config (reference pack) save/load", start)
+    modal = text[start:end]
+
+    assert 'document.createTextNode("Primary video")' in modal
+    assert "Primary edit / continuation video" not in modal
+    assert 'primaryControl.dataset.requiresDriver = "true"' in modal
+    assert "Replacement plans use the editing source." in modal
+
+
 @requires_node
 def test_legacy_envelope_stays_free_of_task_metadata():
     got = _run(
@@ -170,6 +182,56 @@ def test_primary_video_round_trips_independently_of_roles():
     assert _run(
         "toReferencesEnvelope(fromReferencesEnvelope(" + json.dumps(envelope) + "))"
     ) == envelope
+
+
+@requires_node
+def test_replacement_plan_makes_a_roleless_primary_an_edit_source():
+    expression = """
+    (() => {
+      const refs = fromReferencesEnvelope({
+        references: [
+          {kind: 'image', file: 'face.png', roles: ['reference_generation']},
+          {kind: 'video', file: 'plate.mp4', primary: true}
+        ],
+        task_plan: {mode: 'explicit', specialization: 'character_replacement'}
+      });
+      return {
+        changed: ensureReplacementPrimaryRole(refs),
+        roles: refs.videos[0].roles,
+        state: deriveTaskPlanState(refs)
+      };
+    })()
+    """
+    got = _run(expression)
+
+    assert got["changed"] is True
+    assert got["roles"] == ["video_editing"]
+    assert got["state"]["error"] is None
+
+
+@requires_node
+def test_general_plan_does_not_guess_a_primary_video_role():
+    expression = """
+    (() => {
+      const refs = fromReferencesEnvelope({
+        references: [{
+          kind: 'video', file: 'plate.mp4', primary: true,
+          roles: ['reference_generation']
+        }],
+        task_plan: {mode: 'explicit', specialization: 'none'}
+      });
+      return {
+        changed: ensureReplacementPrimaryRole(refs),
+        roles: refs.videos[0].roles,
+        state: deriveTaskPlanState(refs)
+      };
+    })()
+    """
+    got = _run(expression)
+
+    assert got["changed"] is False
+    assert got["roles"] == ["reference_generation"]
+    assert "Use as editing source" in got["state"]["error"]
 
 
 @requires_node

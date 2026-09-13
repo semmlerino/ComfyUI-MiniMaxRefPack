@@ -337,8 +337,8 @@ const TASK_ROLE_OPTIONS = {
     ],
     video: [
         ["reference_generation", "Motion / camera / structure guidance"],
-        ["video_editing", "Edit source"],
-        ["video_continuation", "Continuation source"],
+        ["video_editing", "Use as editing source"],
+        ["video_continuation", "Use as continuation source"],
         ["audio_reuse", "Soundtrack: reuse signal"],
         ["audio_reference", "Soundtrack: reference qualities"],
     ],
@@ -505,7 +505,7 @@ function deriveTaskPlanState(refs, allowPrimaryReorder = false) {
     }
     if (primaries.length && !drivers.length) {
         return { mode: "explicit", prefix: "Invalid plan", taskTypes: [],
-                 error: "The primary video needs an editing or continuation role." };
+                 error: 'Select "Use as editing source" or "Use as continuation source" for the primary video.' };
     }
     if (primaries.length && drivers.length && primaries[0] !== drivers[0].index) {
         return { mode: "explicit", prefix: "Invalid plan", taskTypes: [],
@@ -522,7 +522,7 @@ function deriveTaskPlanState(refs, allowPrimaryReorder = false) {
     const specialization = plan.specialization || "none";
     if (specialization !== "none" && !roles.has("video_editing")) {
         return { mode: "explicit", prefix: "Invalid plan", taskTypes: [],
-                 error: "A replacement specialization requires video editing." };
+                 error: 'A replacement specialization requires "Use as editing source".' };
     }
     if (specialization !== "none" && !(refs.images || []).some(
         (ref) => (ref.roles || []).includes("reference_generation")
@@ -539,6 +539,17 @@ function deriveTaskPlanState(refs, allowPrimaryReorder = false) {
         taskTypes,
         error: null,
     };
+}
+
+function ensureReplacementPrimaryRole(refs) {
+    const plan = refs && refs.taskPlan;
+    if (!plan || plan.mode !== "explicit" || plan.specialization === "none") return false;
+    const primary = (refs.videos || []).find((reference) => reference.primary === true);
+    if (!primary || (primary.roles || []).some(
+        (role) => role === "video_editing" || role === "video_continuation"
+    )) return false;
+    primary.roles = takeRoles("video", [...(primary.roles || []), "video_editing"]);
+    return true;
 }
 
 function referencesFingerprint(refs) {
@@ -2280,9 +2291,18 @@ async function openTaskPlanModal(node) {
     const update = () => {
         working.taskPlan.mode = mode.value;
         working.taskPlan.specialization = mode.value === "explicit" ? specialization.value : "none";
+        ensureReplacementPrimaryRole(working);
+        assets.querySelectorAll("input[data-role-control='true']").forEach((input) => {
+            input.checked = (input._mmrpReference.roles || []).includes(input.value);
+        });
         specialization.disabled = mode.value !== "explicit";
         assets.querySelectorAll("input[type=checkbox], input[type=radio]").forEach((input) => {
-            input.disabled = mode.value !== "explicit" || input.dataset.unavailable === "true";
+            const lacksDriverRole = input.dataset.requiresDriver === "true"
+                && !(input._mmrpReference.roles || []).some(
+                    (role) => role === "video_editing" || role === "video_continuation"
+                );
+            input.disabled = mode.value !== "explicit"
+                || input.dataset.unavailable === "true" || lacksDriverRole;
         });
         const stale = referencesFingerprint(node._mmrpRefs) !== openedFingerprint;
         const state = deriveTaskPlanState(working, true);
@@ -2388,6 +2408,8 @@ async function openTaskPlanModal(node) {
 
             let primaryControl = null;
             if (kind === "video") {
+                const primaryBlock = document.createElement("div");
+                primaryBlock.className = "mmrp-primary-block";
                 const primaryLabel = document.createElement("label");
                 primaryLabel.className = "mmrp-primary-row";
                 primaryControl = document.createElement("input");
@@ -2405,9 +2427,16 @@ async function openTaskPlanModal(node) {
                     update();
                 };
                 primaryControl.dataset.primaryControl = "true";
+                primaryControl.dataset.requiresDriver = "true";
+                primaryControl._mmrpReference = reference;
                 primaryLabel.appendChild(primaryControl);
-                primaryLabel.appendChild(document.createTextNode("Primary edit / continuation video"));
-                row.appendChild(primaryLabel);
+                primaryLabel.appendChild(document.createTextNode("Primary video"));
+                primaryBlock.appendChild(primaryLabel);
+                const primaryHelp = document.createElement("span");
+                primaryHelp.className = "mmrp-primary-help";
+                primaryHelp.textContent = "Choose the editing or continuation source that drives the result. Replacement plans use the editing source.";
+                primaryBlock.appendChild(primaryHelp);
+                row.appendChild(primaryBlock);
             }
 
             const roles = document.createElement("div");
@@ -2417,6 +2446,8 @@ async function openTaskPlanModal(node) {
                 const checkbox = document.createElement("input");
                 checkbox.type = "checkbox";
                 checkbox.value = roleId;
+                checkbox.dataset.roleControl = "true";
+                checkbox._mmrpReference = reference;
                 checkbox.checked = (reference.roles || []).includes(roleId);
                 const isUnavailableSoundtrack = kind === "video"
                     && (roleId === "audio_reuse" || roleId === "audio_reference")

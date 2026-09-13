@@ -106,7 +106,7 @@ On `prompt_provider: local` the environment is never read. Only a key typed into
 
 | Setting | What it does |
 | --- | --- |
-| Task plan | **Infer roles** keeps automatic routing. **Set roles explicitly** derives the official combined prefix, selects composable system-prompt overlays and skips classification. Stored inside `references_json` with the assets. |
+| Task plan | **Infer roles** keeps automatic routing. **Set roles explicitly** derives the official combined prefix, selects composable system-prompt overlays and skips classification. A primary video must also be marked **Use as editing source** or **Use as continuation source**; choosing a replacement specialization assigns the editing role to a roleless primary automatically. Stored inside `references_json` with the assets. |
 | `job_type` | Legacy compatibility field for workflows saved before task plans. It is hidden by the current UI; untouched legacy workflows retain their previous `standard` / `replacement` / `auto` behavior. |
 | `reasoning_effort` | `none` / `low` / `medium` / `high`, default `medium`. Passed to OpenRouter, dropped for models that don't reason. |
 | `width` / `height` / `length_seconds` | Told to the model so it composes for the real frame and keeps its cut timestamps inside the real duration. `0` leaves one unspecified. These do not set the output size, `Empty MiniMax H3 AV Latent` does. |
