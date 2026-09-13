@@ -64,7 +64,9 @@ def test_slot_placement_for_a_mixed_set(fake_folder_paths, monkeypatch):
     assert by_name["audio_1"] == f"AUD:{tmp_path / 'a1.wav'}"
     assert by_name["prompt"] == "a prompt"
 
-    filled = {"image_1", "image_2", "video_1", "video_audio_1", "audio_1", "prompt", "debug"}
+    # width/height always carry the frame (here the 0 x 0 the call passed).
+    filled = {"image_1", "image_2", "video_1", "video_audio_1", "audio_1", "prompt", "debug",
+              "width", "height"}
     for name in refs.output_names():
         if name not in filled:
             assert by_name[name] is None, f"{name} should be empty"
@@ -710,7 +712,7 @@ def test_the_cap_defaults_to_2048_when_the_widget_is_absent(fake_folder_paths, m
     assert declared[1]["default"] == 2048
 
 
-def test_the_cap_is_declared_last_so_old_workflows_restore_unchanged():
+def test_widgets_are_append_only_so_old_workflows_restore_unchanged():
     """Widgets restore POSITIONALLY - a new input anywhere but the end re-points every
     saved value in a workflow written by an older build.
 
@@ -724,7 +726,7 @@ def test_the_cap_is_declared_last_so_old_workflows_restore_unchanged():
         "direction", "references_json", "system_prompt", "prompt_provider",
         "openrouter_api_key", "openrouter_model", "reasoning_effort", "api_base",
         "local_model_slug", "job_type", "width", "height", "length_seconds",
-        "max_reference_edge",
+        "max_reference_edge", "match_video_aspect",
     ]
 
 
@@ -833,3 +835,152 @@ def test_the_api_key_never_reaches_a_log_line(fake_folder_paths, monkeypatch, ca
         )
 
     assert not any("deadbeef" in ln for ln in _lines(caplog))
+
+
+# ---- match_video_aspect -----------------------------------------------------------
+#
+# A 16:9 canvas on a 2.35:1 plate left MiniMax to invent picture above and below it
+# (FaceFusion shots/amelia-tests, #257). With the switch on, width x height sets only
+# the pixel area and the plate sets the shape; the width/height outputs carry the result
+# so the render and the prompt use one frame.
+
+
+class _Frames:
+    """Stands in for the IMAGE tensor load_video returns: [frames, height, width, 3]."""
+
+    def __init__(self, width, height):
+        self.shape = (17, height, width, 3)
+
+
+def _video_refs(monkeypatch, tmp_path, sizes, primary=None):
+    names = [f"v{i}.mp4" for i in range(1, len(sizes) + 1)]
+    _touch(tmp_path, *names)
+    by_path = {str(tmp_path / n): _Frames(*size) for n, size in zip(names, sizes)}
+    monkeypatch.setattr(
+        nodes.media, "load_video",
+        lambda path, target_fps=24, crop=None, trim=None: (by_path[path], None),
+    )
+    refs_list = [{"kind": "video", "file": n, "use_soundtrack": False} for n in names]
+    if primary is not None:
+        refs_list[primary]["primary"] = True
+        refs_list[primary]["roles"] = ["video_editing"]
+    return json.dumps({"references": refs_list})
+
+
+def _capture_prompt(monkeypatch):
+    seen = {}
+
+    def write_prompt(*a, **k):
+        seen.update(width=k.get("width"), height=k.get("height"))
+        return "a prompt"
+
+    monkeypatch.setattr(nodes.prompt, "write_prompt", write_prompt, raising=False)
+    return seen
+
+
+def _frame_out(out):
+    by_name = dict(zip(refs.output_names(), out))
+    return by_name["width"], by_name["height"]
+
+
+@pytest.mark.parametrize("area,video,expected", [
+    ((1376, 768), (1920, 816), (1568, 672)),     # #257's 2.35:1 plate at a 16:9 1.0 MP area
+    ((768, 1376), (458, 816), (768, 1376)),      # #175's head crop is already 9:16
+    ((1280, 720), (1080, 1920), (704, 1280)),    # a portrait plate turns a landscape area
+    ((64, 64), (4000, 10), (1280, 32)),          # never below one grid step
+])
+def test_match_frame_keeps_the_area_and_takes_the_videos_shape(area, video, expected):
+    w, h = nodes.match_frame(*area, *video)
+    assert (w, h) == expected
+    assert w % 32 == 0 and h % 32 == 0
+
+
+def test_the_switch_takes_the_frame_from_video_1(fake_folder_paths, monkeypatch):
+    references_json = _video_refs(monkeypatch, fake_folder_paths, [(1920, 816), (640, 640)])
+    seen = _capture_prompt(monkeypatch)
+    out = nodes.MiniMaxH3ReferencePack().build(
+        direction="d", references_json=references_json, width=1376, height=768,
+        match_video_aspect=True,
+    )
+    assert _frame_out(out) == (1568, 672)
+    assert seen == {"width": 1568, "height": 672}, "the prompt must describe the rendered frame"
+    assert "1568 x 672" in dict(zip(refs.output_names(), out))["debug"]
+
+
+def test_a_primary_video_sets_the_frame_over_video_1(fake_folder_paths, monkeypatch):
+    references_json = _video_refs(
+        monkeypatch, fake_folder_paths, [(640, 640), (1920, 816)], primary=1
+    )
+    _capture_prompt(monkeypatch)
+    out = nodes.MiniMaxH3ReferencePack().build(
+        direction="d", references_json=references_json, width=1376, height=768,
+        match_video_aspect=True,
+    )
+    assert _frame_out(out) == (1568, 672)
+
+
+def test_without_the_switch_width_and_height_pass_through(fake_folder_paths, monkeypatch):
+    references_json = _video_refs(monkeypatch, fake_folder_paths, [(1920, 816)])
+    seen = _capture_prompt(monkeypatch)
+    out = nodes.MiniMaxH3ReferencePack().build(
+        direction="d", references_json=references_json, width=1376, height=768,
+    )
+    assert _frame_out(out) == (1376, 768)
+    assert seen == {"width": 1376, "height": 768}
+
+
+def test_the_switch_without_a_video_keeps_width_and_height(fake_folder_paths, monkeypatch):
+    _capture_prompt(monkeypatch)
+    out = nodes.MiniMaxH3ReferencePack().build(
+        direction="d", references_json="", width=1376, height=768, match_video_aspect=True,
+    )
+    assert _frame_out(out) == (1376, 768)
+    assert "no reference video" in dict(zip(refs.output_names(), out))["debug"]
+
+
+def test_the_switch_needs_an_area_to_keep(fake_folder_paths, monkeypatch):
+    references_json = _video_refs(monkeypatch, fake_folder_paths, [(1920, 816)])
+    _capture_prompt(monkeypatch)
+    with pytest.raises(ValueError, match="match_video_aspect"):
+        nodes.MiniMaxH3ReferencePack().build(
+            direction="d", references_json=references_json, width=0, height=768,
+            match_video_aspect=True,
+        )
+
+
+def test_the_frame_is_set_even_when_no_prompt_is_written(fake_folder_paths, monkeypatch):
+    references_json = _video_refs(monkeypatch, fake_folder_paths, [(1920, 816)])
+    monkeypatch.setattr(nodes.prompt, "write_prompt", _never_called, raising=False)
+    out = nodes.MiniMaxH3ReferencePack().build(
+        direction="d", references_json=references_json, width=1376, height=768,
+        match_video_aspect=True, prompt_provider="none",
+    )
+    assert _frame_out(out) == (1568, 672)
+
+
+def test_a_stray_string_in_the_switch_slot_reads_as_off(fake_folder_paths, monkeypatch):
+    """Direct callers only: a queued prompt is bool()ed by the server first, and the
+    frontend repair in web/refpack.js is what keeps a stray value off there."""
+    references_json = _video_refs(monkeypatch, fake_folder_paths, [(1920, 816)])
+    _capture_prompt(monkeypatch)
+    for stray in ("", "False", "off", None):
+        out = nodes.MiniMaxH3ReferencePack().build(
+            direction="d", references_json=references_json, width=1376, height=768,
+            match_video_aspect=stray,
+        )
+        assert _frame_out(out) == (1376, 768), stray
+
+
+def test_is_changed_key_moves_with_the_switch(fake_folder_paths):
+    kwargs = dict(direction="d", references_json="", width=1376, height=768)
+    off = nodes.MiniMaxH3ReferencePack.IS_CHANGED(**kwargs)
+    on = nodes.MiniMaxH3ReferencePack.IS_CHANGED(match_video_aspect=True, **kwargs)
+    assert off != on
+
+
+def test_the_switch_is_the_last_widget_so_saved_values_keep_their_slots():
+    spec = nodes.MiniMaxH3ReferencePack.INPUT_TYPES()
+    optional = list(spec["optional"])
+    assert optional[-2:] == ["max_reference_edge", "match_video_aspect"]
+    assert spec["optional"]["match_video_aspect"][0] == "BOOLEAN"
+    assert spec["optional"]["match_video_aspect"][1]["default"] is False

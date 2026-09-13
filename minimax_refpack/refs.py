@@ -373,7 +373,7 @@ class ReferenceSet:
 # ---- output socket names ---------------------------------------------------
 
 def output_names() -> tuple[str, ...]:
-    """The node's 20 outputs, in declaration order.
+    """The node's 22 outputs, in declaration order.
 
     image_1..9 -> ref_images.ref_image_0..8
     video_1..3 -> ref_videos.ref_video_0..2
@@ -381,24 +381,26 @@ def output_names() -> tuple[str, ...]:
     audio_1..3 -> ref_audios.ref_audio_0..2
     prompt -> the MiniMax node's prompt widget
     debug -> the full payload that went to the LLM, for a preview/console node
+    width, height -> the frame the prompt was written for; wire them into MiniMax's node
 
     APPEND-ONLY. ComfyUI stores a link by its output SLOT INDEX, so inserting a socket
     anywhere but the end silently re-points every existing link in a saved workflow.
-    `debug` went on the end for exactly that reason - users have graphs wired to these
-    sockets by hand.
+    `debug`, then `width`/`height`, went on the end for exactly that reason - users have
+    graphs wired to these sockets by hand.
     """
     names: list[str] = [f"image_{i}" for i in range(1, MAX_IMAGES + 1)]
     names += [f"video_{i}" for i in range(1, MAX_VIDEOS + 1)]
     names += [f"video_audio_{i}" for i in range(1, MAX_VIDEOS + 1)]
     names += [f"audio_{i}" for i in range(1, MAX_AUDIOS + 1)]
-    names.append("prompt")
-    names.append("debug")
+    names += _STRING_OUTPUTS
+    names += _FRAME_OUTPUTS
     return tuple(names)
 
 
-# The trailing STRING sockets, in output_names() order. Everything before them is a
-# media socket that starts as None; these start as "".
+# The trailing sockets, in output_names() order. Everything before them is a media
+# socket that starts as None; the strings start as "" and the frame as 0.
 _STRING_OUTPUTS = ("prompt", "debug")
+_FRAME_OUTPUTS = ("width", "height")
 
 
 def output_types() -> tuple[str, ...]:
@@ -407,18 +409,20 @@ def output_types() -> tuple[str, ...]:
     types += ["AUDIO"] * MAX_VIDEOS
     types += ["AUDIO"] * MAX_AUDIOS
     types += ["STRING"] * len(_STRING_OUTPUTS)
+    types += ["INT"] * len(_FRAME_OUTPUTS)
     return tuple(types)
 
 
 def slot_index(name: str) -> int:
-    """Index of an output socket by name, for building the 20-tuple."""
+    """Index of an output socket by name, for building the output tuple."""
     return output_names().index(name)
 
 
 def empty_outputs() -> list[Any]:
-    """A full output tuple of Nones (plus empty strings for prompt/debug)."""
-    out: list[Any] = [None] * (len(output_names()) - len(_STRING_OUTPUTS))
+    """A full output tuple of Nones, plus empty strings for prompt/debug and a 0x0 frame."""
+    out: list[Any] = [None] * (len(output_names()) - len(_STRING_OUTPUTS) - len(_FRAME_OUTPUTS))
     out += [""] * len(_STRING_OUTPUTS)
+    out += [0] * len(_FRAME_OUTPUTS)
     return out
 
 

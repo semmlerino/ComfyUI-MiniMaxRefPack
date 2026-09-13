@@ -156,12 +156,15 @@ const ORDER_0_3_3 = [
     "local_model_slug", "job_type", "width", "height", "length_seconds",
     "max_reference_edge",
 ];
+// 0.4.2 appended match_video_aspect. Appending keeps every 0.3.3 slot where it was, so
+// one detection covers both: names past the end of an older array simply do not appear.
+const ORDER_CURRENT = ORDER_0_3_3.concat(["match_video_aspect"]);
 
 function detectLayout(values) {
     if (!Array.isArray(values)) return null;
-    // 0.3.3 already: slot 3 holds a provider string.
+    // 0.3.3 or later: slot 3 holds a provider string.
     if (PROVIDER_VALUES.includes(String(values[3] ?? "").trim().toLowerCase())) {
-        return ORDER_0_3_3;
+        return ORDER_CURRENT;
     }
     // 0.3.1: use_openrouter was a boolean at slot 8. 0.3.2: a provider string there.
     const slot8 = values[8];
@@ -170,6 +173,13 @@ function detectLayout(values) {
         return values.length > 12 ? ORDER_0_3_2 : ORDER_0_3_1;
     }
     return null;   // unrecognised: leave it alone rather than guess
+}
+
+function migrateMatchValue(raw) {
+    // Only a real true survives. A graph saved before the switch existed can restore a
+    // stray trailing value into its slot, and a BOOLEAN widget holding "" or "True" would
+    // otherwise ride through to the server, where bool() reads any non-empty text as on.
+    return raw === true;
 }
 
 function remapWidgetValues(values) {
@@ -192,6 +202,9 @@ function remapWidgetValues(values) {
     }
     if (out.prompt_provider !== undefined) {
         out.prompt_provider = migrateProviderValue(out.prompt_provider);
+    }
+    if (out.match_video_aspect !== undefined) {
+        out.match_video_aspect = migrateMatchValue(out.match_video_aspect);
     }
     return out;
 }
@@ -3680,7 +3693,7 @@ app.registerExtension({
                 // layout it was actually written in.
                 const saved = info && info.widgets_values;
                 const byName = remapWidgetValues(saved);
-                if (byName && detectLayout(saved) !== ORDER_0_3_3) {
+                if (byName && detectLayout(saved) !== ORDER_CURRENT) {
                     for (const [name, value] of Object.entries(byName)) {
                         setWidget(this, name, value);
                     }
@@ -3693,6 +3706,11 @@ app.registerExtension({
                         "[MiniMaxRefPack] event=migrated_provider from=use_openrouter " +
                         `to=${widgetByName(this, "prompt_provider").value}`
                     );
+                }
+                const matchWidget = widgetByName(this, "match_video_aspect");
+                if (matchWidget && matchWidget.value !== migrateMatchValue(matchWidget.value)) {
+                    matchWidget.value = migrateMatchValue(matchWidget.value);
+                    console.log("[MiniMaxRefPack] event=migrated_match_video_aspect to=false");
                 }
                 // After the migration above, so a 0.3.1 graph's `true` has already become
                 // "openrouter" and the button is hidden rather than flickering on.

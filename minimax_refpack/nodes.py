@@ -12,6 +12,7 @@ VAE/tokenizer.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import time
 
@@ -21,6 +22,37 @@ from . import endpoint, logs, media, prompt, refs
 # the widget default AND the fallback when a workflow saved before the widget existed
 # restores without it - those two must never drift apart.
 DEFAULT_MAX_REFERENCE_EDGE = 2048
+
+# MiniMaxH3ReferenceToVideo's width/height step, and the grid its reference canvas is
+# rounded to (comfy_extras/nodes_minimax_h3.py CANVAS_MULTIPLE).
+FRAME_MULTIPLE = 32
+
+
+def match_frame(width: int, height: int, video_width: int, video_height: int) -> tuple[int, int]:
+    """width x height's pixel area in the video's aspect ratio, on the 32 px grid.
+
+    The core node never crops a reference video to the output canvas: it keeps the
+    video's own ratio and leaves any mismatch to the model, which reframes or invents
+    picture. So the area stays the user's (their megapixel choice) and the shape comes
+    from the video. A 2.35:1 plate at a 1376x768 area comes out 1568x672.
+    """
+    area = width * height
+    ratio = video_width / video_height
+    return (
+        max(FRAME_MULTIPLE, round(math.sqrt(area * ratio) / FRAME_MULTIPLE) * FRAME_MULTIPLE),
+        max(FRAME_MULTIPLE, round(math.sqrt(area / ratio) / FRAME_MULTIPLE) * FRAME_MULTIPLE),
+    )
+
+
+def _switch_on(value) -> bool:
+    """Only True, or the text "true", turns the switch on, for callers of build() itself.
+
+    On a queued prompt this cannot help: execution.py bool()s a BOOLEAN input before the
+    node runs, so a stray "False" arrives as True and "" as False. A graph saved before
+    the widget existed restores the DOM widget's "" into this slot, and web/refpack.js
+    (migrateMatchValue) resets anything but a real true before the graph is queued.
+    """
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
 
 
 def _provider_of(prompt_provider, use_openrouter=None) -> str:
@@ -214,6 +246,18 @@ class MiniMaxH3ReferencePack:
                                "cached at source resolution, and the core node resizes "
                                "them at encode time.",
                 }),
+
+                # Appended, not grouped with width/height: widgets_values restores by
+                # position, and the end is the one slot no saved graph already fills.
+                "match_video_aspect": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "On: width x height sets only the pixel area, and the frame "
+                               "takes the aspect ratio of the primary video (<Video 1> when "
+                               "none is marked), on a 32 px grid. The width/height outputs "
+                               "carry the frame; wire them into MiniMax's node so the render "
+                               "and the prompt use the same one. No reference video: "
+                               "width and height pass through.",
+                }),
             },
         }
 
@@ -229,7 +273,7 @@ class MiniMaxH3ReferencePack:
         prompt_provider=endpoint.DEFAULT_PROVIDER,
         reasoning_effort=prompt.DEFAULT_REASONING_EFFORT, job_type="auto",
         max_reference_edge=DEFAULT_MAX_REFERENCE_EDGE, api_base="", local_model_slug="",
-        use_openrouter=None, model=None, model_override=None, **kwargs
+        match_video_aspect=False, use_openrouter=None, model=None, model_override=None, **kwargs
     ):
         openrouter_model = openrouter_model or (model or "")
         local_model_slug = local_model_slug or (model_override or "")
@@ -249,7 +293,7 @@ class MiniMaxH3ReferencePack:
             str(width), str(height), str(length_seconds),
             _provider_of(prompt_provider, use_openrouter),
             str(reasoning_effort), str(job_type), str(max_reference_edge),
-            str(api_base), str(local_model_slug),
+            str(api_base), str(local_model_slug), str(_switch_on(match_video_aspect)),
         ])
 
     def build(
@@ -258,7 +302,7 @@ class MiniMaxH3ReferencePack:
         prompt_provider=endpoint.DEFAULT_PROVIDER,
         reasoning_effort=prompt.DEFAULT_REASONING_EFFORT, job_type="auto",
         max_reference_edge=DEFAULT_MAX_REFERENCE_EDGE, api_base="", local_model_slug="",
-        use_openrouter=None, model=None, model_override=None,
+        match_video_aspect=False, use_openrouter=None, model=None, model_override=None,
     ):
         # Legacy kwarg names, for an API client replaying a prompt stored before 0.3.2.
         # The new field wins when both arrive, so a deliberate value is never overridden
@@ -295,6 +339,7 @@ class MiniMaxH3ReferencePack:
         # the same filename with overwrite=true, which is exactly why IS_CHANGED above
         # hashes mtime+size rather than trusting the name.
         cache = media.MediaCache()
+        aspect_source = None  # (tag, frames) of the video the frame follows
         for tagged in reference_set.assign_tags():
             path = os.path.join(input_dir, tagged.file)
             logs.log(
@@ -313,12 +358,38 @@ class MiniMaxH3ReferencePack:
             elif tagged.kind == "video":
                 frames, audio = cache.video(path, crop=tagged.ref.crop, trim=tagged.ref.trim)
                 outputs[refs.slot_index(f"video_{tagged.slot}")] = frames
+                if aspect_source is None or (tagged.ref.primary and not aspect_source[2]):
+                    aspect_source = (tagged.tag, frames, tagged.ref.primary)
                 if tagged.ref.use_soundtrack and audio is not None:
                     outputs[refs.slot_index(f"video_audio_{tagged.slot}")] = audio
             else:  # audio
                 outputs[refs.slot_index(f"audio_{tagged.slot}")] = cache.audio(
                     path, trim=tagged.ref.trim
                 )
+
+        frame_note = ""
+        if _switch_on(match_video_aspect):
+            if aspect_source is None:
+                frame_note = "  (match_video_aspect: no reference video, kept as given)"
+            else:
+                if not (width and height):
+                    raise ValueError(
+                        "match_video_aspect needs width and height to set the pixel area; "
+                        f"got {width} x {height}"
+                    )
+                tag, frames, _primary = aspect_source
+                # The decoded IMAGE tensor, [frames, height, width, 3]: after crop, the
+                # exact pixels MiniMax's node will size its reference canvas from.
+                video_h, video_w = int(frames.shape[1]), int(frames.shape[2])
+                given = (width, height)
+                width, height = match_frame(width, height, video_w, video_h)
+                frame_note = (
+                    f"  (match_video_aspect: {tag} is {video_w} x {video_h}, "
+                    f"area of {given[0]} x {given[1]})"
+                )
+            logs.log("frame", width=width, height=height, source=aspect_source and aspect_source[0])
+        outputs[refs.slot_index("width")] = int(width or 0)
+        outputs[refs.slot_index("height")] = int(height or 0)
 
         prompt_text = ""
         debug_sink: list[str] = []
@@ -329,6 +400,7 @@ class MiniMaxH3ReferencePack:
             + (" (local_model_slug)" if provider == "local" else " (openrouter_model)"),
             f"width: {width or '(unspecified)'}  height: {height or '(unspecified)'}  "
             f"length_seconds: {length_seconds or '(unspecified)'}",
+            f"frame: {width} x {height}{frame_note}",
             f"reasoning_effort: {reasoning_effort}",
             f"max_reference_edge: {max_reference_edge or 'off'}",
             (

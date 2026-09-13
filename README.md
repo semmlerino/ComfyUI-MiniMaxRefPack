@@ -109,7 +109,8 @@ On `prompt_provider: local` the environment is never read. Only a key typed into
 | Task plan | **Infer roles** keeps automatic routing. **Set roles explicitly** derives the official combined prefix, selects composable system-prompt overlays and skips classification. A primary video must also be marked **Use as editing source** or **Use as continuation source**; choosing a replacement specialization assigns the editing role to a roleless primary automatically. Stored inside `references_json` with the assets. |
 | `job_type` | Legacy compatibility field for workflows saved before task plans. It is hidden by the current UI; untouched legacy workflows retain their previous `standard` / `replacement` / `auto` behavior. |
 | `reasoning_effort` | `none` / `low` / `medium` / `high`, default `medium`. Passed to OpenRouter, dropped for models that don't reason. |
-| `width` / `height` / `length_seconds` | Told to the model so it composes for the real frame and keeps its cut timestamps inside the real duration. `0` leaves one unspecified. These do not set the output size, `Empty MiniMax H3 AV Latent` does. |
+| `width` / `height` / `length_seconds` | Told to the model so it composes for the real frame and keeps its cut timestamps inside the real duration. `0` leaves one unspecified. `width` and `height` come back out of the node's `width` / `height` outputs, changed only by `match_video_aspect`; the output size is whatever feeds MiniMax's node, so wire those outputs there. |
+| `match_video_aspect` | Off by default. On: `width` × `height` sets only the pixel area, and the frame takes the aspect ratio of the primary video (`<Video 1>` when none is marked), rounded to MiniMax's 32 px grid. The shipped example has it on and renders from the `width` / `height` outputs. With no reference video, `width` and `height` pass through. |
 | `prompt_provider` | `openrouter` / `local` / `none`. See above. Replaces the old `use_openrouter` checkbox; workflows saved before 0.3.2 migrate automatically. |
 | `api_base` | Base URL of your OpenAI-compatible server, used only when `prompt_provider` is `local`. Must end in `/v1`. |
 | `openrouter_model` | The model that writes your prompt on `openrouter`. Ignored on every other provider. |
@@ -128,6 +129,10 @@ So a video's soundtrack is `<Audio 1>` even if you added a standalone audio clip
 ## Limits
 
 The model's limits, not the node's: 9 images, 3 videos, 3 soundtracks, 3 audio clips. Reference videos need at least 5 frames, get trimmed to MiniMax's 17k+5 frame grid, then capped to the length of the video you're generating. Clips are resampled to 24fps on the way in.
+
+## Changed in 0.4.2
+
+New `match_video_aspect` switch and `width` / `height` outputs. MiniMax never crops a reference video to the output canvas, so a 16:9 render of a 2.35:1 plate leaves the model to reframe or invent picture above and below it. With the switch on, the node keeps the pixel area of `width` × `height` and takes the shape from the reference video: a 1920×816 plate at a 1376×768 area gives 1568×672. The prompt is written for that frame, and the outputs carry it to MiniMax's node. Both outputs are appended after `debug`, and the switch after `max_reference_edge`, so saved links and widget values keep their slots. Existing graphs keep their behaviour until you turn the switch on and rewire.
 
 ## Changed in 0.4.1
 

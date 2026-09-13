@@ -289,9 +289,9 @@ def test_a_directory_is_not_a_file(tmp_path):
 # ---- output sockets --------------------------------------------------------
 
 
-def test_twenty_outputs_in_declaration_order():
+def test_outputs_in_declaration_order():
     names = output_names()
-    assert len(names) == 20
+    assert len(names) == 22
     assert names[0] == "image_1"
     assert names[8] == "image_9"
     assert names[9:12] == ("video_1", "video_2", "video_3")
@@ -299,6 +299,7 @@ def test_twenty_outputs_in_declaration_order():
     assert names[15:18] == ("audio_1", "audio_2", "audio_3")
     assert names[18] == "prompt"
     assert names[19] == "debug"
+    assert names[20:] == ("width", "height")
 
 
 def test_the_19_media_and_prompt_slots_keep_their_indices():
@@ -324,14 +325,16 @@ def test_output_types_line_up():
     assert types[12:18] == ("AUDIO",) * 6
     assert types[18] == "STRING"
     assert types[19] == "STRING"
+    assert types[20:] == ("INT", "INT")
 
 
-def test_empty_outputs_is_all_none_but_the_two_strings():
+def test_empty_outputs_is_none_but_the_strings_and_the_frame():
     out = empty_outputs()
-    assert len(out) == 20
+    assert len(out) == 22
     assert out[:18] == [None] * 18
     assert out[18] == ""
     assert out[19] == ""
+    assert out[20:] == [0, 0]
 
 
 # ---- pack settings (model / reasoning effort) --------------------------------

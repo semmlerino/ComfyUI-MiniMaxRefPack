@@ -264,8 +264,28 @@ def test_the_js_layout_matches_the_python_declaration_order():
     from minimax_refpack import nodes
     spec = nodes.MiniMaxH3ReferencePack.INPUT_TYPES()
     python_order = list(spec["required"]) + list(spec["optional"])
-    js_order = _run_js("ORDER_0_3_3")
+    js_order = _run_js("ORDER_CURRENT")
     assert js_order == python_order
+
+
+@requires_node
+def test_a_current_array_carrying_the_frame_switch_maps_it_by_name():
+    current = [
+        "d", "", "", "openrouter", "", "google/gemini-3-flash-preview", "medium",
+        "", "", "auto", 1376, 768, 5.0, 2048, True,
+    ]
+    got = _remap(current)
+    assert got["match_video_aspect"] is True
+    assert got["max_reference_edge"] == 2048
+
+
+@requires_node
+@pytest.mark.parametrize("raw,expected", [
+    ("true", True), ("false", False), ('""', False), ('"True"', False), ("null", False),
+])
+def test_the_frame_switch_only_keeps_a_real_boolean_true(raw, expected):
+    """A graph saved before the switch existed can hand its slot a stray trailing value."""
+    assert _run_js(f"migrateMatchValue({raw})") is expected
 
 
 # ---- provider-field visibility -------------------------------------------------

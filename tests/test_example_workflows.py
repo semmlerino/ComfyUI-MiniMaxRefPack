@@ -239,3 +239,33 @@ def test_preview_nodes_ship_empty(path):
                 "run. Clear it before shipping: whatever you last generated goes public "
                 "with the workflow."
             )
+
+
+@pytest.mark.parametrize("path", WORKFLOWS, ids=lambda p: p.name)
+def test_the_render_takes_its_frame_from_the_pack(path):
+    """The shipped graph renders the frame its prompt was written for.
+
+    With match_video_aspect on, the pack's width/height outputs follow the reference
+    video's shape. Feeding MiniMax's node from the ResolutionSelector instead would tell
+    the model one frame and render another.
+    """
+    from minimax_refpack import refs
+
+    graph = json.loads(path.read_text())
+    links = {row[0]: row for row in graph.get("links", [])}
+    names = [name for name, _ in _widget_spec()]
+    for pack in _pack_nodes(path):
+        values = dict(zip(names, pack.get("widgets_values") or []))
+        assert values.get("match_video_aspect") is True, f"{path.name}: switch is off"
+        outputs = [o["name"] for o in pack.get("outputs") or []]
+        assert outputs == list(refs.output_names()), f"{path.name}: outputs {outputs}"
+        renders = [n for n in graph["nodes"] if n.get("type") == "MiniMaxH3ReferenceToVideo"]
+        assert renders, f"{path.name}: no MiniMaxH3ReferenceToVideo"
+        for render in renders:
+            for entry in render.get("inputs") or []:
+                if entry["name"] not in ("width", "height"):
+                    continue
+                row = links[entry["link"]]
+                assert (row[1], row[2]) == (pack["id"], refs.slot_index(entry["name"])), (
+                    f"{path.name}: {entry['name']} comes from node {row[1]} slot {row[2]}"
+                )

@@ -149,14 +149,14 @@ def test_the_widgets_are_named_and_ordered_as_declared():
     spec = nodes.MiniMaxH3ReferencePack.INPUT_TYPES()
     assert list(spec["required"]) == ["direction"]
     # Grouped by decision flow (Aviv, 2026-08-17): the mode, then that mode's settings,
-    # then what to write, then the target video, then reference prep. This order is a
-    # WIRE FORMAT - widgets_values is positional - so changing it means updating
-    # ORDER_0_3_3 in web/refpack.js too, which test_migration.py asserts.
+    # then what to write, then the target video, then reference prep; later widgets are
+    # appended. This order is a WIRE FORMAT - widgets_values is positional - so changing
+    # it means updating ORDER_CURRENT in web/refpack.js too, which test_migration.py asserts.
     assert list(spec["required"]) + list(spec["optional"]) == [
         "direction", "references_json", "system_prompt", "prompt_provider",
         "openrouter_api_key", "openrouter_model", "reasoning_effort", "api_base",
         "local_model_slug", "job_type", "width", "height", "length_seconds",
-        "max_reference_edge",
+        "max_reference_edge", "match_video_aspect",
     ]
 
 

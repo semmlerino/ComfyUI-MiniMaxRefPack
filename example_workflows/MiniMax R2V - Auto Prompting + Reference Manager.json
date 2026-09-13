@@ -2,7 +2,7 @@
   "id": "f6c41c7f-009d-41d6-b0c9-d83b9d8ee121",
   "revision": 0,
   "last_node_id": 194,
-  "last_link_id": 413,
+  "last_link_id": 415,
   "nodes": [
     {
       "id": 121,
@@ -517,7 +517,7 @@
           "widget": {
             "name": "width"
           },
-          "link": 372
+          "link": 414
         },
         {
           "name": "height",
@@ -525,7 +525,7 @@
           "widget": {
             "name": "height"
           },
-          "link": 371
+          "link": 415
         },
         {
           "name": "length",
@@ -920,7 +920,6 @@
           "name": "width",
           "type": "INT",
           "links": [
-            372,
             397
           ]
         },
@@ -928,7 +927,6 @@
           "name": "height",
           "type": "INT",
           "links": [
-            371,
             396
           ]
         }
@@ -1473,11 +1471,25 @@
           "name": "debug",
           "type": "STRING",
           "links": null
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "links": [
+            414
+          ]
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "links": [
+            415
+          ]
         }
       ],
       "properties": {
         "cnr_id": "comfyui-minimaxrefpack",
-        "ver": "0.4.1",
+        "ver": "0.4.2",
         "Node name for S&R": "MiniMaxH3ReferencePack"
       },
       "widgets_values": [
@@ -1494,7 +1506,8 @@
         1280,
         720,
         8,
-        2048
+        2048,
+        true
       ]
     }
   ],
@@ -1650,22 +1663,6 @@
       184,
       0,
       "CLIP"
-    ],
-    [
-      371,
-      115,
-      1,
-      184,
-      23,
-      "INT"
-    ],
-    [
-      372,
-      115,
-      0,
-      184,
-      22,
-      "INT"
     ],
     [
       373,
@@ -1930,6 +1927,22 @@
       194,
       1,
       "STRING"
+    ],
+    [
+      414,
+      185,
+      20,
+      184,
+      22,
+      "INT"
+    ],
+    [
+      415,
+      185,
+      21,
+      184,
+      23,
+      "INT"
     ]
   ],
   "groups": [
