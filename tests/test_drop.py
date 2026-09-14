@@ -234,3 +234,11 @@ def test_the_declared_extensions_cover_what_the_pickers_accept():
     for kind, names in ext.items():
         assert names, kind
         assert names == [n.lower() for n in names], kind
+
+
+@requires_node
+def test_a_dropped_video_still_buckets_as_video_even_though_audio_accepts_video():
+    """The Audio row's picker takes video files; a DROP still sorts by what the file is."""
+    got = _bucket([_file("clip.mp4", "video/mp4"), _file("clip2.mp4")])
+    assert got["video"] == ["clip.mp4", "clip2.mp4"]
+    assert got["audio"] == []

@@ -130,7 +130,10 @@ async def list_files_route(request: web.Request) -> web.Response:
     input_dir = folder_paths.get_input_directory()
     # CU/folder_paths.py:229 - the same content-type filter the core input pickers use.
     files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
-    return web.json_response({"files": folder_paths.filter_files_content_types(files, [kind])})
+    # An audio reference may point at a video file (its soundtrack); core's LoadAudio
+    # lists the same pair (nodes_audio.py:364).
+    types = ["audio", "video"] if kind == "audio" else [kind]
+    return web.json_response({"files": folder_paths.filter_files_content_types(files, types)})
 
 
 async def system_prompt_route(request: web.Request) -> web.Response:

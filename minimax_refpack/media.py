@@ -196,10 +196,19 @@ def load_audio(path: str, trim=None) -> dict:
     """{"waveform": [1, C, L], "sample_rate": int} - CU/comfy_extras/nodes_audio.py:333
     returns (waveform, sample_rate); the AUDIO socket shape wraps it with a batch dim
     (:380-381). `trim` = [start, end] seconds, sliced exactly the way a video's
-    soundtrack is (_slice_audio)."""
+    soundtrack is (_slice_audio).
+
+    A video file is allowed (an audio reference to a clip's soundtrack): it decodes
+    through `_decode_audio_only`, never core's loader, and raises a named ValueError
+    when the clip has no decodable audio track."""
     import os
 
     with logs.timed("load_audio", file=os.path.basename(path), trim=trim) as fields:
+        if _guess_kind(path) == "video":
+            fields["source"] = "video"
+            audio = _decode_audio_only(path, trim)
+            fields["sample_rate"] = audio["sample_rate"]
+            return audio
         waveform, sample_rate = _audio_load_fn()(path)
         audio = {"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate}
         if trim is not None:
@@ -524,7 +533,7 @@ def _estimate_source_frames(container, stream, start_time: float, duration: floa
     return math.ceil(usable * rate)
 
 
-def _last_decodable_audio_stream(container):
+def _last_decodable_audio_stream(container, *, quiet: bool = False):
     """video_types.py:65-74: backwards for the first stream with a codec context.
 
     NOT `container.streams.audio[-1]`. Streams FFmpeg has no decoder for have no codec
@@ -534,7 +543,7 @@ def _last_decodable_audio_stream(container):
     """
     streams = container.streams.audio
     stream = next((s for s in reversed(streams) if s.codec_context is not None), None)
-    if stream is None and len(streams):
+    if stream is None and len(streams) and not quiet:
         logs.warn("video_audio_dropped", stage="select", error="no decodable audio stream")
     return stream
 
@@ -565,6 +574,114 @@ def _frame_start_seconds(frame, sample_rate: int) -> float:
         return 0.0
     time_base = frame.time_base if frame.time_base else Fraction(1, sample_rate)
     return float(frame.pts * time_base)
+
+
+class _AudioCollector:
+    """Resample, head-trim and tail-trim one soundtrack's decoded frames.
+
+    Shared by `_decode_pass` (a video's `video_audio_N`) and `_decode_audio_only` (an
+    audio reference that points at a video file), so the same file trimmed the same
+    way yields the same waveform through either socket - two copies of this loop
+    would drift. `sample_rate` is the stream's advertised rate, 0 when unknown; the
+    first decoded frame supplies it then.
+    """
+
+    def __init__(self, sample_rate: int, start_time: float, duration: float):
+        self.sample_rate = sample_rate
+        self.start_time = start_time
+        self.duration = duration
+        self.done = False
+        self._resampler = None
+        self._frames: list = []
+        self._has_first = False
+
+    def feed(self, raw) -> None:
+        import av
+
+        if self._resampler is None:
+            # Deferred initialisation, not a look-ahead: the rate arrives WITH the first
+            # frame, so no frame can precede it. This is why `probe_audio_params`
+            # (video_types.py:76-89) is not used - its own docstring says "the caller
+            # must seek back afterwards", and the seek it needs undone is what would
+            # break the one-pass claim.
+            rate = self.sample_rate or raw.sample_rate
+            if not rate:
+                return
+            self.sample_rate = int(rate)
+            self._resampler = av.audio.resampler.AudioResampler(format="fltp")
+        start_time, duration, sample_rate = self.start_time, self.duration, self.sample_rate
+        for frame in self._resampler.resample(raw):
+            frame_start = _frame_start_seconds(frame, sample_rate)
+            if duration and frame_start > start_time + duration:
+                self.done = True
+                return
+            if not self._has_first:
+                to_skip = max(0, int((start_time - frame_start) * sample_rate))
+                if to_skip < frame.samples:
+                    self._has_first = True
+                    self._frames.append(frame.to_ndarray()[..., to_skip:])
+            else:
+                self._frames.append(frame.to_ndarray())
+
+    def result(self) -> dict | None:
+        """The AUDIO dict, or None when nothing usable was decoded."""
+        import numpy as np
+        import torch
+
+        if not (self._frames and self.sample_rate):
+            return None
+        data = np.concatenate(self._frames, axis=1)
+        if self.duration:
+            limit = int(self.duration * self.sample_rate)
+            if limit < data.shape[1]:
+                # .copy(), NOT np.ascontiguousarray: a (1, N) mono buffer sliced to
+                # (1, M) is still flagged C_CONTIGUOUS - a leading axis of extent 1
+                # makes its stride irrelevant to the check - so ascontiguousarray
+                # returns the same VIEW and the whole concatenation stays alive
+                # behind it. (2, N) stereo does get copied, so the leak is silent on
+                # exactly the shape most fixtures use.
+                data = data[..., :limit].copy()
+        return {
+            "waveform": torch.from_numpy(data).unsqueeze(0),
+            "sample_rate": int(self.sample_rate),
+        }
+
+
+def _decode_audio_only(path: str, trim) -> dict:
+    """The soundtrack of a VIDEO file used as an audio reference; frames never decoded.
+
+    Not core `nodes_audio.load`: it decodes `streams.audio[0]` unguarded, which is not
+    the track `_decode_pass` picks for the same file's `video_audio_N` (the last
+    decodable one) and crashes the process on a codec-less first track (iPhone APAC).
+    """
+    import os
+
+    name = os.path.basename(path)
+    start_time, duration = _trim_window(trim)
+    with _open_container(path) as container:
+        stream = _last_decodable_audio_stream(container)
+        if stream is None:
+            raise ValueError(f"reference audio {name!r} has no decodable audio track")
+        collector = _AudioCollector(stream.codec_context.sample_rate or 0, start_time, duration)
+        # Seek exactly as `_decode_pass` does - on the video stream - so the audio
+        # decoder is fed the same packets from the same position. Seeking on the audio
+        # stream instead lands elsewhere and changes the codec's pre-roll: measured,
+        # an AAC head came back -0.09 where the video path gives 0.57.
+        videos = container.streams.video
+        seek_stream = videos[0] if videos else stream
+        if start_time and seek_stream.time_base:
+            container.seek(int(start_time / seek_stream.time_base), stream=seek_stream)
+        for packet in container.demux(stream):
+            for raw in packet.decode():
+                collector.feed(raw)
+                if collector.done:
+                    break
+            if collector.done:
+                break
+        audio = collector.result()
+    if audio is None:
+        raise ValueError(f"reference audio {name!r} yielded no decodable audio")
+    return audio
 
 
 def _cropped(img, box):
@@ -627,8 +744,6 @@ def _decode_pass(path, target_fps, crop, start_time, duration, *, n_src_hint, wa
     hint never asks for another.
     """
     import av
-    import numpy as np
-    import torch
 
     result = _PassResult()
     with _open_container(path) as container:
@@ -678,9 +793,7 @@ def _decode_pass(path, target_fps, crop, start_time, duration, *, n_src_hint, wa
         sample_rate = 0
         if audio_stream is not None and audio_stream.codec_context is not None:
             sample_rate = audio_stream.codec_context.sample_rate or 0
-        resampler = None
-        audio_frames: list = []
-        has_first_audio = False
+        collector = _AudioCollector(sample_rate, start_time, duration)
 
         converter = _FrameConverter(time_base)
         sink = None
@@ -746,30 +859,9 @@ def _decode_pass(path, target_fps, crop, start_time, duration, *, n_src_hint, wa
                 if audio_done:
                     continue
                 for raw in packet.decode():
-                    if resampler is None:
-                        # Deferred initialisation, not a look-ahead: the rate arrives
-                        # WITH the first frame, so no frame can precede it. This is why
-                        # `probe_audio_params` (video_types.py:76-89) is not used - its
-                        # own docstring says "the caller must seek back afterwards", and
-                        # the seek it needs undone is what would break the one-pass claim.
-                        rate = sample_rate or raw.sample_rate
-                        if not rate:
-                            continue
-                        sample_rate = int(rate)
-                        resampler = av.audio.resampler.AudioResampler(format="fltp")
-                    for frame in resampler.resample(raw):
-                        frame_start = _frame_start_seconds(frame, sample_rate)
-                        if duration and frame_start > start_time + duration:
-                            audio_done = True
-                            break
-                        if not has_first_audio:
-                            to_skip = max(0, int((start_time - frame_start) * sample_rate))
-                            if to_skip < frame.samples:
-                                has_first_audio = True
-                                audio_frames.append(frame.to_ndarray()[..., to_skip:])
-                        else:
-                            audio_frames.append(frame.to_ndarray())
-                    if audio_done:
+                    collector.feed(raw)
+                    if collector.done:
+                        audio_done = True
                         break
 
         result.n_src = n_seen
@@ -780,23 +872,10 @@ def _decode_pass(path, target_fps, crop, start_time, duration, *, n_src_hint, wa
         if sink is not None and last_frame is not None and next_out < n_out:
             sink.write(_cropped(converter.convert(last_frame), box), n_out - next_out)
 
-        if audio_frames and sample_rate:
-            data = np.concatenate(audio_frames, axis=1)
-            if duration:
-                limit = int(duration * sample_rate)
-                if limit < data.shape[1]:
-                    # .copy(), NOT np.ascontiguousarray: a (1, N) mono buffer sliced to
-                    # (1, M) is still flagged C_CONTIGUOUS - a leading axis of extent 1
-                    # makes its stride irrelevant to the check - so ascontiguousarray
-                    # returns the same VIEW and the whole concatenation stays alive
-                    # behind it. (2, N) stereo does get copied, so the leak is silent on
-                    # exactly the shape most fixtures use.
-                    data = data[..., :limit].copy()
-            result.audio = {
-                "waveform": torch.from_numpy(data).unsqueeze(0),
-                "sample_rate": int(sample_rate),
-            }
-        elif audio_stream is not None and not sample_rate:
+        audio = collector.result()
+        if audio is not None:
+            result.audio = audio
+        elif audio_stream is not None and not collector.sample_rate:
             logs.warn(
                 "video_audio_dropped", stage="decode",
                 error="stream never yielded a frame with a usable sample rate",
@@ -1263,7 +1342,9 @@ def _probe_video(path: str) -> dict:
         with _open_container(path) as container:
             streams = container.streams.video
             if not streams:
-                return empty
+                # An audio-only .mp4 is still a usable AUDIO reference; say it has sound.
+                has_audio = _last_decodable_audio_stream(container, quiet=True) is not None
+                return {**empty, "has_audio": has_audio}
             stream = streams[0]
             rate = stream.average_rate or stream.guessed_rate or stream.base_rate
             duration = None
@@ -1282,7 +1363,9 @@ def _probe_video(path: str) -> dict:
                 "height": height,
                 "fps": float(rate) if rate else None,
                 "duration": duration,
-                "has_audio": len(container.streams.audio) > 0,
+                # Decodable, not merely present: an APAC-only iPhone clip has an audio
+                # stream the decoder skips, and the tile must not promise its sound.
+                "has_audio": _last_decodable_audio_stream(container, quiet=True) is not None,
             }
     except Exception as e:
         logs.warn("probe_failed", file=os.path.basename(path),

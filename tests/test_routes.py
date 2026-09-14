@@ -222,3 +222,12 @@ def test_importing_routes_without_comfyui_does_not_raise():
 
     reloaded = importlib.reload(routes)
     assert reloaded.PromptServer is None or reloaded.PromptServer.instance is None
+
+
+def test_list_files_for_audio_includes_video_files(input_dir):
+    """An audio reference may use a video's soundtrack, so the audio picker lists both."""
+    for name in ("a.png", "b.mp4", "c.wav"):
+        open(os.path.join(input_dir, name), "wb").close()
+
+    resp = run(routes.list_files_route(FakeRequest(query={"kind": "audio"})))
+    assert sorted(body_json(resp)["files"]) == ["b.mp4", "c.wav"]

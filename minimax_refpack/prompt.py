@@ -52,6 +52,9 @@ _MODELS_CACHE_TTL = 3600
 _FALLBACK_MODELS = [DEFAULT_MODEL]
 
 _AUDIO_FORMATS = {".wav": "wav", ".mp3": "mp3"}
+# Standalone audio that cannot be inlined raw goes out decoded, downmixed and resampled
+# to this rate: speech and music survive it, and the payload is ~1/6 of full-rate stereo.
+VLM_AUDIO_RATE = 16000
 
 # OpenRouter normalises `reasoning` across providers and drops it for models that don't
 # reason, so sending it unconditionally is safe. Omitting the field entirely is NOT the
@@ -460,9 +463,36 @@ def classify_mode(*, direction: str, references, api_key: str, model: str = "", 
     return "replacement" if "REPLACEMENT" in answer else "standard"
 
 
+def _undecodable_audio_part(tag: str, filename: str) -> dict:
+    return _text_part(f"{tag}: audio reference {filename} (could not be decoded)")
+
+
+def _vlm_wav_b64(audio: dict) -> str:
+    """An AUDIO dict -> base64 mono PCM16 WAV at VLM_AUDIO_RATE, for the prompt only."""
+    import av
+
+    arr = _to_numpy(audio["waveform"]).astype(np.float32)
+    if arr.ndim == 3:
+        arr = arr[0]
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    mono = np.ascontiguousarray(arr.mean(axis=0, keepdims=True), dtype=np.float32)
+    rate = int(audio["sample_rate"])
+    if rate == VLM_AUDIO_RATE:
+        return _waveform_to_wav_b64(mono, rate)
+    frame = av.AudioFrame.from_ndarray(mono, format="fltp", layout="mono")
+    frame.sample_rate = rate
+    resampler = av.AudioResampler(format="fltp", layout="mono", rate=VLM_AUDIO_RATE)
+    chunks = [f.to_ndarray() for f in resampler.resample(frame)]
+    chunks += [f.to_ndarray() for f in resampler.resample(None)]
+    out = np.concatenate(chunks, axis=1) if chunks else np.zeros((1, 0), np.float32)
+    return _waveform_to_wav_b64(out, VLM_AUDIO_RATE)
+
+
 def _file_audio_part(path: str, tag: str, filename: str) -> dict:
-    """A standalone audio reference: inline if OpenRouter takes the format, else a text
-    line naming the tag, filename and duration. Never crashes on audio."""
+    """An untrimmed .wav/.mp3 audio reference, inlined raw (the only formats OpenRouter
+    takes as files); anything else is decoded by `_build_content` instead. Never
+    crashes on audio."""
     ext = os.path.splitext(filename)[1].lower()
     fmt = _AUDIO_FORMATS.get(ext)
     if fmt is None:
@@ -622,15 +652,34 @@ def _build_content(
 
         else:  # audio
             parts.append(_text_part(f"audio_reference {t.tag} ({t.file}) - the next audio clip:"))
+            ext = os.path.splitext(t.file)[1].lower()
             if t.ref.trim is not None:
                 # The raw-file inline would hand the VLM the WHOLE file. A trimmed
                 # reference decodes through load_audio so the VLM hears exactly the
                 # span the pack's audio_N socket emits; the decoded PCM rides the same
                 # WAV encoder the video soundtracks use (and degrades to text the same
                 # way if the encode fails).
-                parts.append(_video_audio_part(cache.audio(path, trim=t.ref.trim), t.tag, t.file))
-            else:
+                try:
+                    audio = cache.audio(path, trim=t.ref.trim)
+                except Exception:
+                    parts.append(_undecodable_audio_part(t.tag, t.file))
+                else:
+                    parts.append(_video_audio_part(audio, t.tag, t.file))
+            elif ext in _AUDIO_FORMATS:
                 parts.append(_file_audio_part(path, t.tag, t.file))
+            else:
+                # Not inlineable raw (.m4a/.flac, or a VIDEO file used for its sound):
+                # decode and send a mono 16 kHz WAV. Full-rate stereo PCM of a 3-minute
+                # clip is ~46 MB of base64; this is ~8 MB, and plenty for speech/music.
+                try:
+                    audio = cache.audio(path, trim=None)
+                    part = {
+                        "type": "input_audio",
+                        "input_audio": {"data": _vlm_wav_b64(audio), "format": "wav"},
+                    }
+                except Exception:
+                    part = _undecodable_audio_part(t.tag, t.file)
+                parts.append(part)
 
     text = "USER DIRECTION:\n" + direction
     fmt = _target_format_lines(width, height, length_seconds)

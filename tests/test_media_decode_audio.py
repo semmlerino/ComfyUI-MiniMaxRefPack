@@ -551,3 +551,80 @@ def test_the_reset_seam_actually_re_reads_the_environment(budget_env):
     two = media._decode_budget()
     assert (one, two) == (2**30, 2 * 2**30)
     assert one != two
+
+
+# ---- an audio reference to a video file: load_audio == load_video's soundtrack ------
+
+
+@pytest.mark.parametrize("trim", [None, TRIM])
+@pytest.mark.parametrize("codec", sorted(AUDIO_FORMATS))
+def test_load_audio_on_a_video_matches_its_video_soundtrack(clip, codec, trim, monkeypatch):
+    """The no-drift guard for `_AudioCollector`: the same file trimmed the same way must
+    give the same waveform on `audio_N` as on `video_audio_N`. Named `.mp4`/`.mkv` so
+    `_guess_kind` routes it down the video branch, never core's loader."""
+    container, ext, _rebases = AUDIO_FORMATS[codec]
+    ext = "mp4" if ext == "m4a" else ext
+    path = clip(
+        f"av_{codec}.{ext}", n=100, fps=25, container=container,
+        audio=codec, audio_seconds=AUDIO_SECONDS,
+    )
+
+    def core_loader():
+        raise AssertionError("a video file must never reach core's audio loader")
+
+    monkeypatch.setattr(media, "_audio_load_fn", core_loader)
+    decoded_video = []
+    real_pass = media._decode_pass
+    monkeypatch.setattr(
+        media, "_decode_pass", lambda *a, **k: decoded_video.append(1) or real_pass(*a, **k)
+    )
+
+    audio = media.load_audio(path, trim=trim)
+    assert decoded_video == [], "load_audio decoded video frames"
+    _frames, expected = media.load_video(path, trim=trim)
+
+    assert audio["sample_rate"] == expected["sample_rate"]
+    assert audio["waveform"].shape == expected["waveform"].shape
+    assert torch.equal(audio["waveform"], expected["waveform"])
+
+
+def test_load_audio_on_a_video_takes_the_last_decodable_track(tmp_path):
+    good = write_two_track_clip(tmp_path / "two.mkv")
+    path = break_last_codec_id(good, tmp_path / "two_broken.mkv")
+
+    audio = media.load_audio(path)
+
+    assert audio["sample_rate"] == 44100
+    assert float(audio["waveform"].numpy().mean()) == pytest.approx(0.25, abs=1e-3)
+
+
+def test_load_audio_on_a_silent_video_raises_a_named_error(clip):
+    path = clip("silent.mkv", n=30, fps=25, container="matroska", codec="libx264")
+    with pytest.raises(ValueError, match="no decodable audio track"):
+        media.load_audio(path)
+
+
+def test_an_audio_only_mp4_probes_as_sound_and_decodes_trimmed(tmp_path):
+    """No video stream: the probe must still say `has_audio`, and the trim seek falls
+    back to the audio stream itself."""
+    path = str(tmp_path / "voice.mp4")
+    out = av.open(path, "w", format="mp4")
+    try:
+        stream = out.add_stream("aac", rate=SAMPLE_RATE, layout="mono")
+        ramp = (np.arange(TOTAL_SAMPLES, dtype=np.float32) / TOTAL_SAMPLES)[None, :]
+        frame = av.AudioFrame.from_ndarray(ramp, format="fltp", layout="mono")
+        frame.sample_rate = SAMPLE_RATE
+        for packet in stream.encode(frame):
+            out.mux(packet)
+        for packet in stream.encode(None):
+            out.mux(packet)
+    finally:
+        out.close()
+
+    assert media.probe(path)["has_audio"] is True
+    audio = media.load_audio(path, trim=TRIM)
+    assert audio["sample_rate"] == SAMPLE_RATE
+    assert mono(audio).shape[0] == WINDOW_SAMPLES
+    assert float(mono(audio)[WINDOW_SAMPLES // 2]) == pytest.approx(
+        (HEAD_VALUE + TAIL_VALUE) / 2, abs=HEAD_ATOL["aac"]
+    )

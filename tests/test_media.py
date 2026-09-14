@@ -610,3 +610,76 @@ def test_a_failed_load_is_logged_as_a_failure(clip, caplog):
 # all. tests/test_media_encode.py is the replacement and it runs the real encoder: it
 # encodes, decodes the result back with PyAV, and asserts on structure - dimensions, frame
 # rate, frame count, and a soundtrack that actually carries samples.
+
+
+# ---- an audio reference that points at a video file ------------------------------
+
+
+class _FakeAudioStream:
+    def __init__(self, decodable):
+        self.codec_context = object() if decodable else None
+        self.time_base = None
+
+
+class _FakeStreamsContainer:
+    """Only `streams.audio`/`streams.video`: enough for track selection and the probe."""
+
+    def __init__(self, audio_streams):
+        self.streams = type("S", (), {"audio": audio_streams, "video": []})()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_load_audio_on_an_audio_file_never_opens_a_container(monkeypatch):
+    def boom(path):
+        raise AssertionError("an audio file must go through core's loader, not PyAV")
+
+    class FakeWaveform:
+        def unsqueeze(self, dim):
+            return self
+
+    monkeypatch.setattr(media, "_open_container", boom)
+    monkeypatch.setattr(media, "_audio_load_fn", lambda: (lambda path: (FakeWaveform(), 8000)))
+
+    assert media.load_audio("vo.wav")["sample_rate"] == 8000
+
+
+def test_load_audio_on_a_video_without_a_decodable_track_names_the_file(monkeypatch):
+    def core_loader():
+        raise AssertionError("a video file must never reach core's audio loader")
+
+    fake = _FakeStreamsContainer([_FakeAudioStream(False), _FakeAudioStream(False)])
+    monkeypatch.setattr(media, "_open_container", lambda path: fake)
+    monkeypatch.setattr(media, "_audio_load_fn", core_loader)
+
+    with pytest.raises(ValueError, match=r"'clip\.mp4' has no decodable audio track"):
+        media.load_audio("/in/clip.mp4")
+
+
+def test_track_selection_skips_a_codec_less_first_track():
+    first, second = _FakeAudioStream(False), _FakeAudioStream(True)
+    chosen = media._last_decodable_audio_stream(_FakeStreamsContainer([first, second]))
+    assert chosen is second
+
+
+def test_probe_reports_a_clip_whose_only_audio_is_undecodable_as_silent(monkeypatch):
+    class VideoStream:
+        average_rate = 25
+        duration = None
+        time_base = None
+        width, height = 64, 48
+
+    fake = _FakeStreamsContainer([_FakeAudioStream(False)])
+    fake.streams.video = [VideoStream()]
+    fake.duration = None
+    monkeypatch.setattr(media, "_open_container", lambda path: fake)
+    monkeypatch.setattr(media, "_first_frame_rotation_k", lambda c, s: (0, 64, 48))
+
+    info = media.probe("iphone.mov")
+
+    assert info["kind"] == "video"
+    assert info["has_audio"] is False

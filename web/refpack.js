@@ -56,11 +56,21 @@
  * assignment is gone (the node is captured via closure instead); hideWidget()'s own
  * property writes are defensive against the same class of bug.
  *
- * Each video tile carries a soundtrack toggle (♪, bottom-left) — it's the only thing
- * that routes that video's audio to its index-matched video_audio_N output, so it's
- * real functionality, not decoration. Gated on GET /minimax_refpack/probe?file=
- * (media.py's has_audio): dim/pending until the probe answers, permanently disabled
- * for a clip with no audio track. See probeHasAudio()/syncProbes() and drawTile().
+ * Each video tile carries a soundtrack MUTE (bottom-left: ♪ on a light chip when on,
+ * a struck-through speaker when muted, plus a "muted" badge line) — it's the only
+ * thing that routes that video's audio to its index-matched video_audio_N output, so
+ * it's real functionality, not decoration. The edit modal repeats it as a worded
+ * "Soundtrack: on/muted" button. Gated on GET /minimax_refpack/probe?file=
+ * (media.py's has_audio — a DECODABLE track): dim/pending until the probe answers,
+ * permanently disabled for a clip with no audio track. See probeHasAudio()/
+ * syncProbes() and drawTile().
+ *
+ * USE AUDIO ONLY: the mirror chip (bottom-right, speaker + out-arrow) and the edit
+ * modal's "Audio only" button replace a video reference with an AUDIO reference to
+ * the same file (videoToAudioOnly, the MMRP-AUDIO-ONLY seam): <Audio n>, no <Video k>,
+ * trim and audio roles kept. The Audio row's upload/picker accept video files too;
+ * such a tile says "video soundtrack" (or "video · no audio track", with the danger
+ * border) on its badge. Canvas hover titles name every chip's action (hitTitle).
  *
  * NOT SURFACED ON THE NODE BODY: the system prompt itself — lives only behind the ⚙
  * modal (openSystemPromptModal), never drawn on the body.
@@ -830,6 +840,17 @@ function syncProbes(node) {
             scheduleDraw(node);
         });
     }
+    // Audio references that point at a video file: record the answer for the tile's
+    // badge and warning border only. Never mutate the ref - build() raises a named
+    // error for a clip with no decodable track, which is the louder signal.
+    for (const ref of node._mmrpRefs.audios) {
+        if (!isVideoFile(ref.file)) continue;
+        const file = ref.file;
+        probeHasAudio(file).then((hasAudio) => {
+            probeResults.set(file, hasAudio);
+            scheduleDraw(node);
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,9 +1178,11 @@ function drawEditChip(ctx, x, y, edited) {
 
 // One tile: well, thumbnail/glyph, tag badge, delete, edit chip, soundtrack state,
 // play glyph, missing treatment, selection stroke. `lines` is the pre-computed badge
-// text (up to three: tag, a video's <Audio N>, the crop/trim summary); `playState` is
-// null | "play" | "pause" (null = no preview affordance: images, missing refs).
-function drawTile(ctx, kind, ref, lines, x, y, selected, soundState, badgeH, playState) {
+// text (up to three: tag, a video's <Audio N> or "muted" / an audio tile's source note,
+// the crop/trim summary); `playState` is null | "play" | "pause" (null = no preview
+// affordance: images, missing refs). `extra.audioOnly` is null | "on" | "dim" (the
+// video tile's "use audio only" chip); `extra.danger` paints the warning border.
+function drawTile(ctx, kind, ref, lines, x, y, selected, soundState, badgeH, playState, extra = {}) {
     const T = CL.tile;
 
     ctx.save();
@@ -1195,7 +1218,8 @@ function drawTile(ctx, kind, ref, lines, x, y, selected, soundState, badgeH, pla
 
     if (playState) {
         // Video: slightly above center to clear the badge; audio: lower half.
-        drawPlayGlyph(ctx, x + T / 2, kind === "audio" ? y + 80 : y + 58, playState === "pause");
+        // Audio at y+72, not lower: a three-line badge (badge3 = 42) would cover it.
+        drawPlayGlyph(ctx, x + T / 2, kind === "audio" ? y + 72 : y + 58, playState === "pause");
     }
 
     // Tag badge — drawn text on a translucent strip pinned to the tile's bottom.
@@ -1255,11 +1279,23 @@ function drawTile(ctx, kind, ref, lines, x, y, selected, soundState, badgeH, pla
         ctx.lineWidth = 1;
         pathRoundRect(ctx, x + 3.5, sy + 0.5, S - 1, S - 1, 4);
         ctx.stroke();
-        ctx.fillStyle =
-            soundState === "pending" ? "#555" : soundState === "none" ? "#444" : on ? "#000" : C.textMuted;
-        ctx.font = "16px sans-serif";
-        ctx.textAlign = "center";
-        ctx.fillText("♪", x + 3 + S / 2, sy + 20);
+        if (soundState === "off") {
+            // MUTED: a struck-through speaker, so "off" reads as a mute rather than as
+            // a dim note. The strike is brighter than the no-track state's below.
+            drawSpeaker(ctx, x + 3 + S / 2 - 1, sy + S / 2, 9, C.textMuted);
+            ctx.strokeStyle = C.text;
+            ctx.lineWidth = 1.8;
+            ctx.beginPath();
+            ctx.moveTo(x + 8, sy + S - 6);
+            ctx.lineTo(x + S - 2, sy + 6);
+            ctx.stroke();
+        } else {
+            ctx.fillStyle =
+                soundState === "pending" ? "#555" : soundState === "none" ? "#444" : on ? "#000" : C.textMuted;
+            ctx.font = "16px sans-serif";
+            ctx.textAlign = "center";
+            ctx.fillText("♪", x + 3 + S / 2, sy + 20);
+        }
         if (soundState === "none") {
             // Struck through: this clip has no audio track, permanently disabled.
             ctx.strokeStyle = "#555";
@@ -1271,9 +1307,36 @@ function drawTile(ctx, kind, ref, lines, x, y, selected, soundState, badgeH, pla
         }
     }
 
+    if (extra.audioOnly) {
+        // "Use audio only" - bottom-right, the ♪ chip's mirror. A speaker with an
+        // out-arrow: take the sound, leave the picture.
+        const S = CL.sound;
+        const ax = x + T - S - 3;
+        const sy = y + T - badgeH - S - 3;
+        const live = extra.audioOnly === "on";
+        ctx.fillStyle = "#111";
+        pathRoundRect(ctx, ax, sy, S, S, 4);
+        ctx.fill();
+        ctx.strokeStyle = "#555";
+        ctx.lineWidth = 1;
+        pathRoundRect(ctx, ax + 0.5, sy + 0.5, S - 1, S - 1, 4);
+        ctx.stroke();
+        const g = live ? C.text : "#555";
+        drawSpeaker(ctx, ax + S / 2 - 3, sy + S / 2 + 2, 7, g);
+        ctx.strokeStyle = g;
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.moveTo(ax + S - 12, sy + 11);
+        ctx.lineTo(ax + S - 6, sy + 5);
+        ctx.moveTo(ax + S - 10, sy + 5);
+        ctx.lineTo(ax + S - 6, sy + 5);
+        ctx.lineTo(ax + S - 6, sy + 9);
+        ctx.stroke();
+    }
+
     ctx.restore();
 
-    ctx.strokeStyle = ref.missing ? C.danger : C.border;
+    ctx.strokeStyle = ref.missing || extra.danger ? C.danger : C.border;
     ctx.lineWidth = 1;
     pathRoundRect(ctx, x + 0.5, y + 0.5, T - 1, T - 1, 4);
     ctx.stroke();
@@ -1401,9 +1464,16 @@ function draw(node) {
             const lines = kind === "video" && t.audioTag
                 ? [t.tag, `vid_audio ${t.audioTag}`]
                 : [t.tag];
+            const probed = probeResults.has(ref.file) ? probeResults.get(ref.file) : undefined;
+            // A muted clip that HAS sound says so: the ♪ chip alone did not read as mute.
+            if (kind === "video" && !ref.use_soundtrack && probed === true) lines.push("muted");
+            // An audio reference to a video file names its source - exactly one line.
+            const videoAudio = kind === "audio" && isVideoFile(ref.file);
+            if (videoAudio) lines.push(probed === false ? "video · no audio track" : "video soundtrack");
             // An edited reference states its edit on the badge: "2.00-6.50s · cropped".
             const summary = editSummary(ref);
             if (summary) lines.push(summary);
+            lines.length = Math.min(lines.length, 3); // three badge heights exist, no fourth
             const badgeH = [CL.badge1, CL.badge2, CL.badge3][lines.length - 1];
             const selected =
                 node._mmrpSelected && node._mmrpSelected.kind === kind && node._mmrpSelected.index === i;
@@ -1429,7 +1499,17 @@ function draw(node) {
                     playing && playing.kind === kind && playing.file === ref.file ? "pause" : "play";
             }
 
-            drawTile(ctx, kind, ref, lines, tx, tileY, selected, soundState, badgeH, playState);
+            // Audio-only chip: live only once the probe says there is sound to take and
+            // the audio row has room; dimmed (and not clickable) otherwise.
+            let audioOnly = null;
+            if (kind === "video") {
+                const room = node._mmrpRefs.audios.length < CAPS.audio;
+                audioOnly = !ref.missing && probed === true && room ? "on" : "dim";
+            }
+            const danger = videoAudio && probed === false;
+
+            drawTile(ctx, kind, ref, lines, tx, tileY, selected, soundState, badgeH, playState,
+                     { audioOnly, danger });
 
             // Hit regions, most specific last — hitTest scans in reverse so the
             // play/delete/soundtrack/edit affordances win over the tile containing them.
@@ -1458,6 +1538,18 @@ function draw(node) {
                     h: CL.sound,
                 });
             }
+            if (audioOnly === "on") {
+                regions.push({
+                    type: "audio_only",
+                    kind,
+                    index: i,
+                    file: ref.file,
+                    x: tx + CL.tile - CL.sound - 3,
+                    y: tileY + CL.tile - badgeH - CL.sound - 3,
+                    w: CL.sound,
+                    h: CL.sound,
+                });
+            }
             regions.push({
                 type: "del",
                 kind,
@@ -1469,7 +1561,7 @@ function draw(node) {
                 h: CL.del,
             });
             if (playState) {
-                const cy = kind === "audio" ? tileY + 80 : tileY + 58;
+                const cy = kind === "audio" ? tileY + 72 : tileY + 58;
                 regions.push({
                     type: "play",
                     kind,
@@ -1542,6 +1634,8 @@ function onCanvasMouseDown(node, e) {
         removeRef(node, hit.kind, hit.index);
     } else if (hit.type === "sound") {
         toggleSoundtrack(node, hit.file);
+    } else if (hit.type === "audio_only") {
+        convertToAudioOnly(node, hit.index);
     } else if (hit.type === "play") {
         togglePreview(node, hit);
     } else if (hit.type === "edit") {
@@ -1563,6 +1657,24 @@ function onCanvasDblClick(node, e) {
     const ref = node._mmrpRefs[`${hit.kind}s`][hit.index];
     if (!ref || ref.missing) return;
     openEditModal(node, hit.kind, hit.index);
+}
+
+function hitTitle(node, hit) {
+    if (!hit) return "";
+    if (hit.type === "sound") {
+        const ref = node._mmrpRefs.videos[hit.index];
+        return ref && ref.use_soundtrack ? "Mute soundtrack" : "Unmute soundtrack";
+    }
+    if (hit.type === "audio_only") return "Use audio only";
+    if (hit.type === "edit") {
+        return hit.kind === "audio" ? "Edit trim" : hit.kind === "image" ? "Edit crop" : "Edit crop & trim";
+    }
+    if (hit.type === "del") return "Remove";
+    if (hit.type === "play") {
+        const p = node._mmrpPlaying;
+        return p && p.kind === hit.kind && p.file === hit.file ? "Stop" : "Play";
+    }
+    return "";
 }
 
 function toggleSoundtrack(node, file) {
@@ -1786,7 +1898,8 @@ const UPLOAD_ICON =
 const KIND_UPLOAD_META = [
     ["image", "Image", "image/*"],
     ["video", "Video", "video/*"],
-    ["audio", "Audio", "audio/*"],
+    // video/* too: a clip picked here becomes an audio reference to its soundtrack.
+    ["audio", "Audio", "audio/*,video/*"],
 ];
 
 // Drag-and-drop routing. Dropped files are sorted by what they ARE rather than by
@@ -1850,6 +1963,77 @@ function bucketDroppedFiles(files) {
     return { buckets, rejected };
 }
 // <<< MMRP-DROP
+
+// "Use audio only": turn a video reference into an audio reference on the same file,
+// so MiniMax gets the clip's sound as <Audio n> and no <Video k> at all. The backend
+// already accepts a video file under kind "audio" (media.load_audio decodes its last
+// decodable track).
+//
+// The block between the MMRP-AUDIO-ONLY markers is executed by tests/test_audio_only.py
+// under node - same rule as MMRP-DROP: no KINDS, CAPS or other module constants.
+// >>> MMRP-AUDIO-ONLY
+const AUDIO_ONLY_ROLES = ["audio_reuse", "audio_reference"];
+
+function videoToAudioOnly(refs, index, audioCap) {
+    // -> {refs, error}. Pure: returns a new top-level object, never mutates `refs`.
+    // Kept: file, trim, missing and the audio roles. Dropped: crop, primary and the
+    // video roles. A removed primary promotes nothing (removeRef's rule), and an
+    // explicit plan may be left invalid - the caller reports that, it does not repair.
+    const videos = Array.isArray(refs?.videos) ? refs.videos : [];
+    const audios = Array.isArray(refs?.audios) ? refs.audios : [];
+    if (!Number.isInteger(index) || index < 0 || index >= videos.length) {
+        return { refs, error: "No such video reference." };
+    }
+    if (audios.length >= audioCap) {
+        return { refs, error: `The audio row is full (${audioCap}/${audioCap}).` };
+    }
+    const video = videos[index];
+    const audio = {
+        file: video.file,
+        roles: (Array.isArray(video.roles) ? video.roles : []).filter((role) =>
+            AUDIO_ONLY_ROLES.includes(role)
+        ),
+        missing: !!video.missing,
+    };
+    if (Array.isArray(video.trim)) audio.trim = video.trim.slice();
+    return {
+        refs: {
+            ...refs,
+            videos: videos.filter((_, i) => i !== index),
+            audios: [...audios, audio],
+        },
+        error: null,
+    };
+}
+// <<< MMRP-AUDIO-ONLY
+
+// A reference file that is a video container, by extension - for an AUDIO tile, which
+// carries no probe kind of its own.
+function isVideoFile(file) {
+    const name = String(file || "");
+    const dot = name.lastIndexOf(".");
+    return dot >= 0 && DROP_EXTENSIONS.video.includes(name.slice(dot + 1).toLowerCase());
+}
+
+function convertToAudioOnly(node, index) {
+    const before = node._mmrpRefs.videos[index];
+    const { refs, error } = videoToAudioOnly(cloneRefs(node._mmrpRefs), index, CAPS.audio);
+    if (error) {
+        mwarn("audio_only_refused", { index, error });
+        return;
+    }
+    mlog("audio_only", { file: before.file, trim: before.trim || null });
+    if (node._mmrpSelected && node._mmrpSelected.kind === "video") {
+        if (node._mmrpSelected.index === index) node._mmrpSelected = null;
+        else if (node._mmrpSelected.index > index) node._mmrpSelected.index -= 1;
+    }
+    // Removing a video renumbers the later ones, which can break an explicit plan.
+    // renderNodeBody (via applyRefs) puts the Plan button into its error state; this
+    // only makes the cause findable in the console.
+    const plan = deriveTaskPlanState(refs);
+    if (plan.error) mwarn("audio_only_plan_invalid", { file: before.file, error: plan.error });
+    applyRefs(node, refs); // also stops any preview: tile positions shift
+}
 
 function buildCustomBlock(node) {
     const container = document.createElement("div");
@@ -1924,6 +2108,12 @@ function buildCustomBlock(node) {
     canvas.style.height = `${CANVAS_ROWS.height}px`; // fixed, set once
     canvas.addEventListener("mousedown", (e) => onCanvasMouseDown(node, e));
     canvas.addEventListener("dblclick", (e) => onCanvasDblClick(node, e));
+    // The chips carry no text, so a hover names what a click will do.
+    canvas.addEventListener("mousemove", (e) => {
+        const pos = getMousePos(canvas, e);
+        const title = hitTitle(node, hitTest(node, pos.x, pos.y));
+        if (canvas.title !== title) canvas.title = title;
+    });
     // Keep litegraph's node context menu off the tiles (matches the reference's
     // per-item contextmenu swallow).
     canvas.addEventListener("contextmenu", (e) => e.stopPropagation());
@@ -3064,6 +3254,29 @@ function openEditModal(node, kind, index) {
         editBtn.textContent = EDIT;
         row.appendChild(origBtn);
         row.appendChild(editBtn);
+        if (kind === "video") {
+            // The one place with words for the tile's ♪ chip: same toggle, applied at
+            // once (not staged for Save - Save re-reads the live refs, so it survives).
+            const soundBtn = document.createElement("button");
+            soundBtn.className = "mmrp-btn";
+            const syncSound = () => {
+                const live = node._mmrpRefs.videos.find((v) => v.file === ref.file);
+                const hasAudio = probeResults.get(ref.file);
+                soundBtn.disabled = hasAudio !== true;
+                soundBtn.textContent = hasAudio === false
+                    ? "Soundtrack: none"
+                    : live && live.use_soundtrack ? "Soundtrack: on" : "Soundtrack: muted";
+                soundBtn.title = hasAudio === false
+                    ? "This clip has no decodable audio track"
+                    : live && live.use_soundtrack ? "Mute this video's soundtrack" : "Unmute this video's soundtrack";
+            };
+            soundBtn.onclick = () => {
+                toggleSoundtrack(node, ref.file);
+                syncSound();
+            };
+            syncSound();
+            row.appendChild(soundBtn);
+        }
         modal.appendChild(row);
 
         let mode = null;      // null | "original" | "edit"
@@ -3209,6 +3422,25 @@ function openEditModal(node, kind, index) {
         applyRefs(node, next);
     };
 
+    if (kind === "video") {
+        const audioOnlyBtn = document.createElement("button");
+        audioOnlyBtn.className = "mmrp-btn";
+        audioOnlyBtn.textContent = "Audio only";
+        audioOnlyBtn.title =
+            "Replace this video with an audio reference to its soundtrack. Uses the SAVED " +
+            "trim - an unsaved trim edit in this window is discarded.";
+        audioOnlyBtn.disabled =
+            probeResults.get(ref.file) !== true || node._mmrpRefs.audios.length >= CAPS.audio;
+        audioOnlyBtn.onclick = () => {
+            stopPlayback();
+            overlay.remove();
+            // By index, never re-found by filename: the same clip may be referenced
+            // twice with different trims, and findIndex would convert the wrong one.
+            if (node._mmrpRefs.videos[index] === ref) convertToAudioOnly(node, index);
+            else mwarn("audio_only_stale", { file: ref.file, index });
+        };
+        footer.appendChild(audioOnlyBtn);
+    }
     footer.appendChild(cancelBtn);
     footer.appendChild(saveBtn);
     modal.appendChild(footer);

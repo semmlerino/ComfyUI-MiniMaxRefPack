@@ -984,3 +984,25 @@ def test_the_switch_is_the_last_widget_so_saved_values_keep_their_slots():
     assert optional[-2:] == ["max_reference_edge", "match_video_aspect"]
     assert spec["optional"]["match_video_aspect"][0] == "BOOLEAN"
     assert spec["optional"]["match_video_aspect"][1]["default"] is False
+
+
+def test_an_audio_ref_to_a_video_file_fills_audio_not_video(fake_folder_paths, monkeypatch):
+    tmp_path = fake_folder_paths
+    _touch(tmp_path, "clip.mp4")
+
+    def no_video(*a, **k):
+        raise AssertionError("an audio-only reference must not decode frames")
+
+    monkeypatch.setattr(nodes.media, "load_video", no_video)
+    monkeypatch.setattr(nodes.media, "load_audio", lambda path, trim=None: f"AUD:{path}")
+    _stub_prompt(monkeypatch)
+
+    references_json = json.dumps({"references": [{"kind": "audio", "file": "clip.mp4"}]})
+    out = nodes.MiniMaxH3ReferencePack().build(
+        direction="", openrouter_api_key="", model="m", references_json=references_json
+    )
+    by_name = dict(zip(refs.output_names(), out))
+
+    assert by_name["audio_1"] == f"AUD:{tmp_path / 'clip.mp4'}"
+    assert by_name["video_1"] is None
+    assert by_name["video_audio_1"] is None

@@ -363,7 +363,8 @@ class ReferenceSet:
 
     def tag_map(self) -> dict[str, str]:
         """{filename: tag} for prompt context. A video with a soundtrack appears once,
-        with both tags joined, so the model can address either."""
+        with both tags joined, so the model can address either. Keyed by filename, so a
+        file used as BOTH a video and an audio reference keeps only its last entry."""
         out: dict[str, str] = {}
         for t in self.assign_tags():
             out[t.file] = t.tag if t.audio_tag is None else f"{t.tag} {t.audio_tag}"

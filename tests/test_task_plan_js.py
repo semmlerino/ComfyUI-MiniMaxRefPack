@@ -251,3 +251,44 @@ def test_selected_primary_is_promoted_to_video_one_without_reordering_guides():
 
     assert got["files"] == ["plate.mp4", "guide-a.mp4", "guide-b.mp4"]
     assert got["state"]["error"] is None
+
+
+
+@requires_node
+def test_audio_only_on_the_editing_source_invalidates_a_replacement_plan():
+    """Converting a video is not repaired for the plan: turning the primary editing
+    source into audio drops its `video_editing` role, and a replacement specialization
+    re-derives as invalid. The caller surfaces that on the Plan button.
+
+    (Converting a video in FRONT of the driver cannot invalidate on position - the
+    driver moves up into <Video 1>, which is the valid slot.)"""
+    text = REFPACK_JS.read_text()
+    start = text.find("// >>> MMRP-AUDIO-ONLY")
+    end = text.find("// <<< MMRP-AUDIO-ONLY")
+    assert start != -1 and end != -1, "the MMRP-AUDIO-ONLY test seam is missing"
+    refs = {
+        "images": [{"file": "face.png", "roles": ["reference_generation"]}],
+        "videos": [
+            {"file": "plate.mp4", "use_soundtrack": True, "primary": True,
+             "roles": ["video_editing", "audio_reuse"]},
+        ],
+        "audios": [],
+        "taskPlan": {"mode": "explicit", "specialization": "character_replacement"},
+    }
+    script = (
+        _extract_js() + text[start:end]
+        + "\nconst refs = " + json.dumps(refs) + ";"
+        + "\nconst converted = videoToAudioOnly(refs, 0, 3);"
+        + "\nconsole.log(JSON.stringify({before: deriveTaskPlanState(refs).error,"
+        + " after: deriveTaskPlanState(converted.refs).error,"
+        + " audios: converted.refs.audios}));\n"
+    )
+    proc = subprocess.run(
+        [NODE, "--input-type=module", "-e", script], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, f"node failed: {proc.stderr}"
+    got = json.loads(proc.stdout.strip())
+
+    assert got["before"] is None
+    assert got["after"] == 'A replacement specialization requires "Use as editing source".'
+    assert got["audios"] == [{"file": "plate.mp4", "roles": ["audio_reuse"], "missing": False}]

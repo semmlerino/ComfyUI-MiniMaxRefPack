@@ -1308,3 +1308,70 @@ def test_the_three_states_are_the_three_the_system_prompt_documents(monkeypatch,
     assert "marked as not sent" in rules
     # ...and it must no longer promise sound that a silent or failed clip does not carry.
     assert "arrives, whole, with its sound" not in rules
+
+
+# ---- standalone audio that cannot be inlined raw -----------------------------------
+
+
+def _wav_header(part):
+    import base64
+    import io
+    import wave
+
+    with wave.open(io.BytesIO(base64.b64decode(part["input_audio"]["data"]))) as wf:
+        return wf.getnchannels(), wf.getframerate(), wf.getnframes()
+
+
+@pytest.mark.parametrize("name", ["clip.mp4", "vo.m4a"])
+def test_untrimmed_non_inlineable_audio_goes_out_as_mono_16k_wav(monkeypatch, tmp_path, name):
+    """A video used for its sound (or an .m4a) is decoded, downmixed and resampled -
+    not the old "not inlined" text line, and not a full-rate stereo WAV."""
+    calls = {}
+
+    def la(path, trim=None):
+        calls["trim"] = trim
+        return {
+            "waveform": np.random.uniform(-1, 1, size=(1, 2, 48000)).astype(np.float32),
+            "sample_rate": 48000,
+        }
+
+    monkeypatch.setattr(prompt.media, "load_audio", la, raising=False)
+    (tmp_path / name).write_bytes(b"container bytes that must NOT be inlined")
+
+    content = prompt._build_content(ReferenceSet([aud(name)]), str(tmp_path), "d")
+
+    audio_parts = [p for p in content if p.get("type") == "input_audio"]
+    assert len(audio_parts) == 1
+    assert audio_parts[0]["input_audio"]["format"] == "wav"
+    channels, rate, frames = _wav_header(audio_parts[0])
+    assert (channels, rate) == (1, prompt.VLM_AUDIO_RATE)
+    assert abs(frames - 16000) <= 32, frames  # 1 s of audio, resampler edge slack
+    assert calls["trim"] is None
+    assert not any("not inlined" in p.get("text", "") for p in content)
+
+
+def test_untrimmed_mp3_still_inlines_raw_without_decoding(monkeypatch, tmp_path):
+    def la(path, trim=None):
+        raise AssertionError("an untrimmed mp3 must not be decoded")
+
+    monkeypatch.setattr(prompt.media, "load_audio", la, raising=False)
+    (tmp_path / "vo.mp3").write_bytes(b"fake mp3 bytes")
+
+    content = prompt._build_content(ReferenceSet([aud("vo.mp3")]), str(tmp_path), "d")
+    audio_parts = [p for p in content if p.get("type") == "input_audio"]
+    assert [a["input_audio"]["format"] for a in audio_parts] == ["mp3"]
+
+
+@pytest.mark.parametrize("trim", [None, [0.5, 1.5]])
+def test_an_audio_decode_error_degrades_to_text(monkeypatch, tmp_path, trim):
+    def la(path, trim=None):
+        raise ValueError("reference audio 'clip.mp4' has no decodable audio track")
+
+    monkeypatch.setattr(prompt.media, "load_audio", la, raising=False)
+    (tmp_path / "clip.mp4").write_bytes(b"x")
+
+    refset = ReferenceSet([Reference(kind="audio", file="clip.mp4", trim=trim)])
+    content = prompt._build_content(refset, str(tmp_path), "d")
+
+    assert not any(p.get("type") == "input_audio" for p in content)
+    assert any("clip.mp4 (could not be decoded)" in p.get("text", "") for p in content)

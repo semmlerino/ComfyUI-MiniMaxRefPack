@@ -435,3 +435,22 @@ def test_crop_and_trim_survive_a_references_json_round_trip():
 
     assert back.crop == [0.0, 0.0, 0.5, 0.5]
     assert back.trim == [1.0, 3.0]
+
+
+# ---- an audio reference that points at a video file ----------------------------
+
+
+def test_an_audio_ref_to_a_video_file_is_audio_only():
+    tagged = ReferenceSet([aud("clip.mp4")]).assign_tags()
+    assert [(t.kind, t.tag, t.audio_tag) for t in tagged] == [("audio", "<Audio 1>", None)]
+
+
+def test_a_muted_video_and_an_audio_ref_to_the_same_file_tag_separately():
+    tagged = ReferenceSet([vid("clip.mp4", sound=False), aud("clip.mp4")]).assign_tags()
+    assert [(t.tag, t.audio_tag) for t in tagged] == [("<Video 1>", None), ("<Audio 1>", None)]
+
+
+def test_an_audio_ref_to_a_video_file_round_trips():
+    ref = Reference.from_dict({"kind": "audio", "file": "clip.mp4", "trim": [1.0, 2.5]})
+    assert Reference.from_dict(ref.to_dict()) == ref
+    assert ref.to_dict()["kind"] == "audio"
