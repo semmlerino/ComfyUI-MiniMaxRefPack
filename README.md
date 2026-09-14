@@ -118,6 +118,19 @@ On `prompt_provider: local` the environment is never read. Only a key typed into
 | `system_prompt` | A complete workflow-specific override. Blank uses the packaged official base plus the role-derived overlays. |
 | `max_reference_edge` | Downscales a reference **image** whose long edge is bigger than this, `0` turns it off. Never upscales. Reference **videos** are not covered: they are decoded and cached at source resolution, and the core node resizes them at encode time. |
 
+## Preparing the next job early
+
+ComfyUI runs one job at a time, and this node does all of its work - decoding every reference, encoding the VLM's copy, the provider round-trip - before the sampler starts, with the GPU idle. Since 0.4.3 a background thread builds the pack for the next pending job while the current one renders, keyed by the node's own cache key, so `build()` finds it ready. The `debug` output says `prefetch: prepared while the previous job rendered` when that happened. Works with and without Queue Manager.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `MINIMAX_REFPACK_PREFETCH` | on | `0` / `off` / `false` / `no` disables it. |
+| `MINIMAX_REFPACK_PREFETCH_GIB` | 8 | Decoded media kept for prepared packs. A pack over the remaining budget keeps its prompt and decodes again when its job runs. |
+| `MINIMAX_REFPACK_PREFETCH_JOBS` | 1 | Pending jobs prepared ahead, 1 to 8. |
+| `MINIMAX_REFPACK_PREFETCH_POLL_S` | 10 | Seconds between queue checks. A job starting triggers a check at once. |
+
+A job whose `direction` or any other input is wired from another node is not prepared: its values exist only once that node has run. A re-queued job with the same inputs is served by ComfyUI's own cache and is not prepared either. A prepare that fails is logged and left for the job itself to retry. A prepared pack is dropped once its job leaves the queue, after an hour regardless, and a reference re-uploaded before its job runs makes the job build afresh.
+
 ## The tag rule
 
 1. reference images, in order, become `<Picture 1..n>`
@@ -129,6 +142,10 @@ So a video's soundtrack is `<Audio 1>` even if you added a standalone audio clip
 ## Limits
 
 The model's limits, not the node's: 9 images, 3 videos, 3 soundtracks, 3 audio clips. Reference videos need at least 5 frames, get trimmed to MiniMax's 17k+5 frame grid, then capped to the length of the video you're generating. Clips are resampled to 24fps on the way in.
+
+## Changed in 0.4.3
+
+The next pending job's reference pack is built while the current job renders - see *Preparing the next job early*. On a rented GPU the provider round-trip alone was a median 18 s of idle time per job. No workflow changes; the `debug` output gains a `prefetch:` line.
 
 ## Changed in 0.4.2
 

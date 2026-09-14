@@ -12,11 +12,14 @@ VAE/tokenizer.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import time
+from dataclasses import dataclass
+from typing import Any
 
-from . import endpoint, logs, media, prompt, refs
+from . import endpoint, logs, media, prefetch, prompt, refs
 
 # Default long-edge cap for reference IMAGES. Named rather than inlined because it is
 # the widget default AND the fallback when a workflow saved before the widget existed
@@ -102,6 +105,15 @@ def _model_for(provider: str, openrouter_model: str, local_model_slug: str) -> s
     return openrouter_model or ""
 
 
+def _credential_fingerprint(api_key) -> str:
+    """A short hash of the provider key, so two jobs holding different credentials never
+    share a cache identity - and the key itself never appears in one. Blank stays blank
+    (the environment supplies the key on a pod, and that is one identity)."""
+    if not api_key:
+        return ""
+    return hashlib.sha256(str(api_key).encode()).hexdigest()[:16]
+
+
 def _files_signature(reference_set: refs.ReferenceSet, input_dir: str) -> str:
     """mtime+size of every referenced file, folded into one hash.
 
@@ -119,6 +131,36 @@ def _files_signature(reference_set: refs.ReferenceSet, input_dir: str) -> str:
         except OSError:
             h.update(f"{r.file}:missing".encode("utf-8"))
     return h.hexdigest()
+
+
+@dataclass
+class BuildResult:
+    """What one build produced: the socket tuple, plus the two things the prefetcher
+    keeps on their own when the decoded media is over its budget."""
+
+    outputs: tuple[Any, ...]
+    prompt_text: str
+    debug_sink: list[str]
+    media_bytes: int
+
+
+def _media_bytes(outputs) -> int:
+    """Bytes the decoded media in `outputs` occupies: IMAGE tensors and the waveforms
+    inside AUDIO dicts. What a prepared pack holds in RAM until its job runs, which is
+    what the prefetcher's budget is counted in."""
+    total = 0
+    for value in outputs:
+        tensor = value.get("waveform") if isinstance(value, dict) else value
+        # Duck-typed on purpose: this module never imports torch (the node tests stub
+        # the loaders with plain strings), and a tensor is anything that can say how
+        # many elements it has and how wide each one is.
+        numel = getattr(tensor, "numel", None)
+        element_size = getattr(tensor, "element_size", None)
+        if callable(numel) and callable(element_size):
+            count, width = numel(), element_size()
+            if isinstance(count, int) and isinstance(width, int):
+                total += count * width
+    return total
 
 
 class MiniMaxH3ReferencePack:
@@ -288,22 +330,38 @@ class MiniMaxH3ReferencePack:
         # and reasoning_effort changes the completion, so all five move the key too.
         # api_base and model_override change WHERE the call goes and WHAT answers it, so
         # they belong here as much as `model` does.
-        return "|".join([
+        #
+        # A JSON list, not a "|" join. ComfyUI pairs this string with the literal inputs
+        # when it keys its cache, but the prefetcher uses it ALONE as the identity of a
+        # prepared pack, and under a plain join direction="x|||y" + system_prompt="z"
+        # was the same key as direction="x" + system_prompt="y|||z". JSON escapes. The
+        # provider key rides as a fingerprint, never in clear, for the same reason: two
+        # jobs holding different credentials must not consume each other's prompt.
+        return json.dumps([
             sig, direction, openrouter_model, references_json, system_prompt,
             str(width), str(height), str(length_seconds),
             _provider_of(prompt_provider, use_openrouter),
             str(reasoning_effort), str(job_type), str(max_reference_edge),
             str(api_base), str(local_model_slug), str(_switch_on(match_video_aspect)),
-        ])
+            _credential_fingerprint(openrouter_api_key),
+        ], separators=(",", ":"))
 
-    def build(
+    def _build(
         self, direction="", openrouter_api_key="", openrouter_model="", references_json="",
         system_prompt="", width=0, height=0, length_seconds=0.0,
         prompt_provider=endpoint.DEFAULT_PROVIDER,
         reasoning_effort=prompt.DEFAULT_REASONING_EFFORT, job_type="auto",
         max_reference_edge=DEFAULT_MAX_REFERENCE_EDGE, api_base="", local_model_slug="",
         match_video_aspect=False, use_openrouter=None, model=None, model_override=None,
-    ):
+        prewritten: prefetch.Prepared | None = None, prepared_how: str = "no",
+    ) -> BuildResult:
+        """The whole build, as it has always run. `build()` wraps it with the prefetch
+        lookup, and the prefetcher calls it directly for a pending job.
+
+        `prewritten` is a prompt the prefetcher already fetched for this exact key, so
+        the provider is not asked a second time when only the media has to be redone;
+        `prepared_how` is what the debug socket says about where the pack came from.
+        """
         # Legacy kwarg names, for an API client replaying a prompt stored before 0.3.2.
         # The new field wins when both arrive, so a deliberate value is never overridden
         # by a stale one riding alongside it.
@@ -403,6 +461,7 @@ class MiniMaxH3ReferencePack:
             f"frame: {width} x {height}{frame_note}",
             f"reasoning_effort: {reasoning_effort}",
             f"max_reference_edge: {max_reference_edge or 'off'}",
+            f"prefetch: {prepared_how}",
             (
                 f"task_plan: {reference_set.task_plan.mode}"
                 if reference_set.task_plan is not None
@@ -433,24 +492,31 @@ class MiniMaxH3ReferencePack:
             if reference_set.is_empty():
                 debug_header.append("note: no references attached - the prompt is written from the direction alone")
             try:
-                prompt_text = prompt.write_prompt(
-                    references=reference_set,
-                    input_dir=input_dir,
-                    direction=direction,
-                    api_key=openrouter_api_key,
-                    model=model,
-                    system_prompt=system_prompt,
-                    width=width,
-                    height=height,
-                    length_seconds=length_seconds,
-                    reasoning_effort=reasoning_effort,
-                    job_type=job_type,
-                    debug=debug_sink,
-                    provider=provider,
-                    api_base=api_base,
-                    cache=cache,
-                    max_reference_edge=max_reference_edge,
-                )
+                if prewritten is not None:
+                    # Fetched by the prefetcher for this exact key while the previous
+                    # job rendered. The media was decoded again above because it was
+                    # over the retention budget; the provider is not asked twice.
+                    prompt_text = prewritten.prompt_text
+                    debug_sink.extend(prewritten.debug_sink)
+                else:
+                    prompt_text = prompt.write_prompt(
+                        references=reference_set,
+                        input_dir=input_dir,
+                        direction=direction,
+                        api_key=openrouter_api_key,
+                        model=model,
+                        system_prompt=system_prompt,
+                        width=width,
+                        height=height,
+                        length_seconds=length_seconds,
+                        reasoning_effort=reasoning_effort,
+                        job_type=job_type,
+                        debug=debug_sink,
+                        provider=provider,
+                        api_base=api_base,
+                        cache=cache,
+                        max_reference_edge=max_reference_edge,
+                    )
             except ValueError as e:
                 # endpoint.resolve raises this for "local with no api_base". It is a user
                 # error with a fixable cause, so it reads as one rather than as a crash.
@@ -498,10 +564,79 @@ class MiniMaxH3ReferencePack:
 
         outputs[refs.slot_index("prompt")] = prompt_text
         outputs[refs.slot_index("debug")] = debug_text
-        logs.log("build_done", prompt_chars=len(prompt_text),
+        media_bytes = _media_bytes(outputs)
+        logs.log("build_done", prompt_chars=len(prompt_text), prefetch=prepared_how,
+                 media_mb=media_bytes / 2**20,
                  ms=(time.perf_counter() - started) * 1000.0)
-        return tuple(outputs)
+        return BuildResult(
+            outputs=tuple(outputs), prompt_text=prompt_text, debug_sink=debug_sink,
+            media_bytes=media_bytes,
+        )
 
+    def build(
+        self, direction="", openrouter_api_key="", openrouter_model="", references_json="",
+        system_prompt="", width=0, height=0, length_seconds=0.0,
+        prompt_provider=endpoint.DEFAULT_PROVIDER,
+        reasoning_effort=prompt.DEFAULT_REASONING_EFFORT, job_type="auto",
+        max_reference_edge=DEFAULT_MAX_REFERENCE_EDGE, api_base="", local_model_slug="",
+        match_video_aspect=False, use_openrouter=None, model=None, model_override=None,
+    ):
+        """The node's entry point: the pack the prefetcher built for these exact inputs
+        while the previous job rendered, else the build itself.
+
+        The key is computed HERE, from build's own arguments, by the same IS_CHANGED that
+        keys ComfyUI's cache - never taken from the prefetcher - so a key the thread
+        computed from a queued prompt can only ever match, never mislead. Waiting on a
+        prepare still under way costs the time build() would have spent itself.
+        """
+        kwargs: dict[str, Any] = dict(
+            direction=direction, openrouter_api_key=openrouter_api_key,
+            openrouter_model=openrouter_model, references_json=references_json,
+            system_prompt=system_prompt, width=width, height=height,
+            length_seconds=length_seconds, prompt_provider=prompt_provider,
+            reasoning_effort=reasoning_effort, job_type=job_type,
+            max_reference_edge=max_reference_edge, api_base=api_base,
+            local_model_slug=local_model_slug, match_video_aspect=match_video_aspect,
+            use_openrouter=use_openrouter, model=model, model_override=model_override,
+        )
+        key = _key_for(**kwargs)
+        with PREFETCHER.consume(key) as prepared:
+            if prepared is not None and _key_for(**kwargs) != key:
+                # The key hashes every reference's mtime+size, and consume() may have
+                # waited on a prepare for minutes: a reference re-uploaded meanwhile
+                # means the pack was built from the old file. Build from what is on
+                # disk now instead - for a prompt-only hit too, whose prompt described
+                # the old media.
+                logs.log("prefetch_stale", digest=prefetch.key_digest(key))
+                prepared = None
+            if prepared is not None and prepared.outputs is not None:
+                return prepared.outputs
+            if prepared is None:
+                result = self._build(**kwargs)
+            else:
+                result = self._build(
+                    **kwargs, prewritten=prepared,
+                    prepared_how="prompt only; media decoded now (over the retention budget)",
+                )
+        return result.outputs
+
+
+def _key_for(**inputs) -> str:
+    """The node's own cache key for a set of inputs - IS_CHANGED itself, so the
+    prefetcher and build() cannot disagree about what "the same job" means."""
+    return MiniMaxH3ReferencePack.IS_CHANGED(**inputs)
+
+
+def _prefetch_build(**inputs) -> BuildResult:
+    return MiniMaxH3ReferencePack()._build(
+        **inputs, prepared_how="prepared while the previous job rendered"
+    )
+
+
+# Module-level on purpose: one set of prepared packs per process, shared by every
+# instance of the node ComfyUI creates. Installed onto the queue by the package
+# __init__ (prefetch.install), which is a no-op outside a running server.
+PREFETCHER = prefetch.Prefetcher.from_env(key_fn=_key_for, build_fn=_prefetch_build)
 
 NODE_CLASS_MAPPINGS = {"MiniMaxH3ReferencePack": MiniMaxH3ReferencePack}
 # The class key stays MiniMaxH3ReferencePack forever — it is what saved workflows
