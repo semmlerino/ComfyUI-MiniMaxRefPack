@@ -123,13 +123,45 @@ async def thumb_route(request: web.Request) -> web.Response:
     )
 
 
+def _input_files_one_level(input_dir: str) -> list[str]:
+    """Regular files at the input root plus those one directory down, as `sub/name`.
+
+    One level, not a walk: the media a pod stages lives in `images/` and `videos/`
+    (the layout ComfyUI's own upload route and the kit both use), and the node resolves
+    a reference by `os.path.join(input_dir, file)`, so `videos/plate.mp4` is already a
+    valid reference - the picker just could not see it. Listing the subdirectories here
+    is what removes the need for a mirror of every staged file at the input root, which
+    on a pod whose input directory sits on a network filesystem was 673 extra entries
+    for every node that enumerates that directory.
+
+    `os.scandir` rather than `listdir` + `isfile`: `entry.is_file()` reads the type the
+    directory listing already carries and only stats a symlink, where `isfile` costs one
+    stat per entry - on a FUSE mount, milliseconds each and never cached.
+    """
+    found: list[str] = []
+    with os.scandir(input_dir) as root:
+        for entry in root:
+            if entry.is_file():
+                found.append(entry.name)
+            elif entry.is_dir():
+                try:
+                    with os.scandir(entry.path) as sub:
+                        found.extend(
+                            f"{entry.name}/{child.name}" for child in sub if child.is_file()
+                        )
+                except OSError:
+                    continue
+    return sorted(found)
+
+
 async def list_files_route(request: web.Request) -> web.Response:
     kind = request.query.get("kind", "")
     if kind not in ("image", "video", "audio"):
         return web.Response(status=400, text="kind must be image, video or audio")
     input_dir = folder_paths.get_input_directory()
-    # CU/folder_paths.py:229 - the same content-type filter the core input pickers use.
-    files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+    # CU/folder_paths.py:229 - the same content-type filter the core input pickers use;
+    # it keys on the extension, so a `sub/name.ext` entry filters like `name.ext`.
+    files = _input_files_one_level(input_dir)
     # An audio reference may point at a video file (its soundtrack); core's LoadAudio
     # lists the same pair (nodes_audio.py:364).
     types = ["audio", "video"] if kind == "audio" else [kind]

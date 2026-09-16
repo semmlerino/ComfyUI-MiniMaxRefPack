@@ -117,6 +117,36 @@ def test_list_files_filters_by_kind(input_dir):
     assert body_json(resp) == {"files": ["b.mp4"]}
 
 
+def test_list_files_sees_one_level_of_subdirectories(input_dir):
+    """A pod stages media under `images/` and `videos/`; the picker must list those as
+    `sub/name` (the form the node already resolves) without walking any deeper, and a
+    directory whose name looks like a file is not a file."""
+    os.makedirs(os.path.join(input_dir, "videos", "nested"))
+    os.makedirs(os.path.join(input_dir, "images"))
+    os.makedirs(os.path.join(input_dir, "dir.mp4"))
+    for rel in ("root.mp4", "videos/plate.mp4", "videos/nested/deep.mp4", "images/still.png"):
+        open(os.path.join(input_dir, rel), "wb").close()
+
+    resp = run(routes.list_files_route(FakeRequest(query={"kind": "video"})))
+    assert body_json(resp) == {"files": ["root.mp4", "videos/plate.mp4"]}
+
+    resp = run(routes.list_files_route(FakeRequest(query={"kind": "image"})))
+    assert body_json(resp) == {"files": ["images/still.png"]}
+
+
+def test_subdirectory_names_round_trip_through_thumb_and_probe(input_dir):
+    """What the listing hands out must be accepted back: `_safe_join` takes a
+    subdirectory-qualified name, so the tile can be drawn and probed from it."""
+    os.makedirs(os.path.join(input_dir, "images"))
+    with open(os.path.join(input_dir, "images", "ok.png"), "wb") as fh:
+        fh.write(b"\x89PNG")
+
+    resp = run(routes.thumb_route(FakeRequest(query={"file": "images/ok.png"})))
+    assert resp.status == 200
+    assert routes.media.thumb_calls[-1]["path"].endswith(os.path.join("images", "ok.png"))
+    assert run(routes.probe_route(FakeRequest(query={"file": "images/ok.png"}))).status == 200
+
+
 def test_list_files_400_on_bad_kind(input_dir):
     resp = run(routes.list_files_route(FakeRequest(query={"kind": "mesh"})))
     assert resp.status == 400
