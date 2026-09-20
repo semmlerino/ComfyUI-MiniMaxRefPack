@@ -42,6 +42,14 @@
  * is plain CSS-px math off the tile rect. Clicking a tile anywhere OUTSIDE the ▶
  * selects it, exactly as before.
  *
+ * TILE REORDER: the tiles are painted, not DOM, so swapping them is a pointer
+ * drag on the canvas rather than HTML5 drag (that path stays file drops onto the
+ * node). Mousedown on the tile well — not a chip — and drag past a neighbour's
+ * midpoint; the two swap and the MiniMax tags follow slot order, so Picture 1
+ * dragged onto Picture 2 becomes Picture 2. Tiles stay in their own row. The
+ * chips (delete, edit, play, soundtrack, audio-only) keep firing on mousedown
+ * and never start a reorder. Pure helpers live between the MMRP-REORDER markers.
+ *
  * HIDING `references_json`, `direction` and `system_prompt`: mirrors WhatDreamsCost
  * multi_image_loader.js's hide-widget pattern (:122-146) — a plain `w.hidden = true`
  * gets silently overwritten on V3 (vueNodesMode), which re-derives widget visibility
@@ -1651,6 +1659,8 @@ function onCanvasMouseDown(node, e) {
     } else {
         node._mmrpSelected = { kind: hit.kind, index: hit.index };
         scheduleDraw(node);
+        // Reorder starts on the tile well, never a chip: those already fired above.
+        if (hit.type === "tile") beginReorder(node, e, hit);
     }
 }
 
@@ -1680,7 +1690,92 @@ function hitTitle(node, hit) {
         const p = node._mmrpPlaying;
         return p && p.kind === hit.kind && p.file === hit.file ? "Stop" : "Play";
     }
+    if (hit.type === "tile") {
+        const n = (node._mmrpRefs[`${hit.kind}s`] || []).length;
+        return n > 1 ? "Drag to swap with another in this row" : "";
+    }
     return "";
+}
+
+const REORDER_ARM_PX = 8;
+
+function beginReorder(node, e, hit) {
+    const count = (node._mmrpRefs[`${hit.kind}s`] || []).length;
+    if (count < 2) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const canvas = node._mmrpBody.canvas;
+    const pos = getMousePos(canvas, e);
+    const drag = {
+        kind: hit.kind,
+        index: hit.index,
+        fromIndex: hit.index,
+        startX: pos.x,
+        startY: pos.y,
+        armed: false,
+        snapshot: null,
+        canvas,
+    };
+    const onMove = (ev) => onReorderMove(node, ev);
+    const onUp = () => finishReorder(node, false);
+    const onKey = (ev) => {
+        if (ev.key === "Escape") {
+            ev.preventDefault();
+            finishReorder(node, true);
+        }
+    };
+    drag.onMove = onMove;
+    drag.onUp = onUp;
+    drag.onKey = onKey;
+    node._mmrpReorder = drag;
+    window.addEventListener("mousemove", onMove, true);
+    window.addEventListener("mouseup", onUp, true);
+    window.addEventListener("blur", onUp, true);
+    window.addEventListener("keydown", onKey, true);
+}
+
+function onReorderMove(node, e) {
+    const drag = node._mmrpReorder;
+    if (!drag) return;
+    const pos = getMousePos(drag.canvas, e);
+    if (!drag.armed) {
+        const dx = pos.x - drag.startX;
+        const dy = pos.y - drag.startY;
+        if (dx * dx + dy * dy < REORDER_ARM_PX * REORDER_ARM_PX) return;
+        drag.armed = true;
+        drag.snapshot = cloneRefs(node._mmrpRefs);
+        drag.canvas.style.cursor = "grabbing";
+        stopPreview(node);
+    }
+    e.preventDefault();
+    const count = (node._mmrpRefs[`${drag.kind}s`] || []).length;
+    const to = slotIndexAtX(pos.x, count, CL.x0, CL.tile, CL.gap);
+    if (to === drag.index) return;
+    const { refs, error } = moveRefInKind(cloneRefs(node._mmrpRefs), drag.kind, drag.index, to);
+    if (error) return;
+    drag.index = to;
+    node._mmrpSelected = { kind: drag.kind, index: to };
+    applyRefs(node, refs);
+}
+
+function finishReorder(node, restore) {
+    const drag = node._mmrpReorder;
+    if (!drag) return;
+    window.removeEventListener("mousemove", drag.onMove, true);
+    window.removeEventListener("mouseup", drag.onUp, true);
+    window.removeEventListener("blur", drag.onUp, true);
+    window.removeEventListener("keydown", drag.onKey, true);
+    drag.canvas.style.cursor = "";
+    node._mmrpReorder = null;
+    if (!drag.armed) return;
+    if (restore && drag.snapshot) {
+        node._mmrpSelected = { kind: drag.kind, index: drag.fromIndex };
+        applyRefs(node, drag.snapshot);
+        return;
+    }
+    if (drag.index !== drag.fromIndex) {
+        mlog("reference_reordered", { kind: drag.kind, from: drag.fromIndex, to: drag.index });
+    }
 }
 
 function toggleSoundtrack(node, file) {
@@ -2013,6 +2108,45 @@ function videoToAudioOnly(refs, index, audioCap) {
 }
 // <<< MMRP-AUDIO-ONLY
 
+// Drag-to-swap inside one row. Tiles are canvas-painted, so this is array math,
+// not HTML5 drag (that path is file drops). Extracted by tests/test_reorder.py.
+//
+// Semantics: MOVE, not pairwise-exchange with the drop target. Dragging the first
+// of three onto the last yields [b, c, a], which is also what successive
+// neighbour-swaps do as the pointer crosses each midpoint. Picture 1 onto
+// Picture 2 is just the two-item case of the same rule.
+// >>> MMRP-REORDER
+function moveRefInKind(refs, kind, fromIndex, toIndex) {
+    // -> {refs, error}. Pure: new top-level object on a real move, never mutates
+    // `refs`. Same-index is a documented no-op that returns the input object.
+    const key = `${kind}s`;
+    const arr = Array.isArray(refs?.[key]) ? refs[key] : [];
+    if (!Number.isInteger(fromIndex) || !Number.isInteger(toIndex)
+        || fromIndex < 0 || toIndex < 0
+        || fromIndex >= arr.length || toIndex >= arr.length) {
+        return { refs, error: "No such reference." };
+    }
+    if (fromIndex === toIndex) return { refs, error: null };
+    const next = arr.slice();
+    const [item] = next.splice(fromIndex, 1);
+    next.splice(toIndex, 0, item);
+    return { refs: { ...refs, [key]: next }, error: null };
+}
+
+function slotIndexAtX(x, count, x0, tile, gap) {
+    // Nearest tile centre. Crossing the midpoint between two tiles is the swap.
+    // count < 2 has nowhere to go; a non-positive stride is a caller bug, not a
+    // throw — return 0 rather than Infinity.
+    if (!Number.isInteger(count) || count <= 1) return 0;
+    const stride = tile + gap;
+    if (!(stride > 0)) return 0;
+    const i = Math.round((x - x0 - tile / 2) / stride);
+    if (i < 0) return 0;
+    if (i > count - 1) return count - 1;
+    return i;
+}
+// <<< MMRP-REORDER
+
 // A reference file that is a video container, by extension - for an AUDIO tile, which
 // carries no probe kind of its own.
 function isVideoFile(file) {
@@ -2114,11 +2248,19 @@ function buildCustomBlock(node) {
     canvas.style.height = `${CANVAS_ROWS.height}px`; // fixed, set once
     canvas.addEventListener("mousedown", (e) => onCanvasMouseDown(node, e));
     canvas.addEventListener("dblclick", (e) => onCanvasDblClick(node, e));
+    // Painted tiles are not DOM, so a native drag would pick up the whole canvas
+    // as an image. File drops still work: those start outside this element.
+    canvas.addEventListener("dragstart", (e) => e.preventDefault());
     // The chips carry no text, so a hover names what a click will do.
     canvas.addEventListener("mousemove", (e) => {
+        if (node._mmrpReorder && node._mmrpReorder.armed) return;
         const pos = getMousePos(canvas, e);
-        const title = hitTitle(node, hitTest(node, pos.x, pos.y));
+        const hit = hitTest(node, pos.x, pos.y);
+        const title = hitTitle(node, hit);
         if (canvas.title !== title) canvas.title = title;
+        const grab = hit && hit.type === "tile"
+            && (node._mmrpRefs[`${hit.kind}s`] || []).length > 1;
+        canvas.style.cursor = grab ? "grab" : "";
     });
     // Keep litegraph's node context menu off the tiles (matches the reference's
     // per-item contextmenu swallow).
@@ -3805,6 +3947,7 @@ function installSelectionHandlers(node) {
         if (!node._mmrpSelected) return;
         const active = document.activeElement;
         if (active && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) return;
+        if (node._mmrpReorder) return; // live drag owns Escape; don't delete mid-swap
         if (e.key === "Delete" || e.key === "Backspace") {
             e.preventDefault();
             e.stopPropagation();
@@ -3824,6 +3967,7 @@ function installSelectionHandlers(node) {
     node.onRemoved = function () {
         document.removeEventListener("mousedown", clearOnOutsideClick, true);
         document.removeEventListener("keydown", keyHandler, true);
+        finishReorder(this, false);
         (node._mmrpHideIntervals || []).forEach((id) => clearInterval(id));
         stopPreview(node);
         if (node._mmrpBody) node._mmrpBody.resizeObserver.disconnect();
