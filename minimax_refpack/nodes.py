@@ -300,6 +300,16 @@ class MiniMaxH3ReferencePack:
                                "and the prompt use the same one. No reference video: "
                                "width and height pass through.",
                 }),
+
+                # Display-only record of the idea typed before Auto Prompt rewrote
+                # `direction`. Appended so every earlier slot stays where it was.
+                # Freeze and PromptToWorkflow fill this once and then leave it.
+                "original_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "tooltip": "The idea typed before Auto Prompt rewrote direction. "
+                               "Never sent to the VLM. A non-empty value is not overwritten.",
+                }),
             },
         }
 
@@ -315,7 +325,8 @@ class MiniMaxH3ReferencePack:
         prompt_provider=endpoint.DEFAULT_PROVIDER,
         reasoning_effort=prompt.DEFAULT_REASONING_EFFORT, job_type="auto",
         max_reference_edge=DEFAULT_MAX_REFERENCE_EDGE, api_base="", local_model_slug="",
-        match_video_aspect=False, use_openrouter=None, model=None, model_override=None, **kwargs
+        match_video_aspect=False, original_prompt="", use_openrouter=None, model=None,
+        model_override=None, **kwargs
     ):
         openrouter_model = openrouter_model or (model or "")
         local_model_slug = local_model_slug or (model_override or "")
@@ -579,7 +590,8 @@ class MiniMaxH3ReferencePack:
         prompt_provider=endpoint.DEFAULT_PROVIDER,
         reasoning_effort=prompt.DEFAULT_REASONING_EFFORT, job_type="auto",
         max_reference_edge=DEFAULT_MAX_REFERENCE_EDGE, api_base="", local_model_slug="",
-        match_video_aspect=False, use_openrouter=None, model=None, model_override=None,
+        match_video_aspect=False, original_prompt="", use_openrouter=None, model=None,
+        model_override=None,
     ):
         """The node's entry point: the pack the prefetcher built for these exact inputs
         while the previous job rendered, else the build itself.
@@ -589,6 +601,7 @@ class MiniMaxH3ReferencePack:
         computed from a queued prompt can only ever match, never mislead. Waiting on a
         prepare still under way costs the time build() would have spent itself.
         """
+        del original_prompt  # display-only; never part of the VLM key or the build
         kwargs: dict[str, Any] = dict(
             direction=direction, openrouter_api_key=openrouter_api_key,
             openrouter_model=openrouter_model, references_json=references_json,

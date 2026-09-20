@@ -277,6 +277,19 @@ def test_a_current_array_carrying_the_frame_switch_maps_it_by_name():
     got = _remap(current)
     assert got["match_video_aspect"] is True
     assert got["max_reference_edge"] == 2048
+    assert "original_prompt" not in got
+
+
+@requires_node
+def test_an_appended_original_prompt_maps_by_name():
+    current = [
+        "rewrite", "", "", "none", "", "google/gemini-3-flash-preview", "medium",
+        "", "", "auto", 1376, 768, 5.0, 2048, False, "the idea",
+    ]
+    got = _remap(current)
+    assert got["direction"] == "rewrite"
+    assert got["original_prompt"] == "the idea"
+    assert got["match_video_aspect"] is False
 
 
 @requires_node

@@ -8,6 +8,8 @@
  *   <canvas> — black; Images (N/9) / Videos (N/3) / Audio (N/3), three fixed
  *              sections separated by drawn divider lines, a "+" add slot per row
  *   Prompt — one large plain textarea (bound to the hidden `direction` widget)
+ *   Original prompt — a second textarea (bound to hidden `original_prompt`) that
+ *                     keeps the idea Auto Prompt rewrote away from `direction`
  * The ⚙ opens a modal for the `system_prompt` widget — never drawn on the node body,
  * only editable behind that modal (see openSystemPromptModal).
  *
@@ -168,7 +170,9 @@ const ORDER_0_3_3 = [
 ];
 // 0.4.2 appended match_video_aspect. Appending keeps every 0.3.3 slot where it was, so
 // one detection covers both: names past the end of an older array simply do not appear.
-const ORDER_CURRENT = ORDER_0_3_3.concat(["match_video_aspect"]);
+const ORDER_0_4_2 = ORDER_0_3_3.concat(["match_video_aspect"]);
+// original_prompt is display-only and also appended, so a 0.4.2 array still maps.
+const ORDER_CURRENT = ORDER_0_4_2.concat(["original_prompt"]);
 
 function detectLayout(values) {
     if (!Array.isArray(values)) return null;
@@ -300,10 +304,12 @@ const CONTENT = {
     pad: 10, // side inset of the DOM block within the node
     uploadsH: 30, // .mmrp-uploads fixed height
     promptH: 110, // .mmrp-direction fixed height — clearly smaller than a canvas row
+    originalH: 88, // label + .mmrp-original — keeps the idea after Auto Prompt rewrites direction
     gap: 8, // .mmrp-block flex gap
 };
 CONTENT.height =
-    CONTENT.uploadsH + CONTENT.gap + CANVAS_ROWS.height + CONTENT.gap + CONTENT.promptH;
+    CONTENT.uploadsH + CONTENT.gap + CANVAS_ROWS.height + CONTENT.gap + CONTENT.promptH
+    + CONTENT.gap + CONTENT.originalH;
 
 // The ONE node size. Height floors against the 19 output sockets; widgetY is where
 // litegraph placed the DOM block below the native widgets (fallback for the beat
@@ -2158,6 +2164,16 @@ function buildCustomBlock(node) {
     directionInput.spellcheck = false;
     container.appendChild(directionInput);
 
+    const originalLabel = document.createElement("div");
+    originalLabel.className = "mmrp-original-label";
+    originalLabel.textContent = "Original prompt";
+    container.appendChild(originalLabel);
+    const originalInput = document.createElement("textarea");
+    originalInput.className = "mmrp-original";
+    originalInput.placeholder = "Idea before Auto Prompt rewrote the box above";
+    originalInput.spellcheck = false;
+    container.appendChild(originalInput);
+
     // --- drag-and-drop ---------------------------------------------------------
     //
     // Attached to `container` rather than to the canvas: it is the real DOM element
@@ -2255,6 +2271,7 @@ function buildCustomBlock(node) {
         canvas,
         ctx: canvas.getContext("2d"),
         directionInput,
+        originalInput,
         previewVideo,
         previewAudio,
         resizeObserver,
@@ -3876,6 +3893,9 @@ app.registerExtension({
             const directionWidget = widgetByName(node, "direction");
             const ivDirection = hideWidget(directionWidget);
 
+            const originalWidget = widgetByName(node, "original_prompt");
+            const ivOriginal = hideWidget(originalWidget);
+
             const systemPromptWidget = widgetByName(node, "system_prompt");
             const ivSystemPrompt = hideWidget(systemPromptWidget);
 
@@ -3887,7 +3907,7 @@ app.registerExtension({
             // Cleared early in installSelectionHandlers' onRemoved wrapper so a deleted
             // node doesn't leave a hide-poll timer running (they also self-clear after
             // 1s regardless, this just avoids the wait on an early delete).
-            node._mmrpHideIntervals = [ivRefs, ivDirection, ivSystemPrompt, ivJobType]
+            node._mmrpHideIntervals = [ivRefs, ivDirection, ivOriginal, ivSystemPrompt, ivJobType]
                 .filter((id) => id !== undefined);
 
             const bodyEl = buildCustomBlock(node);
@@ -3907,6 +3927,12 @@ app.registerExtension({
                 if (!directionWidget) return;
                 directionWidget.value = node._mmrpBody.directionInput.value;
                 if (directionWidget.callback) directionWidget.callback(directionWidget.value);
+            });
+            node._mmrpBody.originalInput.value = originalWidget ? originalWidget.value || "" : "";
+            node._mmrpBody.originalInput.addEventListener("input", () => {
+                if (!originalWidget) return;
+                originalWidget.value = node._mmrpBody.originalInput.value;
+                if (originalWidget.callback) originalWidget.callback(originalWidget.value);
             });
 
             installSizeGuards(node);
@@ -3952,7 +3978,21 @@ app.registerExtension({
                 stopPreview(this);
                 this._mmrpRefs = parseRefsValue(rw);
                 const dw = widgetByName(this, "direction");
-                if (this._mmrpBody) this._mmrpBody.directionInput.value = dw ? dw.value || "" : "";
+                const ow = widgetByName(this, "original_prompt");
+                const named = info && info.widgets_values_named;
+                if (ow && !(String(ow.value || "").trim())) {
+                    const stored = named && typeof named.original_prompt === "string"
+                        ? named.original_prompt : "";
+                    const namedDir = named && typeof named.direction === "string"
+                        ? named.direction : "";
+                    const direction = dw ? String(dw.value || "") : "";
+                    if (stored.trim()) ow.value = stored;
+                    else if (namedDir && namedDir !== direction) ow.value = namedDir;
+                }
+                if (this._mmrpBody) {
+                    this._mmrpBody.directionInput.value = dw ? dw.value || "" : "";
+                    this._mmrpBody.originalInput.value = ow ? ow.value || "" : "";
+                }
                 this._mmrpSelected = null;
                 // configure() writes the serialized size straight onto node.size,
                 // bypassing our setSize wrapper — re-assert the fixed size.

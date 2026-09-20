@@ -726,7 +726,7 @@ def test_widgets_are_append_only_so_old_workflows_restore_unchanged():
         "direction", "references_json", "system_prompt", "prompt_provider",
         "openrouter_api_key", "openrouter_model", "reasoning_effort", "api_base",
         "local_model_slug", "job_type", "width", "height", "length_seconds",
-        "max_reference_edge", "match_video_aspect",
+        "max_reference_edge", "match_video_aspect", "original_prompt",
     ]
 
 
@@ -978,12 +978,21 @@ def test_is_changed_key_moves_with_the_switch(fake_folder_paths):
     assert off != on
 
 
+def test_original_prompt_does_not_move_the_cache_key(fake_folder_paths):
+    kwargs = dict(direction="d", references_json="", width=1376, height=768)
+    blank = nodes.MiniMaxH3ReferencePack.IS_CHANGED(**kwargs)
+    filled = nodes.MiniMaxH3ReferencePack.IS_CHANGED(original_prompt="idea", **kwargs)
+    assert blank == filled
+
+
 def test_the_switch_is_the_last_widget_so_saved_values_keep_their_slots():
     spec = nodes.MiniMaxH3ReferencePack.INPUT_TYPES()
     optional = list(spec["optional"])
-    assert optional[-2:] == ["max_reference_edge", "match_video_aspect"]
+    assert optional[-3:] == ["max_reference_edge", "match_video_aspect", "original_prompt"]
     assert spec["optional"]["match_video_aspect"][0] == "BOOLEAN"
     assert spec["optional"]["match_video_aspect"][1]["default"] is False
+    assert spec["optional"]["original_prompt"][0] == "STRING"
+    assert spec["optional"]["original_prompt"][1]["default"] == ""
 
 
 def test_an_audio_ref_to_a_video_file_fills_audio_not_video(fake_folder_paths, monkeypatch):

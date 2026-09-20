@@ -156,7 +156,7 @@ def test_the_widgets_are_named_and_ordered_as_declared():
         "direction", "references_json", "system_prompt", "prompt_provider",
         "openrouter_api_key", "openrouter_model", "reasoning_effort", "api_base",
         "local_model_slug", "job_type", "width", "height", "length_seconds",
-        "max_reference_edge", "match_video_aspect",
+        "max_reference_edge", "match_video_aspect", "original_prompt",
     ]
 
 
