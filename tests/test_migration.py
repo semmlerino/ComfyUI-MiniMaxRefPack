@@ -290,6 +290,18 @@ def test_an_appended_original_prompt_maps_by_name():
     assert got["direction"] == "rewrite"
     assert got["original_prompt"] == "the idea"
     assert got["match_video_aspect"] is False
+    assert "rewrite_pin" not in got
+
+
+@requires_node
+def test_an_appended_rewrite_pin_maps_by_name():
+    current = [
+        "rewrite", "", "", "none", "", "google/gemini-3-flash-preview", "medium",
+        "", "", "auto", 1376, 768, 5.0, 2048, False, "the idea", "rub",
+    ]
+    got = _remap(current)
+    assert got["original_prompt"] == "the idea"
+    assert got["rewrite_pin"] == "rub"
 
 
 @requires_node

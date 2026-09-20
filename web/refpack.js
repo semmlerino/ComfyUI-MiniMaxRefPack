@@ -11,7 +11,10 @@
  *   Original prompt — a second textarea (bound to hidden `original_prompt`) that
  *                     keeps the idea Auto Prompt rewrote away from `direction`
  * The ⚙ opens a modal for the `system_prompt` widget — never drawn on the node body,
- * only editable behind that modal (see openSystemPromptModal).
+ * only editable behind that modal (see openSystemPromptModal). `rewrite_pin` is a
+ * native combo appended after `original_prompt` so a saved graph picks the rewriter
+ * without pasting into ⚙. Named pins replace packaged six-section; a non-blank ⚙
+ * `system_prompt` still wins.
  *
  * FIXED SIZE, per spec: "I would like this node to have a fixed size that cannot be
  * moved" / "I don't want the canvas to change at all — always the same row. It just
@@ -180,7 +183,8 @@ const ORDER_0_3_3 = [
 // one detection covers both: names past the end of an older array simply do not appear.
 const ORDER_0_4_2 = ORDER_0_3_3.concat(["match_video_aspect"]);
 // original_prompt is display-only and also appended, so a 0.4.2 array still maps.
-const ORDER_CURRENT = ORDER_0_4_2.concat(["original_prompt"]);
+// rewrite_pin is a visible combo appended after that: older arrays stay aligned.
+const ORDER_CURRENT = ORDER_0_4_2.concat(["original_prompt", "rewrite_pin"]);
 
 function detectLayout(values) {
     if (!Array.isArray(values)) return null;

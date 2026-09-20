@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from . import endpoint, logs, media, prefetch, prompt, refs
+from . import endpoint, logs, media, prefetch, prompt, refs, rewrite_pins
 
 # Default long-edge cap for reference IMAGES. Named rather than inlined because it is
 # the widget default AND the fallback when a workflow saved before the widget existed
@@ -310,6 +310,16 @@ class MiniMaxH3ReferencePack:
                     "tooltip": "The idea typed before Auto Prompt rewrote direction. "
                                "Never sent to the VLM. A non-empty value is not overwritten.",
                 }),
+
+                # Appended after original_prompt: a visible combo so a saved graph
+                # picks the rewriter system prompt without pasting into ⚙.
+                "rewrite_pin": (rewrite_pins.combo_values(), {
+                    "default": rewrite_pins.DEFAULT,
+                    "tooltip": "Rewriter system prompt for Auto Prompt. default = "
+                               "packaged six-section (or a non-blank ⚙ system_prompt). "
+                               "Named pins are Hearmeman three-field variants. A ⚙ "
+                               "system_prompt still wins if it is not blank.",
+                }),
             },
         }
 
@@ -325,7 +335,8 @@ class MiniMaxH3ReferencePack:
         prompt_provider=endpoint.DEFAULT_PROVIDER,
         reasoning_effort=prompt.DEFAULT_REASONING_EFFORT, job_type="auto",
         max_reference_edge=DEFAULT_MAX_REFERENCE_EDGE, api_base="", local_model_slug="",
-        match_video_aspect=False, original_prompt="", use_openrouter=None, model=None,
+        match_video_aspect=False, original_prompt="", rewrite_pin=rewrite_pins.DEFAULT,
+        use_openrouter=None, model=None,
         model_override=None, **kwargs
     ):
         openrouter_model = openrouter_model or (model or "")
@@ -355,6 +366,7 @@ class MiniMaxH3ReferencePack:
             str(reasoning_effort), str(job_type), str(max_reference_edge),
             str(api_base), str(local_model_slug), str(_switch_on(match_video_aspect)),
             _credential_fingerprint(openrouter_api_key),
+            rewrite_pins.normalize(rewrite_pin),
         ], separators=(",", ":"))
 
     def _build(
@@ -363,7 +375,8 @@ class MiniMaxH3ReferencePack:
         prompt_provider=endpoint.DEFAULT_PROVIDER,
         reasoning_effort=prompt.DEFAULT_REASONING_EFFORT, job_type="auto",
         max_reference_edge=DEFAULT_MAX_REFERENCE_EDGE, api_base="", local_model_slug="",
-        match_video_aspect=False, use_openrouter=None, model=None, model_override=None,
+        match_video_aspect=False, rewrite_pin=rewrite_pins.DEFAULT,
+        use_openrouter=None, model=None, model_override=None,
         prewritten: prefetch.Prepared | None = None, prepared_how: str = "no",
     ) -> BuildResult:
         """The whole build, as it has always run. `build()` wraps it with the prefetch
@@ -462,6 +475,16 @@ class MiniMaxH3ReferencePack:
 
         prompt_text = ""
         debug_sink: list[str] = []
+        widget_override = bool((system_prompt or "").strip())
+        system_prompt, pin_job_type = rewrite_pins.apply(system_prompt, rewrite_pin)
+        if pin_job_type:
+            job_type = pin_job_type
+        if widget_override:
+            prompt_src = "workflow override"
+        elif rewrite_pins.is_named(rewrite_pin):
+            prompt_src = f"rewrite pin {rewrite_pins.normalize(rewrite_pin)}"
+        else:
+            prompt_src = "packaged default"
         debug_header = [
             "=== MiniMax References Manager ===",
             f"prompt_provider: {provider}" + (f" ({api_base})" if provider == "local" else ""),
@@ -478,7 +501,7 @@ class MiniMaxH3ReferencePack:
                 if reference_set.task_plan is not None
                 else f"job_type: {job_type}"
             ),   # rewritten below once auto/explicit routing has resolved
-            f"system_prompt: {'workflow override' if (system_prompt or '').strip() else 'packaged default'}",
+            f"system_prompt: {prompt_src}",
             f"references: {len(reference_set.references)} "
             f"({', '.join(f'{t.tag} {t.file}' for t in reference_set.assign_tags()) or 'none'})",
         ]
@@ -590,7 +613,8 @@ class MiniMaxH3ReferencePack:
         prompt_provider=endpoint.DEFAULT_PROVIDER,
         reasoning_effort=prompt.DEFAULT_REASONING_EFFORT, job_type="auto",
         max_reference_edge=DEFAULT_MAX_REFERENCE_EDGE, api_base="", local_model_slug="",
-        match_video_aspect=False, original_prompt="", use_openrouter=None, model=None,
+        match_video_aspect=False, original_prompt="", rewrite_pin=rewrite_pins.DEFAULT,
+        use_openrouter=None, model=None,
         model_override=None,
     ):
         """The node's entry point: the pack the prefetcher built for these exact inputs
@@ -610,6 +634,7 @@ class MiniMaxH3ReferencePack:
             reasoning_effort=reasoning_effort, job_type=job_type,
             max_reference_edge=max_reference_edge, api_base=api_base,
             local_model_slug=local_model_slug, match_video_aspect=match_video_aspect,
+            rewrite_pin=rewrite_pin,
             use_openrouter=use_openrouter, model=model, model_override=model_override,
         )
         key = _key_for(**kwargs)

@@ -113,6 +113,46 @@ def test_system_prompt_widget_is_passed_through_to_write_prompt(fake_folder_path
     assert captured["system_prompt"] == "a custom system prompt"
 
 
+def test_named_rewrite_pin_is_passed_as_system_prompt(fake_folder_paths, monkeypatch):
+    tmp_path = fake_folder_paths
+    _touch(tmp_path, "i1.jpg")
+    monkeypatch.setattr(nodes.media, "load_image", lambda path, crop=None, max_edge=0: f"IMG:{path}")
+    captured = {}
+
+    def fake_write_prompt(**kwargs):
+        captured.update(kwargs)
+        return "a prompt"
+
+    monkeypatch.setattr(nodes.prompt, "write_prompt", fake_write_prompt, raising=False)
+    references_json = json.dumps({"references": [{"kind": "image", "file": "i1.jpg"}]})
+    nodes.MiniMaxH3ReferencePack().build(
+        direction="d", openrouter_api_key="", model="m",
+        references_json=references_json, rewrite_pin="rub",
+    )
+    assert "wild kissing" in captured["system_prompt"]
+    assert captured["job_type"] == "standard"
+
+
+def test_system_prompt_widget_wins_over_rewrite_pin(fake_folder_paths, monkeypatch):
+    tmp_path = fake_folder_paths
+    _touch(tmp_path, "i1.jpg")
+    monkeypatch.setattr(nodes.media, "load_image", lambda path, crop=None, max_edge=0: f"IMG:{path}")
+    captured = {}
+
+    def fake_write_prompt(**kwargs):
+        captured.update(kwargs)
+        return "a prompt"
+
+    monkeypatch.setattr(nodes.prompt, "write_prompt", fake_write_prompt, raising=False)
+    references_json = json.dumps({"references": [{"kind": "image", "file": "i1.jpg"}]})
+    nodes.MiniMaxH3ReferencePack().build(
+        direction="d", openrouter_api_key="", model="m",
+        references_json=references_json, system_prompt="custom ⚙", rewrite_pin="rub",
+    )
+    assert captured["system_prompt"] == "custom ⚙"
+    assert captured["job_type"] == "auto"
+
+
 def test_empty_set_with_a_direction_still_writes_the_prompt(fake_folder_paths, monkeypatch):
     """Zero references is not zero input: with a direction, the writer still runs and
     the prompt socket carries its answer."""
@@ -445,6 +485,17 @@ def test_is_changed_key_moves_when_only_system_prompt_changes(fake_folder_paths)
     assert key1 != key2
 
 
+def test_is_changed_key_moves_when_rewrite_pin_changes(fake_folder_paths):
+    _touch(fake_folder_paths, "i1.jpg")
+    references_json = json.dumps({"references": [{"kind": "image", "file": "i1.jpg"}]})
+    kwargs = dict(direction="d", openrouter_api_key="", model="m", references_json=references_json)
+
+    key1 = nodes.MiniMaxH3ReferencePack.IS_CHANGED(rewrite_pin="default", **kwargs)
+    key2 = nodes.MiniMaxH3ReferencePack.IS_CHANGED(rewrite_pin="rub", **kwargs)
+
+    assert key1 != key2
+
+
 def test_is_changed_key_moves_when_use_openrouter_toggles(fake_folder_paths):
     _touch(fake_folder_paths, "i1.jpg")
     references_json = json.dumps({"references": [{"kind": "image", "file": "i1.jpg"}]})
@@ -727,6 +778,7 @@ def test_widgets_are_append_only_so_old_workflows_restore_unchanged():
         "openrouter_api_key", "openrouter_model", "reasoning_effort", "api_base",
         "local_model_slug", "job_type", "width", "height", "length_seconds",
         "max_reference_edge", "match_video_aspect", "original_prompt",
+        "rewrite_pin",
     ]
 
 
@@ -988,11 +1040,14 @@ def test_original_prompt_does_not_move_the_cache_key(fake_folder_paths):
 def test_the_switch_is_the_last_widget_so_saved_values_keep_their_slots():
     spec = nodes.MiniMaxH3ReferencePack.INPUT_TYPES()
     optional = list(spec["optional"])
-    assert optional[-3:] == ["max_reference_edge", "match_video_aspect", "original_prompt"]
+    assert optional[-4:] == [
+        "max_reference_edge", "match_video_aspect", "original_prompt", "rewrite_pin",
+    ]
     assert spec["optional"]["match_video_aspect"][0] == "BOOLEAN"
     assert spec["optional"]["match_video_aspect"][1]["default"] is False
     assert spec["optional"]["original_prompt"][0] == "STRING"
     assert spec["optional"]["original_prompt"][1]["default"] == ""
+    assert spec["optional"]["rewrite_pin"][0][0] == "default"
 
 
 def test_an_audio_ref_to_a_video_file_fills_audio_not_video(fake_folder_paths, monkeypatch):
