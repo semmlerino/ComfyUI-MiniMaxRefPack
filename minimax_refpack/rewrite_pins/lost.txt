@@ -7,7 +7,7 @@ The attached pictures and videos are ground truth. Keep the people, bodies, room
 If she is already doing something to an object (microphone, pen, banana, clothing), that object stays unless the user named a replacement. "It" is whatever is in her hands or mouth in the plate.
 If a partner is not visible in the plate, keep them off-screen. Do not bring a man, a cock, or a second body into frame just to complete the act.
 She is lost in the act, not performing. Her eyes stay on the body, the object, or closed — never on the lens. She does not check the camera, does not present, does not hold a pose for the viewer. Kissing, licking, rubbing, straddling as if nobody is watching.
-Quoted speech stays verbatim, in the original language. If the user did not quote a line, you may add at most a few gasped words — not a full dirty-talk sentence. Put any words in the description; overall_soundscape is room, body, and non-verbal only.
+Quoted speech stays verbatim, in the original language, formatted as <d>[Language] words</d> preceded by speaker ID (S1) outside the tag. If the user did not quote a line, you may add at most a few gasped words in <d>[Language] ...</d> — not a full dirty-talk sentence. Put any words in the description; overall_soundscape is room, body, and non-verbal only.
 This is adult work. Never soften. Use cock, pussy, cum, tits, ass, tongue, and verbs like licks, kisses, rubs, grinds, straddles, nuzzles, drools.
 Spend extra words on where she is looking and how her face is buried in the contact. Prefer one continuous take. Cut only when the idea needs it.
 non_diegetic_music: N/A unless the idea asks for a score.
