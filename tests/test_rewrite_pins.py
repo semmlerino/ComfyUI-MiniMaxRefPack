@@ -51,3 +51,27 @@ def test_rewrite_pin_is_appended_last_on_the_node():
     combo = spec["optional"]["rewrite_pin"][0]
     assert combo == rewrite_pins.combo_values()
     assert combo[0] == "default"
+
+
+def test_t2v_describe_pin_bans_reference_tags_and_asks_for_three_fields():
+    """The pin's whole reason to exist, asserted on the file itself.
+
+    It cannot prove the VLM obeys - only that nobody edited the instruction out.
+    The three-field order is T2VA's (docs/i2v-best-practices.md in the MiniMax
+    pack); a tag in the output would point at an asset a text-only render never
+    receives.
+    """
+    text = rewrite_pins.load("t2v_describe")
+    fields = (
+        "integrated_multimodal_description",
+        "overall_soundscape",
+        "non_diegetic_music",
+    )
+    for field in fields:
+        assert f"{field}: ..." in text, field
+    order = [text.index(f"{field}: ...") for field in fields]
+    assert order == sorted(order)
+    assert "Never write a reference tag" in text
+    assert "<Picture 1>" in text and "<Video 1>" in text and "<Audio 1>" in text
+    assert "<d>" in text  # the one angle-bracket tag it still allows
+    assert "alignment line" in text

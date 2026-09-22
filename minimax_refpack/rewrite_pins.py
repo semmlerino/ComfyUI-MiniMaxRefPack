@@ -27,6 +27,7 @@ NAMES: tuple[str, ...] = (
     "slow",
     "lost",
     "lens",
+    "t2v_describe",
 )
 
 BLURBS: dict[str, str] = {
@@ -40,6 +41,7 @@ BLURBS: dict[str, str] = {
     "slow": "languid stuck contact; partner off-screen",
     "lost": "never looks at the lens; partner off-screen",
     "lens": "never looks away from the lens; partner off-screen",
+    "t2v_describe": "text-only: transcribe references into prose, no tags",
 }
 
 
