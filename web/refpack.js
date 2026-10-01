@@ -327,9 +327,10 @@ CONTENT.height =
 // litegraph placed the DOM block below the native widgets (fallback for the beat
 // before the first layout assigns last_y).
 function fixedSize(node) {
+    const inputsMin = layoutExposedInputs(node);
     const widgetY = (node._mmrpDomWidget && node._mmrpDomWidget.last_y) || 80;
     const outputsMin = Math.max(node.outputs?.length || 1, node.inputs?.length || 1) * 20 + 40;
-    return [CONTENT.width, Math.max(widgetY + CONTENT.height + CONTENT.pad, outputsMin)];
+    return [CONTENT.width, Math.max(widgetY + CONTENT.height + CONTENT.pad, outputsMin, inputsMin)];
 }
 
 // ---------------------------------------------------------------------------
@@ -4029,7 +4030,23 @@ const REFERENCE_INPUTS = Object.fromEntries([
     ...Array.from({ length: 3 }, (_, i) => [`audio_${i + 1}`, "AUDIO"]),
 ]);
 
+function layoutExposedInputs(node) {
+    // Plain sockets get their own rows above the widgets. Converted setting sockets
+    // stay with their widgets, and the DOM reference area moves down with them.
+    const rowHeight = 24;
+    let row = 0;
+    for (const input of node.inputs || []) {
+        if (input.widget) continue;
+        input.pos = [10, 14 + row++ * rowHeight];
+    }
+    node.widgets_start_y = row
+        ? Math.max(node._mmrpBaseWidgetsStartY || 0, row * rowHeight + 16)
+        : node._mmrpBaseWidgetsStartY;
+    return row * rowHeight + 16;
+}
+
 function installInputControls(node) {
+    node._mmrpBaseWidgetsStartY = node.widgets_start_y;
     // New nodes start compact. onConfigure restores any sockets saved in a workflow.
     for (let i = (node.inputs?.length || 0) - 1; i >= 0; i--) {
         if (REFERENCE_INPUTS[node.inputs[i].name]) node.removeInput(i);
@@ -4058,7 +4075,20 @@ function installInputControls(node) {
     const previousConnections = node.onConnectionsChange;
     node.onConnectionsChange = function () {
         previousConnections?.apply(this, arguments);
+        layoutExposedInputs(this);
         scheduleDraw(this);
+    };
+    const previousDraw = node.onDrawBackground;
+    node.onDrawBackground = function () {
+        // Widget positions can change after provider switches and workflow restore.
+        const size = fixedSize(this);
+        if (this.size[1] !== size[1]) this.setSize(size);
+        previousDraw?.apply(this, arguments);
+    };
+    const previousConnectionPos = node.getConnectionPos;
+    node.getConnectionPos = function () {
+        layoutExposedInputs(this);
+        return previousConnectionPos.apply(this, arguments);
     };
 }
 

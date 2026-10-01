@@ -32,3 +32,27 @@ def test_expose_hide_and_link_protection():
     '''
     result = subprocess.run(["node", "--input-type=module", "-e", script], text=True, capture_output=True, check=True)
     assert all(json.loads(result.stdout).values())
+
+
+def test_reference_input_rows_reserve_space_before_widgets_and_reflow():
+    text = (Path(__file__).resolve().parent.parent / "web/refpack.js").read_text()
+    block = text.split("// >>> MMRP-INPUTS", 1)[1].split("// <<< MMRP-INPUTS", 1)[0]
+    script = block + '''
+    const setting = {name: "width", widget: {name: "width"}, pos: [10, 100]};
+    const node = {
+        _mmrpDomWidget: {last_y: 300},
+        inputs: [setting, {name: "image_1"}, {name: "image_2"}, {name: "direction"}],
+    };
+    const bottom = layoutExposedInputs(node);
+    const first = node.inputs[1].pos[1];
+    const second = node.inputs[2].pos[1];
+    const separated = first === 14 && second - first === 24 && node.widgets_start_y > node.inputs[3].pos[1];
+    const settingUnchanged = setting.pos[1] === 100;
+    node.inputs.splice(1, 1);
+    node._mmrpDomWidget.last_y = 400;
+    layoutExposedInputs(node);
+    const reflowed = node.inputs[1].pos[1] === 14 && node.inputs[2].pos[1] === 38 && node.widgets_start_y === 64;
+    console.log(JSON.stringify({separated, settingUnchanged, reflowed, fits: bottom > second}));
+    '''
+    result = subprocess.run(["node", "--input-type=module", "-e", script], text=True, capture_output=True, check=True)
+    assert all(json.loads(result.stdout).values())
