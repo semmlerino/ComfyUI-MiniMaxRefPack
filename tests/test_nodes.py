@@ -773,7 +773,9 @@ def test_widgets_are_append_only_so_old_workflows_restore_unchanged():
     rather than being appended - a type change in place, covered by the migration tests.
     """
     spec = nodes.MiniMaxH3ReferencePack.INPUT_TYPES()
-    assert list(spec["required"]) + list(spec["optional"]) == [
+    # Media sockets have no widgets and must not shift widgets_values.
+    widgets = [name for name in spec["optional"] if name not in nodes.wired.INPUT_TYPES]
+    assert list(spec["required"]) + widgets == [
         "direction", "references_json", "system_prompt", "prompt_provider",
         "openrouter_api_key", "openrouter_model", "reasoning_effort", "api_base",
         "local_model_slug", "job_type", "width", "height", "length_seconds",
@@ -1039,7 +1041,7 @@ def test_original_prompt_does_not_move_the_cache_key(fake_folder_paths):
 
 def test_the_switch_is_the_last_widget_so_saved_values_keep_their_slots():
     spec = nodes.MiniMaxH3ReferencePack.INPUT_TYPES()
-    optional = list(spec["optional"])
+    optional = [name for name in spec["optional"] if name not in nodes.wired.INPUT_TYPES]
     assert optional[-4:] == [
         "max_reference_edge", "match_video_aspect", "original_prompt", "rewrite_pin",
     ]

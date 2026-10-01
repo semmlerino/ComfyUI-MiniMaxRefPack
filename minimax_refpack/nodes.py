@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from . import endpoint, logs, media, prefetch, prompt, refs, rewrite_pins
+from . import endpoint, logs, media, prefetch, prompt, refs, rewrite_pins, wired
 
 # Default long-edge cap for reference IMAGES. Named rather than inlined because it is
 # the widget default AND the fallback when a workflow saved before the widget existed
@@ -320,6 +320,8 @@ class MiniMaxH3ReferencePack:
                                "Named pins are Hearmeman three-field variants. A ⚙ "
                                "system_prompt still wins if it is not blank.",
                 }),
+                **{name: (kind, {"tooltip": "Upstream override; unconnected uses the internal slot."})
+                   for name, kind in wired.INPUT_TYPES.items()},
             },
         }
 
@@ -378,6 +380,7 @@ class MiniMaxH3ReferencePack:
         match_video_aspect=False, rewrite_pin=rewrite_pins.DEFAULT,
         use_openrouter=None, model=None, model_override=None,
         prewritten: prefetch.Prepared | None = None, prepared_how: str = "no",
+        **upstream,
     ) -> BuildResult:
         """The whole build, as it has always run. `build()` wraps it with the prefetch
         lookup, and the prefetcher calls it directly for a pending job.
@@ -398,7 +401,10 @@ class MiniMaxH3ReferencePack:
         reference_set.validate()  # raises refs.ReferenceError (a ValueError) over cap
 
         input_dir = folder_paths.get_input_directory()
-        missing = reference_set.missing_files(input_dir)
+        reference_set, cache = wired.resolve(reference_set, upstream, input_dir)
+        reference_set.validate()
+        missing = [file for file in reference_set.missing_files(input_dir)
+                   if os.path.join(input_dir, file) not in cache.overrides]
         if missing:
             raise ValueError(
                 "reference file(s) not found in the ComfyUI input directory: " + ", ".join(missing)
@@ -420,7 +426,6 @@ class MiniMaxH3ReferencePack:
         # It must not outlive the build: the browser re-uploads an edited reference under
         # the same filename with overwrite=true, which is exactly why IS_CHANGED above
         # hashes mtime+size rather than trusting the name.
-        cache = media.MediaCache()
         aspect_source = None  # (tag, frames) of the video the frame follows
         for tagged in reference_set.assign_tags():
             path = os.path.join(input_dir, tagged.file)
@@ -615,7 +620,7 @@ class MiniMaxH3ReferencePack:
         max_reference_edge=DEFAULT_MAX_REFERENCE_EDGE, api_base="", local_model_slug="",
         match_video_aspect=False, original_prompt="", rewrite_pin=rewrite_pins.DEFAULT,
         use_openrouter=None, model=None,
-        model_override=None,
+        model_override=None, **upstream,
     ):
         """The node's entry point: the pack the prefetcher built for these exact inputs
         while the previous job rendered, else the build itself.
@@ -637,6 +642,8 @@ class MiniMaxH3ReferencePack:
             rewrite_pin=rewrite_pin,
             use_openrouter=use_openrouter, model=model, model_override=model_override,
         )
+        if wired.active(upstream):
+            return self._build(**kwargs, **upstream).outputs
         key = _key_for(**kwargs)
         with PREFETCHER.consume(key) as prepared:
             if prepared is not None and _key_for(**kwargs) != key:

@@ -263,7 +263,7 @@ def test_the_js_layout_matches_the_python_declaration_order():
     """The one assertion that stops the two halves drifting."""
     from minimax_refpack import nodes
     spec = nodes.MiniMaxH3ReferencePack.INPUT_TYPES()
-    python_order = list(spec["required"]) + list(spec["optional"])
+    python_order = list(spec["required"]) + [name for name in spec["optional"] if name not in nodes.wired.INPUT_TYPES]
     js_order = _run_js("ORDER_CURRENT")
     assert js_order == python_order
 

@@ -167,3 +167,32 @@ Reference videos are decoded by a streaming pass of our own rather than through 
 ## Licence
 
 MIT. Free, and public on GitHub. Clone it, fork it, rip the prompt writer out and keep the reference manager, ship it inside something you sell. You do not need an account, and the node never calls home.
+
+## Connect upstream inputs
+
+Right-click the node border and choose **Expose input**, then choose `image_1` through
+`image_9`, `video_1` through `video_3`, `video_audio_1` through `video_audio_3`, or
+`audio_1` through `audio_3`. Connect a loader, selector, randomizer, or processor.
+A connected value overrides that internal slot; disconnecting restores the picker.
+The menu hides unused sockets, and saved workflows retain exposed sockets and links.
+
+For example: random image selector → `image_1`. Set `prompt_provider` to `none` with
+your finished prompt in direction to change that picture while keeping the prompt fixed.
+Auto Prompt instead sees the incoming media and may rewrite the prompt.
+
+Image inputs accept one RGB ComfyUI `IMAGE` tensor. Video inputs accept decoded RGB
+`IMAGE` frame batches at **24 fps**, already on MiniMax's **17k+5** frame grid;
+provide their soundtrack separately through `video_audio_N` (`AUDIO`). A connected
+video replaces its internal soundtrack too: without `video_audio_N` it is silent.
+Wiring only `video_audio_N` replaces the soundtrack of the internal video. Standalone
+sound uses `audio_N` (`AUDIO`). Fill slots consecutively: empty gaps would change
+MiniMax's picture/video numbering and are rejected. Internal slot roles and primary
+video status carry over; crop, trim, and image size caps are bypassed for upstream
+media, so prepare those values upstream. The tile's file preview remains the internal
+fallback, with an **upstream input** badge when overridden; it is not a tensor preview.
+
+Use ComfyUI's **Convert widget to input** for visible settings such as dimensions,
+provider, and model. **Expose input** also offers the hidden `direction`,
+`system_prompt`, and `references_json` fields. A linked value wins at execution.
+Portable configs store the internal fallback values; the full workflow stores links.
+Jobs with upstream media bypass the file-based prefetch cache.

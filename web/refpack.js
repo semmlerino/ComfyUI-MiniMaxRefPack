@@ -328,7 +328,7 @@ CONTENT.height =
 // before the first layout assigns last_y).
 function fixedSize(node) {
     const widgetY = (node._mmrpDomWidget && node._mmrpDomWidget.last_y) || 80;
-    const outputsMin = ((node.outputs && node.outputs.length) || 1) * 20 + 40;
+    const outputsMin = Math.max(node.outputs?.length || 1, node.inputs?.length || 1) * 20 + 40;
     return [CONTENT.width, Math.max(widgetY + CONTENT.height + CONTENT.pad, outputsMin)];
 }
 
@@ -1479,9 +1479,11 @@ function draw(node) {
             const t = taggedArr[i];
             // "vid_audio <Audio 1>" not bare "<Audio 1>": the tag is what MiniMax binds
             // and has to stay visible, but unlabelled it reads as a standalone audio ref.
+            const upstream = node.inputs?.some((input) => input.name === `${kind}_${i + 1}` && input.link != null);
             const lines = kind === "video" && t.audioTag
                 ? [t.tag, `vid_audio ${t.audioTag}`]
                 : [t.tag];
+            if (upstream) lines.push("upstream input");
             const probed = probeResults.has(ref.file) ? probeResults.get(ref.file) : undefined;
             // A muted clip that HAS sound says so: the ♪ chip alone did not read as mute.
             if (kind === "video" && !ref.use_soundtrack && probed === true) lines.push("muted");
@@ -4018,6 +4020,50 @@ function installSizeGuards(node) {
     };
 }
 
+// >>> MMRP-INPUTS
+// Optional sockets are exposed individually; their backend schema is always present.
+const REFERENCE_INPUTS = Object.fromEntries([
+    ...Array.from({ length: 9 }, (_, i) => [`image_${i + 1}`, "IMAGE"]),
+    ...Array.from({ length: 3 }, (_, i) => [`video_${i + 1}`, "IMAGE"]),
+    ...Array.from({ length: 3 }, (_, i) => [`video_audio_${i + 1}`, "AUDIO"]),
+    ...Array.from({ length: 3 }, (_, i) => [`audio_${i + 1}`, "AUDIO"]),
+]);
+
+function installInputControls(node) {
+    // New nodes start compact. onConfigure restores any sockets saved in a workflow.
+    for (let i = (node.inputs?.length || 0) - 1; i >= 0; i--) {
+        if (REFERENCE_INPUTS[node.inputs[i].name]) node.removeInput(i);
+    }
+    const previousMenu = node.getExtraMenuOptions;
+    node.getExtraMenuOptions = function (canvas, options) {
+        previousMenu?.call(this, canvas, options);
+        const entries = { ...REFERENCE_INPUTS, direction: "STRING", system_prompt: "STRING",
+            references_json: "STRING" };
+        options.push({ content: "Expose input", submenu: { options: Object.entries(entries).map(([name, type]) => {
+            const index = this.inputs?.findIndex((input) => input.name === name) ?? -1;
+            const input = index >= 0 ? this.inputs[index] : null;
+            return {
+                content: `${input ? "Hide" : "Expose"} ${name}${input?.link != null ? " (disconnect first)" : ""}`,
+                disabled: input?.link != null,
+                callback: () => {
+                    if (index >= 0) this.removeInput(index);
+                    else this.addInput(name, type);
+                    this.setSize(fixedSize(this));
+                    this.setDirtyCanvas(true, true);
+                    scheduleDraw(this);
+                },
+            };
+        }) } });
+    };
+    const previousConnections = node.onConnectionsChange;
+    node.onConnectionsChange = function () {
+        previousConnections?.apply(this, arguments);
+        scheduleDraw(this);
+    };
+}
+
+// <<< MMRP-INPUTS
+
 // ---------------------------------------------------------------------------
 // Extension registration
 // ---------------------------------------------------------------------------
@@ -4033,6 +4079,7 @@ app.registerExtension({
             origOnNodeCreated?.apply(this, arguments);
             injectStyles();
             const node = this;
+            installInputControls(node);
 
             const refsWidget = widgetByName(node, "references_json");
             node._mmrpRefs = parseRefsValue(refsWidget);

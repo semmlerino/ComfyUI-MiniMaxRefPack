@@ -45,7 +45,7 @@ def test_default_pin_leaves_packaged_path():
 
 def test_rewrite_pin_is_appended_last_on_the_node():
     spec = nodes.MiniMaxH3ReferencePack.INPUT_TYPES()
-    ordered = list(spec["required"]) + list(spec["optional"])
+    ordered = list(spec["required"]) + [name for name in spec["optional"] if name not in nodes.wired.INPUT_TYPES]
     assert ordered[-1] == "rewrite_pin"
     assert ordered[-2] == "original_prompt"
     combo = spec["optional"]["rewrite_pin"][0]
