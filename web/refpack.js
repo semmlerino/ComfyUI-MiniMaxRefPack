@@ -110,6 +110,7 @@
  */
 
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 
 const NODE_NAME = "MiniMaxH3ReferencePack";
 
@@ -427,6 +428,11 @@ function normalizeTaskPlan(raw) {
     return { mode, specialization };
 }
 
+function takeControl(raw) {
+    return raw && typeof raw === "object" && !Array.isArray(raw)
+        ? JSON.parse(JSON.stringify(raw)) : null;
+}
+
 export function fromReferencesList(list) {
     const refs = { images: [], videos: [], audios: [], taskPlan: null };
     for (const r of list || []) {
@@ -460,6 +466,7 @@ export function fromReferencesList(list) {
 function fromReferencesEnvelope(data) {
     const refs = fromReferencesList((data && data.references) || []);
     refs.taskPlan = normalizeTaskPlan(data && data.task_plan);
+    refs.control = takeControl(data && data.control);
     return refs;
 }
 
@@ -493,6 +500,7 @@ function toReferencesEnvelope(refs) {
             envelope.task_plan.specialization = refs.taskPlan.specialization;
         }
     }
+    if (refs.control) envelope.control = takeControl(refs.control);
     return envelope;
 }
 
@@ -595,7 +603,11 @@ function ensureReplacementPrimaryRole(refs) {
 }
 
 function referencesFingerprint(refs) {
-    return JSON.stringify(toReferencesEnvelope(refs));
+    const envelope = toReferencesEnvelope(refs);
+    // A preparation can finish while the role planner is open. Its independent
+    // control receipt does not change the reference assets or their roles.
+    delete envelope.control;
+    return JSON.stringify(envelope);
 }
 
 function normalizePrimaryVideo(refs) {
@@ -605,6 +617,207 @@ function normalizePrimaryVideo(refs) {
     return refs;
 }
 // <<< MMRP-TASK-PLAN
+
+// Preparation is a separate queue entry. These helpers are also exercised without
+// a browser or GPU by tests/test_control_js.py.
+// >>> MMRP-CONTROL
+function controlSettings(control, lengthSeconds = 0) {
+    return {
+        file: control?.file || "", mode: control?.mode || "pose",
+        resolution: Number(control?.resolution ?? 512),
+        trim: control?.trim || null, crop: control?.crop || null,
+        length_seconds: Number(lengthSeconds) || 0,
+    };
+}
+
+function ensureControlOutput(node) {
+    // LiteGraph may restore the saved output array after node creation. Append the
+    // new socket to older managers without moving any serialized link's slot.
+    if (!(node.outputs || []).some((output) => output.name === "control_video")) {
+        node.addOutput("control_video", "IMAGE");
+    }
+}
+
+function controlSettingsFingerprint(control, lengthSeconds = 0) {
+    return JSON.stringify(controlSettings(control, lengthSeconds));
+}
+
+function changeControlSettings(control, changes) {
+    const next = { ...(takeControl(control) || {
+        file: "", mode: "pose", resolution: 512, trim: null, crop: null, map: null,
+    }), ...changes };
+    if (controlSettingsFingerprint(next) !== controlSettingsFingerprint(control)) {
+        next.map = null;
+        delete next.preparation;
+    }
+    return next;
+}
+
+function controlLength(node) {
+    const upstreamAt = (current, index) => {
+        const direct = current.getInputNode?.(index);
+        if (direct) return direct;
+        const graph = current.graph;
+        const linkId = current.inputs?.[index]?.link;
+        const link = graph?.links?.get?.(linkId) || graph?.links?.[linkId];
+        return link ? graph.getNodeById?.(link.origin_id) : null;
+    };
+    const seen = new Set();
+    const constant = (current) => {
+        if (!current || seen.has(current)) return null;
+        seen.add(current);
+        const type = current.comfyClass || current.type;
+        if (type === "Reroute") {
+            const index = current.inputs?.findIndex((input) => input.link != null) ?? -1;
+            return index >= 0 ? constant(upstreamAt(current, index)) : null;
+        }
+        if (!["PrimitiveFloat", "PrimitiveInt", "PrimitiveNode"].includes(type)) return null;
+        const linkedValue = current.inputs?.findIndex((input) => input.name === "value" && input.link != null) ?? -1;
+        if (linkedValue >= 0) return constant(upstreamAt(current, linkedValue));
+        const value = Number(widgetByName(current, "value")?.value);
+        return Number.isFinite(value) && value >= 0 ? value : null;
+    };
+    const linked = node.inputs?.findIndex((input) => input.name === "length_seconds" && input.link != null) ?? -1;
+    if (linked >= 0) return constant(upstreamAt(node, linked));
+    const value = Number(widgetByName(node, "length_seconds")?.value ?? 0);
+    return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function controlMapCurrent(control, lengthSeconds) {
+    if (lengthSeconds == null) return false;
+    const recipe = control?.map?.recipe;
+    if (!control?.map?.file || !recipe) return false;
+    const expected = controlSettings(control, lengthSeconds);
+    return ["mode", "resolution", "crop", "trim", "length_seconds"].every(
+        (key) => JSON.stringify(recipe[key] ?? null) === JSON.stringify(expected[key])
+    );
+}
+
+function controlRecipeFingerprint(recipe) {
+    const ordered = (value) => Array.isArray(value) ? value.map(ordered)
+        : value && typeof value === "object"
+            ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, ordered(value[key])]))
+            : value;
+    return JSON.stringify(ordered(recipe));
+}
+
+function canApplyControlMap(control, preparation, map, lengthSeconds) {
+    return lengthSeconds != null && !!control && !!map?.file
+        && control.preparation?.prompt_id === preparation.prompt_id
+        && controlSettingsFingerprint(control, lengthSeconds) === preparation.settings_fingerprint
+        && controlRecipeFingerprint(map.recipe) === controlRecipeFingerprint(preparation.recipe);
+}
+
+function controlHistoryState(history, promptId, outputNodeId) {
+    const entry = history?.[promptId];
+    if (!entry) return { state: "pending", map: null, message: "" };
+    const status = entry.status || {};
+    if (status.status_str === "error") {
+        const error = (status.messages || []).find(([type]) =>
+            type === "execution_error" || type === "execution_interrupted");
+        return { state: "failed", map: null,
+            message: error?.[1]?.exception_message || "Control preparation failed or was interrupted." };
+    }
+    if (!status.completed) return { state: "pending", map: null, message: "" };
+    const map = entry.outputs?.[String(outputNodeId)]?.control_map?.[0];
+    return map?.file
+        ? { state: "complete", map, message: "" }
+        : { state: "failed", map: null, message: "Preparation completed without a control map." };
+}
+
+async function queueControlPreparation(node, plan, expectedFingerprint) {
+    if (controlLength(node) == null) {
+        throw new Error("The linked length_seconds cannot be read before execution. Connect a PrimitiveFloat/PrimitiveNode duration or disconnect it and set length_seconds on the manager.");
+    }
+    if (controlSettingsFingerprint(node._mmrpRefs.control, controlLength(node)) !== expectedFingerprint) {
+        throw new Error("Control settings changed while preparing the job. Generate again.");
+    }
+    if (!plan.prompt || !plan.workflow || plan.output_node_id == null || !plan.recipe) {
+        throw new Error("The server returned an incomplete preparation workflow.");
+    }
+    const result = await api.queuePrompt(0, { output: plan.prompt, workflow: plan.workflow });
+    if (!result?.prompt_id) throw new Error("Preparation was not accepted by ComfyUI.");
+    // The request may finish after the user removes the control or changes its source.
+    // The queue entry remains visible in ComfyUI; its result cannot restore those edits.
+    if (!node._mmrpRefs.control
+        || controlSettingsFingerprint(node._mmrpRefs.control, controlLength(node)) !== expectedFingerprint) {
+        return null;
+    }
+    const preparation = {
+        prompt_id: result.prompt_id, output_node_id: String(plan.output_node_id),
+        recipe: plan.recipe, settings_fingerprint: expectedFingerprint, status: "queued",
+    };
+    node._mmrpRefs.control.preparation = preparation;
+    syncReferencesWidget(node);
+    renderNodeBody(node);
+    return preparation;
+}
+// <<< MMRP-CONTROL
+
+// >>> MMRP-CONTROL-RUNTIME
+async function controlRequest(path, options) {
+    const response = await api.fetchApi(`/minimax_refpack/control/${path}`, options);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `Control request failed: ${response.status}`);
+    return data;
+}
+
+function watchControlPreparation(node) {
+    const preparation = node._mmrpRefs.control?.preparation;
+    if (!preparation || preparation.error || node._mmrpControlWatcher === preparation.prompt_id) return;
+    node._mmrpControlWatcher = preparation.prompt_id;
+    const active = () => liveNodes.has(node)
+        && node._mmrpRefs.control?.preparation?.prompt_id === preparation.prompt_id;
+    const fail = (message) => {
+        if (!active()) return;
+        node._mmrpRefs.control.preparation.error = message;
+        syncReferencesWidget(node);
+        renderNodeBody(node);
+    };
+    (async () => {
+        let absent = 0;
+        for (let poll = 0; poll < 1800 && active(); poll++) {
+            try {
+                const response = await api.fetchApi(`/history/${encodeURIComponent(preparation.prompt_id)}`);
+                if (!response.ok) throw new Error(`History unavailable: ${response.status}`);
+                const result = controlHistoryState(await response.json(), preparation.prompt_id, preparation.output_node_id);
+                if (!active()) return;
+                if (result.state === "failed") { fail(result.message); return; }
+                if (result.state === "complete") {
+                    if (!canApplyControlMap(node._mmrpRefs.control, preparation, result.map, controlLength(node))) {
+                        fail("Settings changed or the returned recipe differs. Generate a new control map.");
+                        return;
+                    }
+                    node._mmrpRefs.control.map = takeControl(result.map);
+                    delete node._mmrpRefs.control.preparation;
+                    syncReferencesWidget(node);
+                    renderNodeBody(node);
+                    return;
+                }
+                const queueResponse = await api.fetchApi("/queue");
+                if (queueResponse.ok) {
+                    const queue = await queueResponse.json();
+                    const running = (queue.queue_running || []).some((item) => item[1] === preparation.prompt_id);
+                    const queued = (queue.queue_pending || []).some((item) => item[1] === preparation.prompt_id);
+                    absent = running || queued ? 0 : absent + 1;
+                    if (absent >= 3) { fail("Preparation left the queue without a result; it may have been cancelled or the server restarted."); return; }
+                    if (active()) {
+                        node._mmrpRefs.control.preparation.status = running ? "running" : "queued";
+                        delete node._mmrpRefs.control.preparation.notice;
+                    }
+                }
+            } catch (error) {
+                if (active()) node._mmrpRefs.control.preparation.notice = error.message;
+            }
+            node._mmrpControlUpdate?.();
+            await new Promise((resolve) => setTimeout(resolve, 1500));
+        }
+        if (active()) fail("Preparation is still pending after 45 minutes. Check ComfyUI history before generating another job.");
+    })().catch((error) => fail(error.message)).finally(() => {
+        if (node._mmrpControlWatcher === preparation.prompt_id) node._mmrpControlWatcher = null;
+    });
+}
+// <<< MMRP-CONTROL-RUNTIME
 
 // ---------------------------------------------------------------------------
 // Crop/trim pure helpers — fraction-space math only, no DOM, so a node harness
@@ -729,7 +942,7 @@ export function cropPreviewBox(crop, dw, dh) {
 }
 
 function emptyRefs() {
-    return { images: [], videos: [], audios: [], taskPlan: null };
+    return { images: [], videos: [], audios: [], taskPlan: null, control: null };
 }
 
 function cloneRefs(refs) {
@@ -744,6 +957,7 @@ function cloneRefs(refs) {
         videos: refs.videos.map(clone),
         audios: refs.audios.map(clone),
         taskPlan: refs.taskPlan ? { ...refs.taskPlan } : null,
+        control: takeControl(refs.control),
     };
 }
 
@@ -1986,6 +2200,17 @@ function renderNodeBody(node) {
         body.planButton.classList.toggle("mmrp-plan-error", !!state.error);
         body.planButton.title = state.error || "Choose what each reference contributes";
     }
+    if (body.controlsButton) {
+        const control = refs.control;
+        const pending = control?.preparation && !control.preparation.error;
+        const ready = controlMapCurrent(control, controlLength(node));
+        body.controlsButton.textContent = !control ? "Controls" : pending
+            ? "Controls: preparing" : ready ? `Controls: ${control.mode}` : "Controls: needs map";
+        body.controlsButton.title = "Prepare a separate Pose, Depth or Edges control video";
+        body.controlsButton.classList.toggle("mmrp-plan-error", !!control && !pending && !ready);
+    }
+    if (refs.control?.preparation && !refs.control.preparation.error) watchControlPreparation(node);
+    node._mmrpControlUpdate?.();
     syncProbes(node);
     scheduleDraw(node);
 }
@@ -2217,6 +2442,12 @@ function buildCustomBlock(node) {
     planButton.onclick = () => openTaskPlanModal(node);
     uploadRow.appendChild(planButton);
 
+    const controlsButton = document.createElement("button");
+    controlsButton.className = "mmrp-btn mmrp-upload-btn mmrp-plan-btn";
+    controlsButton.textContent = "Controls";
+    controlsButton.onclick = () => openControlModal(node);
+    uploadRow.appendChild(controlsButton);
+
     const saveConfigBtn = document.createElement("button");
     saveConfigBtn.className = "mmrp-btn mmrp-upload-btn";
     saveConfigBtn.textContent = "Save config";
@@ -2417,6 +2648,7 @@ function buildCustomBlock(node) {
         uploadButtons,
         fileInputs,
         planButton,
+        controlsButton,
         canvas,
         ctx: canvas.getContext("2d"),
         directionInput,
@@ -2435,7 +2667,10 @@ function buildCustomBlock(node) {
 let plannerModalSerial = 0;
 
 function createPlannerModal(title, extraClass = "") {
-    document.querySelectorAll(".mmrp-overlay.mmrp-planner-overlay").forEach((el) => el.remove());
+    document.querySelectorAll(".mmrp-overlay.mmrp-planner-overlay").forEach((el) => {
+        el.querySelector(".mmrp-modal")?.dispatchEvent(new Event("mmrp-modal-close"));
+        el.remove();
+    });
     const previouslyFocused = document.activeElement;
     const overlay = document.createElement("div");
     overlay.className = "mmrp-overlay mmrp-planner-overlay";
@@ -2482,6 +2717,7 @@ function createPlannerModal(title, extraClass = "") {
     };
     const close = () => {
         document.removeEventListener("keydown", onKey, true);
+        modal.dispatchEvent(new Event("mmrp-modal-close"));
         overlay.remove();
         if (previouslyFocused && typeof previouslyFocused.focus === "function") {
             previouslyFocused.focus();
@@ -2879,11 +3115,303 @@ async function openTaskPlanModal(node) {
         normalizePrimaryVideo(working);
         const state = deriveTaskPlanState(working);
         if (state.error) return;
+        working.control = takeControl(node._mmrpRefs.control);
         setWidget(node, "job_type", "auto");
         close();
         applyRefs(node, working);
     };
     update();
+}
+
+// ---------------------------------------------------------------------------
+// Controls: managed source, explicit preparation, then a reusable map preview.
+// ---------------------------------------------------------------------------
+
+function controlFileUrl(file) {
+    const parts = String(file || "").split("/");
+    const filename = parts.pop();
+    const query = new URLSearchParams({ filename, type: "input" });
+    if (parts.length) query.set("subfolder", parts.join("/"));
+    return `/view?${query}`;
+}
+
+async function openControlModal(node) {
+    const { modal, close } = createPlannerModal("Control video", "mmrp-control-modal");
+    let draft = takeControl(node._mmrpRefs.control) || {
+        file: "", mode: "pose", resolution: 512, trim: null, crop: null, map: null,
+    };
+    let modes = [];
+    let busy = false;
+    let message = "Loading available processors…";
+    let sourceRevision = 0;
+    const hint = document.createElement("div");
+    hint.className = "mmrp-modal-hint";
+    hint.textContent = "Drop a source video here or select one below. Generate queues only control preparation; rendering stays a separate action. Pose and Depth use optional controlnet_aux processors and may download missing detector weights. Changes are saved immediately; closing keeps the preparation job.";
+    modal.appendChild(hint);
+
+    const fields = document.createElement("div");
+    fields.className = "mmrp-plan-controls";
+    const field = (label, element) => {
+        const wrapper = document.createElement("label");
+        wrapper.textContent = label;
+        element.setAttribute("aria-label", label);
+        wrapper.appendChild(element);
+        fields.appendChild(wrapper);
+        return element;
+    };
+    const source = field("Source video", document.createElement("select"));
+    source.className = "mmrp-source-select";
+    const mode = field("Control type", document.createElement("select"));
+    for (const [id, label] of [["pose", "Pose"], ["depth", "Depth"], ["edges", "Edges"]]) {
+        const option = document.createElement("option");
+        option.value = id;
+        option.textContent = label;
+        mode.appendChild(option);
+    }
+    const resolution = field("Detection resolution", document.createElement("select"));
+    for (const size of [...new Set([256, 512, 768, 1024, Number(draft.resolution)])].sort((a, b) => a - b)) {
+        const option = document.createElement("option");
+        option.value = String(size);
+        option.textContent = `${size} px`;
+        resolution.appendChild(option);
+    }
+    const numeric = (label, minimum = 0, maximum = null) => {
+        const input = field(label, document.createElement("input"));
+        input.className = "mmrp-source-select";
+        input.type = "number";
+        input.step = "any";
+        input.min = String(minimum);
+        if (maximum != null) input.max = String(maximum);
+        return input;
+    };
+    const trimStart = numeric("Trim start (seconds; blank = full clip)");
+    const trimEnd = numeric("Trim end (seconds)");
+    const crop = ["Crop X", "Crop Y", "Crop width", "Crop height"].map((label) => numeric(`${label} (0–1; blank = full frame)`, 0, 1));
+    modal.appendChild(fields);
+
+    const previews = document.createElement("div");
+    previews.className = "mmrp-plan-controls";
+    const preview = (title) => {
+        const panel = document.createElement("div");
+        panel.className = "mmrp-plan-asset";
+        const label = document.createElement("strong");
+        label.textContent = title;
+        const video = document.createElement("video");
+        video.controls = true;
+        video.muted = true;
+        video.preload = "metadata";
+        video.style.width = "100%";
+        video.style.maxHeight = "240px";
+        video.style.objectFit = "contain";
+        panel.appendChild(label);
+        panel.appendChild(video);
+        previews.appendChild(panel);
+        return video;
+    };
+    const sourcePreview = preview("Source video");
+    const mapPreview = preview("Prepared control map");
+    modal.addEventListener("mmrp-modal-close", () => {
+        sourcePreview.pause();
+        mapPreview.pause();
+        if (node._mmrpControlUpdate === update) node._mmrpControlUpdate = null;
+    });
+    modal.appendChild(previews);
+    sourcePreview.onloadedmetadata = () => {
+        sourcePreview.currentTime = (node._mmrpRefs.control || draft).trim?.[0] || 0;
+    };
+    sourcePreview.ontimeupdate = () => {
+        const trim = (node._mmrpRefs.control || draft).trim;
+        if (trim && sourcePreview.currentTime >= trim[1]) {
+            sourcePreview.pause();
+            sourcePreview.currentTime = trim[0];
+        }
+    };
+
+    const status = document.createElement("div");
+    status.className = "mmrp-plan-status";
+    status.setAttribute("role", "status");
+    modal.appendChild(status);
+    const footer = document.createElement("div");
+    footer.className = "mmrp-modal-footer";
+    const button = (label, onclick) => {
+        const element = document.createElement("button");
+        element.className = "mmrp-btn";
+        element.textContent = label;
+        element.onclick = onclick;
+        footer.appendChild(element);
+        return element;
+    };
+    const uploadInput = document.createElement("input");
+    uploadInput.type = "file";
+    uploadInput.accept = "video/*,.mkv,.webm,.avi,.mov,.mp4";
+    uploadInput.hidden = true;
+    modal.appendChild(uploadInput);
+    const upload = button("Upload source…", () => uploadInput.click());
+    const remove = button("Remove control", () => {
+        node._mmrpRefs.control = null;
+        draft = { file: "", mode: "pose", resolution: 512, trim: null, crop: null, map: null };
+        message = "Control removed. Any already queued preparation remains in ComfyUI's queue.";
+        syncReferencesWidget(node);
+        renderNodeBody(node);
+    });
+    const generate = button("Generate control map", async () => {
+        busy = true;
+        message = "Preparing the control job…";
+        update();
+        try {
+            if (controlLength(node) == null) {
+                throw new Error("The linked length_seconds cannot be read before execution. Use a PrimitiveFloat/PrimitiveNode duration or disconnect it and set the manager's length_seconds.");
+            }
+            const control = takeControl(node._mmrpRefs.control);
+            const expected = controlSettingsFingerprint(control, controlLength(node));
+            const plan = await controlRequest("prepare", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ control, length_seconds: controlLength(node) }),
+            });
+            const pending = await queueControlPreparation(node, plan, expected);
+            message = pending ? "" : "The preparation was queued, but its result will be ignored because the control changed.";
+        } catch (error) {
+            message = error.message || error.response?.error?.message || "Preparation could not be queued. Check ComfyUI's queue before retrying.";
+        } finally {
+            busy = false;
+            update();
+        }
+    });
+    generate.classList.add("mmrp-btn-primary");
+    button("Close", close);
+    modal.appendChild(footer);
+
+    const setControl = (changes) => {
+        const next = changeControlSettings(node._mmrpRefs.control || draft, changes);
+        draft = next;
+        node._mmrpRefs.control = next.file ? next : null;
+        message = "";
+        syncReferencesWidget(node);
+        renderNodeBody(node);
+        update();
+    };
+    source.onchange = () => setControl({ file: source.value, trim: null, crop: null });
+    mode.onchange = () => setControl({ mode: mode.value });
+    resolution.onchange = () => setControl({ resolution: Number(resolution.value) });
+    const saveEdits = () => setControl({
+        trim: trimStart.value === "" && trimEnd.value === "" ? null
+            : [Number(trimStart.value), Number(trimEnd.value)],
+        crop: crop.every((input) => input.value === "") ? null
+            : crop.map((input, index) => input.value === "" ? (index < 2 ? 0 : 1) : Number(input.value)),
+    });
+    for (const input of [trimStart, trimEnd, ...crop]) input.onchange = saveEdits;
+    const uploadSource = async (files) => {
+        const list = Array.from(files || []);
+        if (list.length !== 1 || !isVideoFile(list[0].name)) {
+            message = "Choose or drop one source video.";
+            update();
+            return;
+        }
+        busy = true;
+        message = "Uploading source video…";
+        const expected = controlSettingsFingerprint(node._mmrpRefs.control || draft, controlLength(node));
+        update();
+        try {
+            const file = await apiUpload(list[0]);
+            if (controlSettingsFingerprint(node._mmrpRefs.control || draft, controlLength(node)) !== expected) {
+                message = "The source was uploaded, but control settings changed while uploading. Select the uploaded file to use it.";
+                const option = document.createElement("option");
+                option.value = file;
+                option.textContent = file;
+                if (![...source.options].some((item) => item.value === file)) source.appendChild(option);
+                return;
+            }
+            sourceRevision += 1;
+            const next = changeControlSettings(node._mmrpRefs.control || draft, {
+                file, trim: null, crop: null, map: null,
+            });
+            // Upload overwrites the managed file; the same filename still needs a new map.
+            delete next.preparation;
+            draft = next;
+            node._mmrpRefs.control = next;
+            const option = document.createElement("option");
+            option.value = file;
+            option.textContent = file;
+            if (![...source.options].some((item) => item.value === file)) source.appendChild(option);
+            message = "";
+            syncReferencesWidget(node);
+            renderNodeBody(node);
+        } catch (error) { message = error.message; }
+        finally { busy = false; uploadInput.value = ""; update(); }
+    };
+    uploadInput.onchange = () => uploadSource(uploadInput.files);
+    modal.ondragover = (event) => { event.preventDefault(); event.stopPropagation(); };
+    modal.ondrop = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!busy) uploadSource(event.dataTransfer.files);
+    };
+
+    const update = () => {
+        if (!modal.isConnected) {
+            sourcePreview.pause();
+            mapPreview.pause();
+            if (node._mmrpControlUpdate === update) node._mmrpControlUpdate = null;
+            return;
+        }
+        const control = node._mmrpRefs.control || draft;
+        source.value = control.file;
+        mode.value = control.mode;
+        resolution.value = String(control.resolution);
+        [trimStart, trimEnd].forEach((input, i) => {
+            if (document.activeElement !== input) input.value = control.trim?.[i] ?? "";
+        });
+        crop.forEach((input, i) => {
+            if (document.activeElement !== input) input.value = control.crop?.[i] ?? "";
+        });
+        const capability = modes.find((item) => item.id === control.mode);
+        const pending = control.preparation && !control.preparation.error;
+        const ready = controlMapCurrent(control, controlLength(node));
+        const unresolvedLength = controlLength(node) == null;
+        const error = unresolvedLength
+            ? "The linked length_seconds cannot be read before execution. Use a PrimitiveFloat/PrimitiveNode duration or disconnect it and set the manager's length_seconds."
+            : control.preparation?.error || (!ready && !pending && !capability?.available ? capability?.reason : "");
+        status.textContent = message || error || (pending
+            ? `${control.preparation.status === "running" ? "Preparing" : "Queued"}: ${control.preparation.prompt_id}${control.preparation.notice ? ` — ${control.preparation.notice}` : ""}`
+            : ready ? `Ready: ${control.map.frame_count} frames at ${control.map.fps} fps, ${control.map.width} × ${control.map.height}. Preview the map, then queue your render.`
+            : control.file ? "Generate a control map for these settings before rendering." : "Choose or drop a source video.");
+        status.classList.toggle("mmrp-plan-status-error", !!error);
+        generate.disabled = busy || !!pending || unresolvedLength || !control.file || !capability?.available;
+        upload.disabled = busy;
+        remove.disabled = !node._mmrpRefs.control;
+        const sourceUrl = control.file ? `${controlFileUrl(control.file)}&revision=${sourceRevision}` : "";
+        const mapUrl = ready ? controlFileUrl(control.map.file) : "";
+        for (const [video, url] of [[sourcePreview, sourceUrl], [mapPreview, mapUrl]]) {
+            if (video.dataset.source !== url) {
+                video.pause();
+                video.dataset.source = url;
+                if (url) video.src = url;
+                else { video.removeAttribute("src"); video.load(); }
+            }
+            video.hidden = !url;
+        }
+    };
+    node._mmrpControlUpdate = update;
+    const listed = await Promise.allSettled([apiListFiles("video"), controlRequest("capabilities")]);
+    if (!modal.isConnected) return;
+    const files = listed[0].status === "fulfilled" ? listed[0].value : [];
+    appendFileOptions(source, files, node._mmrpRefs.control?.file || draft.file);
+    const empty = document.createElement("option");
+    empty.value = "";
+    empty.textContent = "Choose a source video…";
+    source.prepend(empty);
+    if (listed[1].status === "fulfilled") modes = listed[1].value.modes || [];
+    else message = listed[1].reason.message;
+    if (listed[0].status === "rejected") message = `Source listing failed: ${listed[0].reason.message}. You can still upload a video.`;
+    else if (listed[1].status === "fulfilled") message = "";
+    for (const option of mode.options) {
+        const capability = modes.find((item) => item.id === option.value);
+        option.disabled = !capability?.available;
+        option.title = capability?.reason || "";
+        option.textContent = `${capability?.label || option.textContent}${capability?.available ? "" : " (unavailable)"}`;
+    }
+    update();
+    watchControlPreparation(node);
 }
 
 // ---------------------------------------------------------------------------
@@ -2916,6 +3444,9 @@ function buildConfig(node, name) {
         references: envelope.references,
     };
     if (envelope.task_plan) config.task_plan = envelope.task_plan;
+    if (envelope.control) config.control = envelope.control;
+    const lengthSeconds = controlLength(node);
+    if (lengthSeconds != null) config.length_seconds = lengthSeconds;
     return config;
 }
 
@@ -3038,12 +3569,20 @@ async function applyConfig(node, data, sourceLabel) {
     const missing = await missingFiles(data.references);
     const list = data.references.map((r) => ({ ...r, missing: missing.has(r.file) }));
     node._mmrpSelected = null;
-    applyRefs(node, fromReferencesEnvelope({ references: list, task_plan: data.task_plan }));
+    applyRefs(node, fromReferencesEnvelope({ references: list, task_plan: data.task_plan, control: data.control }));
 
     const directionWidget = widgetByName(node, "direction");
     if (directionWidget && typeof data.direction === "string") {
         directionWidget.value = data.direction;
         if (node._mmrpBody) node._mmrpBody.directionInput.value = data.direction;
+    }
+    // Do not overwrite a linked duration node. Its visible constant remains the
+    // authority; the map's recipe will show if a portable config needs regeneration.
+    const linkedLength = node.inputs?.some((input) => input.name === "length_seconds" && input.link != null);
+    if (!linkedLength && typeof data.length_seconds === "number"
+        && Number.isFinite(data.length_seconds) && data.length_seconds >= 0) {
+        setWidget(node, "length_seconds", data.length_seconds);
+        renderNodeBody(node);
     }
 
     // A config written before these fields existed carries "" — leave the widget alone
@@ -4170,6 +4709,7 @@ app.registerExtension({
             const origOnConfigure = node.onConfigure;
             node.onConfigure = function (info) {
                 const out = origOnConfigure ? origOnConfigure.apply(this, arguments) : undefined;
+                ensureControlOutput(this);
                 // configure() has just applied widgets_values POSITIONALLY, which for any
                 // graph saved before 0.3.3 means the values landed in the wrong widgets.
                 // The original array is still on `info`, so re-place it by name from the

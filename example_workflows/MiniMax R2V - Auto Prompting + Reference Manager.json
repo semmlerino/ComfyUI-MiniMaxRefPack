@@ -1485,11 +1485,16 @@
           "links": [
             415
           ]
+        },
+        {
+          "name": "control_video",
+          "type": "IMAGE",
+          "links": null
         }
       ],
       "properties": {
         "cnr_id": "comfyui-minimaxrefpack",
-        "ver": "0.4.3",
+        "ver": "0.5.0",
         "Node name for S&R": "MiniMaxH3ReferencePack"
       },
       "widgets_values": [

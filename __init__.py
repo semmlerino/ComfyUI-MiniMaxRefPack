@@ -7,9 +7,14 @@
 try:
     from .minimax_refpack import prefetch, routes
     from .minimax_refpack.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, PREFETCHER
+    from .minimax_refpack import control_nodes
 except ImportError:  # pragma: no cover - test-time import path
     from minimax_refpack import prefetch, routes
     from minimax_refpack.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, PREFETCHER
+    from minimax_refpack import control_nodes
+
+NODE_CLASS_MAPPINGS = {**NODE_CLASS_MAPPINGS, **control_nodes.NODE_CLASS_MAPPINGS}
+NODE_DISPLAY_NAME_MAPPINGS = {**NODE_DISPLAY_NAME_MAPPINGS, **control_nodes.NODE_DISPLAY_NAME_MAPPINGS}
 
 # Builds the next queued job's reference pack while the current one renders. A no-op
 # outside a running ComfyUI (no `server` module) and under MINIMAX_REFPACK_PREFETCH=0.

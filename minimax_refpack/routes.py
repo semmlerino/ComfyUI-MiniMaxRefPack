@@ -15,13 +15,14 @@ which mirrors the containment check ComfyUI's own upload route uses:
 
 from __future__ import annotations
 
+import asyncio
 import math
 import os
 
 from aiohttp import web
 
 from .refs import ReferenceError, validate_crop
-from . import endpoint, logs, media, prompt
+from . import controls, endpoint, logs, media, prompt
 
 try:
     from server import PromptServer
@@ -207,6 +208,28 @@ async def detect_route(request):
     return web.json_response({"servers": prompt.detect_local_servers()})
 
 
+# ---- explicit control preparation ---------------------------------------------
+
+
+async def control_capabilities_route(request):
+    return web.json_response(controls.capabilities())
+
+
+async def control_prepare_route(request):
+    """Return a preparation-only graph; the explicit UI action owns its submission."""
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise controls.ControlError("control preparation body must be an object")
+        result = await asyncio.to_thread(
+            controls.preparation_graph, body.get("control"),
+            folder_paths.get_input_directory(), body.get("length_seconds", 0),
+        )
+        return web.json_response(result)
+    except (ValueError, TypeError) as error:
+        return web.json_response({"error": str(error)}, status=400)
+
+
 # ---- registration -------------------------------------------------------------
 
 _ROUTES: tuple[tuple[str, str, object], ...] = (
@@ -215,9 +238,11 @@ _ROUTES: tuple[tuple[str, str, object], ...] = (
     ("GET", "/minimax_refpack/files", list_files_route),
     ("GET", "/minimax_refpack/system_prompt", system_prompt_route),
     ("GET", "/minimax_refpack/detect", detect_route),
+    ("GET", "/minimax_refpack/control/capabilities", control_capabilities_route),
+    ("POST", "/minimax_refpack/control/prepare", control_prepare_route),
 )
 
 if PromptServer is not None and getattr(PromptServer, "instance", None) is not None:
-    _method_fn = {"GET": PromptServer.instance.routes.get}
+    _method_fn = {"GET": PromptServer.instance.routes.get, "POST": PromptServer.instance.routes.post}
     for _method, _path, _handler in _ROUTES:
         _method_fn[_method](_path)(_handler)

@@ -19,7 +19,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from . import endpoint, logs, media, prefetch, prompt, refs, rewrite_pins, wired
+from . import controls, endpoint, logs, prefetch, prompt, refs, rewrite_pins, wired
+from . import media  # noqa: F401 - public loader patch seam retained for existing clients/tests
 
 # Default long-edge cap for reference IMAGES. Named rather than inlined because it is
 # the widget default AND the fallback when a workflow saved before the widget existed
@@ -130,6 +131,7 @@ def _files_signature(reference_set: refs.ReferenceSet, input_dir: str) -> str:
             h.update(f"{r.file}:{st.st_mtime_ns}:{st.st_size}".encode("utf-8"))
         except OSError:
             h.update(f"{r.file}:missing".encode("utf-8"))
+    h.update(controls.file_signature(reference_set.control, input_dir).encode("utf-8"))
     return h.hexdigest()
 
 
@@ -421,12 +423,18 @@ class MiniMaxH3ReferencePack:
         )
 
         outputs = refs.empty_outputs()
+        aspect_source = None  # (tag, frames, preferred) of the video the frame follows
+        if reference_set.control is not None:
+            control_frames = controls.load_ready(
+                reference_set.control, input_dir, length_seconds, cache
+            )
+            outputs[refs.slot_index("control_video")] = control_frames
+            aspect_source = ("control map", control_frames, True)
         # ONE cache for this build and no longer. The prompt writer needs the same pixels
         # the sockets do, and before this it fetched its own copy of every one of them.
         # It must not outlive the build: the browser re-uploads an edited reference under
         # the same filename with overwrite=true, which is exactly why IS_CHANGED above
         # hashes mtime+size rather than trusting the name.
-        aspect_source = None  # (tag, frames) of the video the frame follows
         for tagged in reference_set.assign_tags():
             path = os.path.join(input_dir, tagged.file)
             logs.log(
@@ -509,6 +517,10 @@ class MiniMaxH3ReferencePack:
             f"system_prompt: {prompt_src}",
             f"references: {len(reference_set.references)} "
             f"({', '.join(f'{t.tag} {t.file}' for t in reference_set.assign_tags()) or 'none'})",
+            "control: " + (
+                f"{reference_set.control['mode']} {reference_set.control['map']['file']}"
+                if reference_set.control is not None else "none"
+            ),
         ]
 
         if provider == "none":

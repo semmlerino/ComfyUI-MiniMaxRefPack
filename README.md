@@ -7,7 +7,8 @@ One node that manages every reference for **MiniMax H3 Reference to Video**, wri
 ## Features
 
 - **Select or upload instead of wiring.** Use each asset's source dropdown for files already in ComfyUI's input directory, use the upload buttons for new files, or drop a mixed group anywhere on the node. Preview them, play them and delete them without loader nodes or links.
-- **20 outputs, wired once.** Connect the 18 reference sockets plus `prompt` into `MiniMax H3 Reference to Video` and save the workflow. Change your references as often as you like, the graph never changes.
+- **References and controls, wired once.** Connect the 18 reference sockets plus `prompt` into `MiniMax H3 Reference to Video`. The `width` / `height` outputs carry the target canvas; the appended `control_video` output connects to native **Apply MiniMax H3 Fun ControlNet**. Existing output slots retain their positions.
+- **Prepare a control map from a source video.** Open **Controls**, drop or select a clip, choose Pose, Depth or Edges, and click **Generate control map**. Preview the finished map before queueing the render separately. Control videos do not consume reference tags or soundtrack slots.
 - **Auto prompting.** A multimodal model looks at your references, reads your direction text, and writes a full MiniMax H3 prompt in the exact six-section format the model expects.
 - **Run it on your own machine.** `prompt_provider: local` points the prompt writer at any OpenAI-compatible server, so auto prompting needs no account and no key, and your references never leave the machine. Ollama, LM Studio, llama.cpp, vLLM, or anything else that speaks the same API.
 - **It finds your server for you.** The **Local LLM** button sweeps the usual local ports, lists every server that answered and the models it holds, and fills in the URL and the model id in one click, so you never have to go looking for a base URL yourself. The scan is loopback-only and never resolves a hostname, so it cannot be turned into a port scanner.
@@ -30,7 +31,7 @@ No. `prompt_provider` picks who writes the prompt, and two of its three settings
 | `local` | Any OpenAI-compatible server on your own machine writes it. Nothing leaves the machine. | No |
 | `none` | No call at all. Your `direction` text becomes the `prompt` output, word for word. | No |
 
-Whichever you pick, you keep the whole reference manager: the uploads, the previews, the crop and trim editor, the `<Picture 2>` / `<Video 1>` / `<Audio 1>` tags, the portable configs, all 20 outputs wired once.
+Whichever you pick, you keep the whole reference manager: uploads, previews, crop and trim, reference tags, portable configs and ControlNet preparation.
 
 **Don't like the prompt it writes?** Open the node's settings modal and edit `system_prompt`. A nonblank value is a complete override and is saved with the workflow. Leave it blank to use the official shared base plus the overlays selected by the task plan.
 
@@ -41,6 +42,16 @@ The upload buttons and drag/drop behave as before. The small `+` at the end of e
 Open **Plan** to work asset-first. Every attached asset has its own source dropdown and may have more than one role. When several videos are attached, designate the one that is directly edited or continued as the primary video. In explicit mode, the role set mechanically derives the prompt prefix; for example, a primary edit video, an appearance image and a retained soundtrack produce `[video editing + reference generation + audio reuse]`. Explicit plans skip the classifier call.
 
 Only one video may be the direct editing or continuation source. On **Apply plan**, the designated primary moves to the first video position so the official prompt can address it as `<Video 1>`; the other videos keep their relative order and can still provide reference-generation guidance for motion, camera or temporal structure. A video's audio roles apply to the synchronized soundtrack controlled by that tile's mute chip; a muted video carries no audio roles.
+
+## ControlNet preparation
+
+**Controls** manages one control source independently of ordinary references. Source selection, trim, crop, detection resolution, the prepared map and its recipe survive workflow and config save/load. Changing the source, preparation settings or target duration requires a new map; modified source or map files are rejected at rendering. Removing the control disables its output. A queued preparation stays visible in ComfyUI's queue when the dialog closes; its result is recovered when available.
+
+**Generate control map** queues a separate source → preprocessor → save job through ComfyUI. It never queues the H3 render. Edges uses core Canny. Pose uses `DWPreprocessor` and Depth uses `DepthAnythingV2Preprocessor` from optional `comfyui_controlnet_aux`; unavailable processors are identified in the dialog, and those existing nodes may download missing detector weights when preparation is queued. No detector dependencies are added to RefPack.
+
+Maps are stored under `input/control_maps/` as high-quality H.264 at 24 fps, with a content hash and source/recipe receipt. Preparation matches H3's rounded `17k+5` target frame count; a shorter source holds its final frame. Connect the appended `control_video` IMAGE output to native `MiniMaxH3FunControlNetApply.control_video`, with the video VAE and a Union patch loaded through `ModelPatchLoader`. Connect that node's model output to the guider. Strength and its start/end schedule stay on the native apply node. When `match_video_aspect` is enabled, the control map sets the canvas aspect ahead of ordinary reference videos.
+
+Prepared maps can render on an install without the detector used to create them. Carry both source and map with the config: the receipt verifies their exact bytes. The MiniMax repository's pod outbox and ControlNet companion support this transport; older outbox versions only capture ordinary references. Restart ComfyUI after updating RefPack to register the preparation nodes and new output. Real detector execution and H3 render quality require GPU validation beyond the automated tests.
 
 ## Running it locally
 

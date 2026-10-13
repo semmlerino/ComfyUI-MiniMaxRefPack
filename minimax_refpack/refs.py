@@ -24,6 +24,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Literal
 
+from . import controls
+
 Kind = Literal["image", "video", "audio"]
 
 # Hard caps, from the Autogrow group definitions at nodes_minimax_h3.py:183,187,191,195.
@@ -254,6 +256,8 @@ class ReferenceSet:
     # None is deliberately different from TaskPlan(mode="auto"): None means a workflow
     # saved before task plans existed, whose job_type widget must retain its old routing.
     task_plan: TaskPlan | None = None
+    # Control maps are distinct from references: no numbered tag, prompt role or cap.
+    control: dict[str, Any] | None = None
 
     # ---- construction -------------------------------------------------------
 
@@ -275,21 +279,26 @@ class ReferenceSet:
     def from_obj(cls, data: Any) -> "ReferenceSet":
         """Accept either a bare list of references or a {"references": [...]} envelope."""
         task_plan = None
+        control = None
         if isinstance(data, dict):
             if "task_plan" in data:
                 task_plan = TaskPlan.from_dict(data["task_plan"])
+            control = controls.normalize_control(data.get("control"))
             data = data.get("references", [])
         if not isinstance(data, list):
             raise ReferenceError("references must be a list")
         return cls(
             [Reference.from_dict(d) for d in data if isinstance(d, dict)],
             task_plan=task_plan,
+            control=control,
         )
 
     def to_json(self) -> str:
         out: dict[str, Any] = {"references": [r.to_dict() for r in self.references]}
         if self.task_plan is not None:
             out["task_plan"] = self.task_plan.to_dict()
+        if self.control is not None:
+            out["control"] = controls.normalize_control(self.control)
         return json.dumps(out)
 
     # ---- queries ------------------------------------------------------------
@@ -307,6 +316,8 @@ class ReferenceSet:
         """Raise if the set exceeds MiniMax's hard caps."""
         if self.task_plan is not None:
             self.task_plan.validate()
+        if self.control is not None:
+            controls.normalize_control(self.control)
         for reference in self.references:
             validate_roles(reference.kind, reference.roles)
             if not isinstance(reference.primary, bool):
@@ -374,7 +385,7 @@ class ReferenceSet:
 # ---- output socket names ---------------------------------------------------
 
 def output_names() -> tuple[str, ...]:
-    """The node's 22 outputs, in declaration order.
+    """The node's append-only outputs, in declaration order.
 
     image_1..9 -> ref_images.ref_image_0..8
     video_1..3 -> ref_videos.ref_video_0..2
@@ -383,6 +394,7 @@ def output_names() -> tuple[str, ...]:
     prompt -> the MiniMax node's prompt widget
     debug -> the full payload that went to the LLM, for a preview/console node
     width, height -> the frame the prompt was written for; wire them into MiniMax's node
+    control_video -> prepared control-map frames for native MiniMax ControlNet Apply
 
     APPEND-ONLY. ComfyUI stores a link by its output SLOT INDEX, so inserting a socket
     anywhere but the end silently re-points every existing link in a saved workflow.
@@ -395,11 +407,12 @@ def output_names() -> tuple[str, ...]:
     names += [f"audio_{i}" for i in range(1, MAX_AUDIOS + 1)]
     names += _STRING_OUTPUTS
     names += _FRAME_OUTPUTS
+    names += ("control_video",)
     return tuple(names)
 
 
-# The trailing sockets, in output_names() order. Everything before them is a media
-# socket that starts as None; the strings start as "" and the frame as 0.
+# Non-media defaults, in their original output_names() order. Appended media starts
+# as None; the strings start as "" and the target frame dimensions as 0.
 _STRING_OUTPUTS = ("prompt", "debug")
 _FRAME_OUTPUTS = ("width", "height")
 
@@ -411,6 +424,7 @@ def output_types() -> tuple[str, ...]:
     types += ["AUDIO"] * MAX_AUDIOS
     types += ["STRING"] * len(_STRING_OUTPUTS)
     types += ["INT"] * len(_FRAME_OUTPUTS)
+    types += ["IMAGE"]
     return tuple(types)
 
 
@@ -421,10 +435,8 @@ def slot_index(name: str) -> int:
 
 def empty_outputs() -> list[Any]:
     """A full output tuple of Nones, plus empty strings for prompt/debug and a 0x0 frame."""
-    out: list[Any] = [None] * (len(output_names()) - len(_STRING_OUTPUTS) - len(_FRAME_OUTPUTS))
-    out += [""] * len(_STRING_OUTPUTS)
-    out += [0] * len(_FRAME_OUTPUTS)
-    return out
+    return ["" if name in _STRING_OUTPUTS else 0 if name in _FRAME_OUTPUTS else None
+            for name in output_names()]
 
 
 def iter_kind_slots(kind: Kind) -> Iterable[str]:
