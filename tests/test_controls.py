@@ -150,7 +150,7 @@ def test_manager_requires_map_before_rendering(prepared, monkeypatch):
     control["map"] = None
     monkeypatch.setattr(nodes, "_provider_of", lambda *args: "none")
     monkeypatch.setitem(sys.modules, "folder_paths", types.SimpleNamespace(get_input_directory=lambda: str(directory)))
-    with pytest.raises(controls.ControlError, match="Generate control map"):
+    with pytest.raises(controls.ControlError, match="click Generate"):
         nodes.MiniMaxH3ReferencePack().build(references_json=json.dumps({"control": control}), length_seconds=1)
 
 

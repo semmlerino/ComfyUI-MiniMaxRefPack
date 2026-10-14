@@ -752,7 +752,7 @@ async function queueControlPreparation(node, plan, expectedFingerprint, operatio
         throw new Error("The linked length_seconds cannot be read before execution. Connect a PrimitiveFloat/PrimitiveNode duration or disconnect it and set length_seconds on the manager.");
     }
     if (controlInputType(node._mmrpRefs.control) === "map") {
-        throw new Error("Use control map to validate an existing map without detector preparation.");
+        throw new Error("Check map validates an existing map without detector preparation.");
     }
     if ((operation != null && node._mmrpControlOperation !== operation)
         || controlSettingsFingerprint(node._mmrpRefs.control, controlLength(node)) !== expectedFingerprint) {
@@ -778,6 +778,76 @@ async function queueControlPreparation(node, plan, expectedFingerprint, operatio
     syncReferencesWidget(node);
     renderNodeBody(node);
     return preparation;
+}
+
+const CONTROL_MODE_LABELS = { pose: "Pose", depth: "Depth", edges: "Edges" };
+
+// controls.target_frames: 24 fps, rounded UP to MiniMax's 17k+5 grid; 0 = clip-driven.
+function controlTargetFrames(lengthSeconds) {
+    const seconds = Number(lengthSeconds);
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    // Python's round() is half-to-even: 0.9375 s is 22.5 frames and rounds to 22, not 23.
+    const raw = seconds * 24;
+    const floor = Math.floor(raw);
+    const rounded = raw - floor !== 0.5 ? Math.round(raw) : floor % 2 === 0 ? floor : floor + 1;
+    const count = Math.max(5, rounded);
+    return 5 + Math.floor((count - 5 + 16) / 17) * 17;
+}
+
+// The dialog's length line. `spanSeconds` is the trimmed clip (null until its
+// duration is known). A short clip holds its last frame; a long one is cut.
+function controlLengthFact(lengthSeconds, spanSeconds) {
+    if (lengthSeconds == null) {
+        return { level: "warn", head: "Render length unknown.",
+            detail: "The linked length_seconds cannot be read before the graph runs. Feed it from a PrimitiveFloat or PrimitiveNode, or disconnect it and set length_seconds on the manager." };
+    }
+    if (lengthSeconds > 0 && lengthSeconds < 5 / 24) {
+        return { level: "warn", head: `Render ${Number(lengthSeconds).toFixed(2)} s is too short.`,
+            detail: "A control map needs at least 5 frames at 24 fps (0.21 s)." };
+    }
+    const frames = controlTargetFrames(lengthSeconds);
+    if (frames == null) {
+        return { level: "ok", head: "length_seconds is 0.",
+            detail: "The map keeps the clip's own length, cut down to MiniMax's 17k+5 frame grid." };
+    }
+    const head = `Render ${Number(lengthSeconds).toFixed(1)} s → ${frames} frames at 24 fps.`;
+    if (spanSeconds == null || !(spanSeconds > 0)) return { level: "ok", head, detail: "" };
+    const spanFrames = Math.round(spanSeconds * 24);
+    if (spanFrames < frames) {
+        return { level: "warn", head, detail: `The clip gives ${spanSeconds.toFixed(2)} s; the map holds its last frame for the final ${((frames - spanFrames) / 24).toFixed(2)} s.` };
+    }
+    const extra = (spanFrames - frames) / 24;
+    return { level: "ok", head, detail: extra >= 0.05
+        ? `The last ${extra.toFixed(2)} s of the clip are not used.`
+        : "The clip covers it." };
+}
+
+// Nodes fed by the appended control_video output, as {type, title}.
+function controlOutputTargets(node) {
+    const output = (node.outputs || []).find((item) => item.name === "control_video");
+    const graph = node.graph;
+    return (output?.links || []).map((id) => {
+        const link = graph?.links?.get?.(id) || graph?.links?.[id];
+        const target = link ? graph?.getNodeById?.(link.target_id) : null;
+        return target ? { type: target.comfyClass || target.type, title: target.title || target.type } : null;
+    }).filter(Boolean);
+}
+
+// What differs between the settings a map was made for and the current ones, worded
+// for "You changed … after this map was made".
+function controlChangedSettings(previous, control, lengthSeconds) {
+    const recipe = previous?.map?.recipe;
+    if (!recipe) return [];
+    const now = controlSettings(control, lengthSeconds);
+    const same = (key) => JSON.stringify(recipe[key] ?? null) === JSON.stringify(now[key] ?? null);
+    const changed = [];
+    if ((previous.file || "") !== now.file) changed.push("the file");
+    if (!same("mode")) changed.push("the control type");
+    if (!same("resolution")) changed.push("the resolution");
+    if (!same("crop")) changed.push("the crop");
+    if (!same("trim")) changed.push("the trim");
+    if (lengthSeconds != null && !same("length_seconds")) changed.push("the render length");
+    return changed;
 }
 // <<< MMRP-CONTROL
 
@@ -810,7 +880,7 @@ async function useExistingControlMap(node) {
     const imported = takeControl(data.control);
     if (!imported || controlSettingsFingerprint(imported, lengthSeconds) !== expected
         || !controlMapCurrent(imported, lengthSeconds)) {
-        throw new Error("The server returned a control map for different settings. Use control map again.");
+        throw new Error("The server returned a control map for different settings. Check the map again.");
     }
     node._mmrpRefs.control = imported;
     syncReferencesWidget(node);
@@ -2256,21 +2326,31 @@ function renderNodeBody(node) {
         body.planButton.classList.toggle("mmrp-plan-error", !!state.error);
         body.planButton.title = state.error || "Choose what each reference contributes";
     }
-    if (body.controlsButton) {
-        const control = refs.control;
-        const imported = controlInputType(control) === "map";
-        const pending = control?.preparation && !control.preparation.error;
-        const ready = controlMapCurrent(control, controlLength(node));
-        body.controlsButton.textContent = !control ? "Controls" : pending
-            ? "Controls: preparing" : ready ? `Controls: ${control.mode}${imported ? " map" : ""}`
-                : imported ? "Controls: validate map" : "Controls: needs map";
-        body.controlsButton.title = "Generate or use a separate Pose, Depth or Edges control video";
-        body.controlsButton.classList.toggle("mmrp-plan-error", !!control && !pending && !ready);
-    }
+    syncControlsButton(node);
     if (refs.control?.preparation && !refs.control.preparation.error) watchControlPreparation(node);
     node._mmrpControlUpdate?.();
     syncProbes(node);
     scheduleDraw(node);
+}
+
+// The node's ControlNet button says whether the guide will reach the render: no map,
+// preparing, ready, or ready but control_video wired to nothing.
+function syncControlsButton(node) {
+    const button = node._mmrpBody?.controlsButton;
+    if (!button) return;
+    const control = node._mmrpRefs.control;
+    const imported = controlInputType(control) === "map";
+    const pending = control?.preparation && !control.preparation.error;
+    const ready = controlMapCurrent(control, controlLength(node));
+    const unwired = !!control && controlOutputTargets(node).length === 0;
+    const label = CONTROL_MODE_LABELS[control?.mode] || "ControlNet";
+    button.textContent = !control ? "ControlNet" : pending ? "ControlNet: preparing"
+        : !ready ? (imported ? "ControlNet: check map" : "ControlNet: needs map")
+            : unwired ? `ControlNet: ${label} · not wired` : `ControlNet: ${label}`;
+    button.title = !control ? "Add a Pose, Depth or Edges video that steers the render"
+        : unwired ? "control_video is not connected to Apply MiniMax H3 Fun ControlNet"
+            : "Open the ControlNet guide";
+    button.classList.toggle("mmrp-plan-error", !!control && !pending && (!ready || unwired));
 }
 
 // ---------------------------------------------------------------------------
@@ -2494,7 +2574,7 @@ function buildCustomBlock(node) {
     }
 
     const planButton = document.createElement("button");
-    planButton.className = "mmrp-btn mmrp-upload-btn mmrp-plan-btn";
+    planButton.className = "mmrp-btn mmrp-upload-btn mmrp-plan-btn mmrp-group-start";
     planButton.textContent = "Plan: legacy";
     planButton.title = "Choose what each reference contributes";
     planButton.onclick = () => openTaskPlanModal(node);
@@ -2502,12 +2582,12 @@ function buildCustomBlock(node) {
 
     const controlsButton = document.createElement("button");
     controlsButton.className = "mmrp-btn mmrp-upload-btn mmrp-plan-btn";
-    controlsButton.textContent = "Controls";
+    controlsButton.textContent = "ControlNet";
     controlsButton.onclick = () => openControlModal(node);
     uploadRow.appendChild(controlsButton);
 
     const saveConfigBtn = document.createElement("button");
-    saveConfigBtn.className = "mmrp-btn mmrp-upload-btn";
+    saveConfigBtn.className = "mmrp-btn mmrp-upload-btn mmrp-group-start";
     saveConfigBtn.textContent = "Save config";
     saveConfigBtn.onclick = () => saveConfig(node, saveConfigBtn);
     uploadRow.appendChild(saveConfigBtn);
@@ -3193,246 +3273,477 @@ function controlFileUrl(file) {
     return `/view?${query}`;
 }
 
+const CONTROL_MODE_HELP = {
+    pose: "Body skeleton from DWPose. Keeps the performance; clothes, face and setting come from the references.",
+    depth: "Distance from camera from Depth Anything V2. Keeps layout and camera move; surfaces and light stay free.",
+    edges: "Canny outlines, built into ComfyUI. Follows shapes closely.",
+};
+const CONTROL_RESOLUTIONS = [
+    [256, "256 px · fastest"], [512, "512 px · default"], [768, "768 px · finer"], [1024, "1024 px · finest, slowest"],
+];
+const CONTROL_UPLOAD_OPTION = "\u0000upload";
+// The control decoder needs at least five frames at 24 fps (0.21 s); 0.25 s keeps a
+// frame of margin against how the trimmed window's edges round.
+const CONTROL_MIN_TRIM = 0.25;
+
+// The ControlNet guide: the input clip with its crop and trim on the left, the control
+// type, resolution and resulting map on the right, then whether the map covers the
+// render length and reaches Apply MiniMax H3 Fun ControlNet. Every change is saved
+// immediately; a settings change drops the stored map (changeControlSettings), and the
+// dialog keeps showing the map it last saw, greyed, with what changed since.
 async function openControlModal(node) {
-    const { modal, close } = createPlannerModal("Control video", "mmrp-control-modal");
-    let draft = takeControl(node._mmrpRefs.control) || {
-        file: "", mode: "pose", resolution: 512, trim: null, crop: null, map: null,
-    };
+    const { modal, close } = createPlannerModal("ControlNet guide", "mmrp-control-modal");
+    const tabStash = {};   // each tab's control as it was left, while the dialog is open
+    const emptyControl = () => ({ file: "", mode: "pose", resolution: 512, trim: null, crop: null, map: null });
+    let draft = takeControl(node._mmrpRefs.control) || emptyControl();
+    const current = () => node._mmrpRefs.control || draft;
     let modes = [];
     let busy = false;
     let message = "Loading available processors…";
+    let messageError = false;
     let sourceRevision = 0;
-    const hint = document.createElement("div");
-    hint.className = "mmrp-modal-hint";
-    hint.textContent = "Drop a source video here or select one below. Generate queues only control preparation; rendering stays a separate action. Pose and Depth use optional controlnet_aux processors and may download missing detector weights. Changes are saved immediately; closing keeps the preparation job.";
-    modal.appendChild(hint);
-
-    const fields = document.createElement("div");
-    fields.className = "mmrp-plan-controls";
-    const field = (label, element) => {
-        const wrapper = document.createElement("label");
-        const caption = document.createElement("span");
-        caption.textContent = label;
-        wrapper.appendChild(caption);
-        element._mmrpLabel = caption;
-        element.setAttribute("aria-label", label);
-        wrapper.appendChild(element);
-        fields.appendChild(wrapper);
+    let previous = null;      // {file, map} of the last map this dialog showed
+    let undoRemove = null;
+    const make = (tag, className = "", text = "") => {
+        const element = document.createElement(tag);
+        if (className) element.className = className;
+        if (text) element.textContent = text;
         return element;
     };
-    const setFieldLabel = (element, label) => {
-        element._mmrpLabel.textContent = label;
-        element.setAttribute("aria-label", label);
+
+    const hint = modal.appendChild(make("div", "mmrp-modal-hint"));
+
+    // ---- tabs: two tasks, not a mode dropdown ----
+    const tabs = modal.appendChild(make("div", "mmrp-ctl-tabs"));
+    tabs.setAttribute("role", "tablist");
+    const tab = (id, label) => {
+        const button = tabs.appendChild(make("button", "mmrp-ctl-tab", label));
+        button.setAttribute("role", "tab");
+        button.onclick = () => {
+            const from = controlInputType(current());
+            if (from === id) return;
+            if (current().file) tabStash[from] = takeControl(current());
+            const back = tabStash[id];
+            if (!back) { setControl({ input_type: id }); return; }
+            delete back.preparation;
+            invalidateControlOperation(node);
+            draft = back;
+            node._mmrpRefs.control = back;
+            undoRemove = null;
+            message = "";
+            messageError = false;
+            syncReferencesWidget(node);
+            renderNodeBody(node);
+            update();
+        };
+        return button;
     };
-    const inputType = field("Control input", document.createElement("select"));
-    for (const [id, label] of [["source", "Generate from source video"], ["map", "Use existing control map"]]) {
-        const option = document.createElement("option");
-        option.value = id;
-        option.textContent = label;
-        inputType.appendChild(option);
-    }
-    const source = field("Source video", document.createElement("select"));
-    source.className = "mmrp-source-select";
-    const emptySourceOption = document.createElement("option");
+    const sourceTab = tab("source", "Make from a video");
+    const mapTab = tab("map", "Use a map I already have");
+
+    const columns = modal.appendChild(make("div", "mmrp-ctl-body"));
+    const left = columns.appendChild(make("div", "mmrp-ctl-col"));
+    const right = columns.appendChild(make("div", "mmrp-ctl-col"));
+
+    // ---- left: file picker, framed clip, crop and trim ----
+    const leftTitle = left.appendChild(make("div", "mmrp-ctl-title"));
+    const source = left.appendChild(make("select", "mmrp-source-select"));
+    const emptySourceOption = make("option");
     emptySourceOption.value = "";
+    const uploadOption = make("option");
+    uploadOption.value = CONTROL_UPLOAD_OPTION;
     source.appendChild(emptySourceOption);
-    const mode = field("Control type", document.createElement("select"));
-    for (const [id, label] of [["pose", "Pose"], ["depth", "Depth"], ["edges", "Edges"]]) {
-        const option = document.createElement("option");
-        option.value = id;
-        option.textContent = label;
-        mode.appendChild(option);
-    }
-    const resolution = field("Detection resolution", document.createElement("select"));
-    for (const size of [...new Set([256, 512, 768, 1024, Number(draft.resolution)])].sort((a, b) => a - b)) {
-        const option = document.createElement("option");
-        option.value = String(size);
-        option.textContent = `${size} px`;
-        resolution.appendChild(option);
-    }
-    const numeric = (label, minimum = 0, maximum = null) => {
-        const input = field(label, document.createElement("input"));
-        input.className = "mmrp-source-select";
-        input.type = "number";
-        input.step = "any";
-        input.min = String(minimum);
-        if (maximum != null) input.max = String(maximum);
-        return input;
-    };
-    const trimStart = numeric("Trim start (seconds; blank = full clip)");
-    const trimEnd = numeric("Trim end (seconds)");
-    const crop = ["Crop X", "Crop Y", "Crop width", "Crop height"].map((label) => numeric(`${label} (0–1; blank = full frame)`, 0, 1));
-    modal.appendChild(fields);
+    source.appendChild(uploadOption);
 
-    const previews = document.createElement("div");
-    previews.className = "mmrp-plan-controls";
-    const preview = (title) => {
-        const panel = document.createElement("div");
-        panel.className = "mmrp-plan-asset";
-        const label = document.createElement("strong");
-        label.textContent = title;
-        const video = document.createElement("video");
-        video.controls = true;
-        video.muted = true;
-        video.preload = "metadata";
-        video.style.width = "100%";
-        video.style.maxHeight = "240px";
-        video.style.objectFit = "contain";
-        panel.appendChild(label);
-        panel.appendChild(video);
-        previews.appendChild(panel);
-        video._mmrpLabel = label;
-        return video;
-    };
-    const sourcePreview = preview("Source video");
-    const mapPreview = preview("Prepared control map");
-    modal.addEventListener("mmrp-modal-close", () => {
-        sourcePreview.pause();
-        mapPreview.pause();
-        if (node._mmrpControlUpdate === update) node._mmrpControlUpdate = null;
+    const stageBox = left.appendChild(make("div", "mmrp-ctl-stage-box"));
+    const stageEmpty = stageBox.appendChild(make("div", "mmrp-ctl-empty"));
+    const stage = stageBox.appendChild(make("div", "mmrp-ctl-stage"));
+    const stageVideo = stage.appendChild(make("video"));
+    stageVideo.muted = true;
+    stageVideo.playsInline = true;
+    stageVideo.preload = "auto";
+    const cropLayer = stage.appendChild(make("div", "mmrp-crop-layer"));
+    const cropRect = cropLayer.appendChild(make("div", "mmrp-crop-rect"));
+    const cropSize = cropRect.appendChild(make("span", "mmrp-ctl-crop-size"));
+    const cropHandles = {};
+    for (const corner of ["nw", "ne", "sw", "se"]) {
+        cropHandles[corner] = cropRect.appendChild(make("div", `mmrp-crop-handle mmrp-crop-${corner}`));
+    }
+
+    const aspectRow = left.appendChild(make("div", "mmrp-aspect-row"));
+    aspectRow.appendChild(make("span", "mmrp-edit-label", "Crop"));
+    const renderW = Number(widgetByName(node, "width")?.value) || 0;
+    const renderH = Number(widgetByName(node, "height")?.value) || 0;
+    const presets = [["Free", null]];
+    if (renderW > 0 && renderH > 0) presets.push([`Render ${renderW}:${renderH}`, renderW / renderH]);
+    presets.push(...ASPECT_PRESETS);
+    const aspectButtons = presets.map(([label, ratio]) => {
+        const button = aspectRow.appendChild(make("button", "mmrp-btn", label));
+        button._mmrpRatio = ratio;
+        return button;
     });
-    modal.appendChild(previews);
-    sourcePreview.onloadedmetadata = () => {
-        sourcePreview.currentTime = (node._mmrpRefs.control || draft).trim?.[0] || 0;
+    const clearCrop = aspectRow.appendChild(make("button", "mmrp-btn mmrp-clear-btn", "Clear crop"));
+
+    const trimRow = left.appendChild(make("div", "mmrp-trim-row"));
+    const playClip = trimRow.appendChild(make("button", "mmrp-btn", "▶"));
+    playClip.setAttribute("aria-label", "Play the trimmed clip");
+    trimRow.appendChild(make("span", "mmrp-edit-label", "Trim"));
+    const trimIn = trimRow.appendChild(make("input", "mmrp-trim-num"));
+    const trimBar = trimRow.appendChild(make("div", "mmrp-trim-bar"));
+    const trimSpan = trimBar.appendChild(make("div", "mmrp-trim-span"));
+    const inHandle = trimBar.appendChild(make("div", "mmrp-trim-handle"));
+    const outHandle = trimBar.appendChild(make("div", "mmrp-trim-handle"));
+    const trimOut = trimRow.appendChild(make("input", "mmrp-trim-num"));
+    const clearTrim = trimRow.appendChild(make("button", "mmrp-btn mmrp-clear-btn", "Clear trim"));
+    for (const [input, label] of [[trimIn, "Trim in (seconds)"], [trimOut, "Trim out (seconds)"]]) {
+        input.type = "number";
+        input.step = "0.01";
+        input.min = "0";
+        input.setAttribute("aria-label", label);
+    }
+    const trimRead = left.appendChild(make("div", "mmrp-ctl-trim-read"));
+
+    // ---- right: type, resolution, result ----
+    right.appendChild(make("div", "mmrp-ctl-title", "Guide"));
+    const typeLabel = right.appendChild(make("div", "mmrp-ctl-label"));
+    const typeGroup = right.appendChild(make("div", "mmrp-ctl-seg"));
+    typeGroup.setAttribute("role", "group");
+    const typeButtons = Object.entries(CONTROL_MODE_LABELS).map(([id, label]) => {
+        const button = typeGroup.appendChild(make("button", "mmrp-ctl-seg-btn", label));
+        button.dataset.mode = id;
+        button.onclick = () => setControl({ mode: id });
+        return button;
+    });
+    const typeHelp = right.appendChild(make("div", "mmrp-ctl-help"));
+    const resolutionLabel = right.appendChild(make("label", "mmrp-ctl-label"));
+    const resolutionCaption = resolutionLabel.appendChild(make("span"));
+    const resolution = resolutionLabel.appendChild(make("select", "mmrp-source-select"));
+    for (const [size, label] of CONTROL_RESOLUTIONS) {
+        const option = resolution.appendChild(make("option", "", label));
+        option.value = String(size);
+    }
+    if (!CONTROL_RESOLUTIONS.some(([size]) => size === Number(draft.resolution))) {
+        const option = resolution.appendChild(make("option", "", `${draft.resolution} px`));
+        option.value = String(draft.resolution);
+    }
+    const resolutionHelp = right.appendChild(make("div", "mmrp-ctl-help"));
+
+    const result = right.appendChild(make("div", "mmrp-ctl-result"));
+    result.setAttribute("role", "status");
+    const resultHead = result.appendChild(make("div", "mmrp-ctl-result-head"));
+    const resultTitle = resultHead.appendChild(make("span"));
+    const badge = resultHead.appendChild(make("span", "mmrp-ctl-badge"));
+    const mapView = result.appendChild(make("div", "mmrp-ctl-mapview"));
+    const mapVideo = mapView.appendChild(make("video"));
+    mapVideo.muted = true;
+    mapVideo.playsInline = true;
+    mapVideo.preload = "metadata";
+    mapVideo.controls = true;
+    const mapEmpty = mapView.appendChild(make("div", "mmrp-ctl-empty"));
+    const staleNote = mapView.appendChild(make("div", "mmrp-ctl-stale-note"));
+    const resultMeta = result.appendChild(make("div", "mmrp-ctl-meta"));
+    const resultNote = result.appendChild(make("div", "mmrp-ctl-help"));
+    const resultActions = result.appendChild(make("div", "mmrp-ctl-actions"));
+    const playBoth = resultActions.appendChild(make("button", "mmrp-btn", "▶ Play with source"));
+    // A current receipt can still name a file that changed on disk; rendering rejects
+    // it by hash, so rebuilding must not require touching a setting first.
+    const redo = resultActions.appendChild(make("button", "mmrp-btn"));
+
+    // ---- facts: render length, wiring ----
+    const facts = modal.appendChild(make("div", "mmrp-ctl-facts"));
+    const fact = () => {
+        const row = facts.appendChild(make("div", "mmrp-ctl-fact"));
+        row._icon = row.appendChild(make("span", "mmrp-ctl-fact-icon"));
+        row._head = row.appendChild(make("strong"));
+        row._detail = row.appendChild(make("span", "mmrp-ctl-fact-detail"));
+        return row;
     };
-    sourcePreview.ontimeupdate = () => {
-        const trim = (node._mmrpRefs.control || draft).trim;
-        if (trim && sourcePreview.currentTime >= trim[1]) {
-            sourcePreview.pause();
-            sourcePreview.currentTime = trim[0];
-        }
+    const lengthFact = fact();
+    const wiringFact = fact();
+    const setFact = (row, level, head, detail) => {
+        row.classList.toggle("mmrp-ctl-fact-warn", level === "warn");
+        row._icon.textContent = level === "warn" ? "!" : "✓";
+        row._head.textContent = head;
+        row._detail.textContent = detail ? ` ${detail}` : "";
     };
 
-    const status = document.createElement("div");
-    status.className = "mmrp-plan-status";
-    status.setAttribute("role", "status");
-    modal.appendChild(status);
-    const footer = document.createElement("div");
-    footer.className = "mmrp-modal-footer";
-    const button = (label, onclick) => {
-        const element = document.createElement("button");
-        element.className = "mmrp-btn";
-        element.textContent = label;
-        element.onclick = onclick;
-        footer.appendChild(element);
-        return element;
-    };
-    const uploadInput = document.createElement("input");
+    // ---- footer: remove sits apart from the primary action ----
+    const footer = modal.appendChild(make("div", "mmrp-modal-footer mmrp-ctl-footer"));
+    const remove = footer.appendChild(make("button", "mmrp-btn mmrp-ctl-remove", "Remove guide"));
+    const toast = footer.appendChild(make("span", "mmrp-ctl-toast"));
+    const toastText = toast.appendChild(make("span"));
+    const undo = toast.appendChild(make("button", "mmrp-ctl-link", "Undo"));
+    footer.appendChild(make("span", "mmrp-ctl-spacer"));
+    footer.appendChild(make("button", "mmrp-btn", "Close")).onclick = close;
+    const primary = footer.appendChild(make("button", "mmrp-btn mmrp-btn-primary"));
+
+    const uploadInput = modal.appendChild(make("input"));
     uploadInput.type = "file";
     uploadInput.accept = "video/*,.mkv,.webm,.avi,.mov,.mp4";
     uploadInput.hidden = true;
-    modal.appendChild(uploadInput);
-    const upload = button("Upload source…", () => uploadInput.click());
-    const remove = button("Remove control", () => {
-        const hadPreparation = !!node._mmrpRefs.control?.preparation;
-        invalidateControlOperation(node);
-        node._mmrpRefs.control = null;
-        draft = { file: "", mode: "pose", resolution: 512, trim: null, crop: null, map: null };
-        message = hadPreparation ? "Control removed. Any already queued preparation remains in ComfyUI's queue." : "Control removed.";
-        syncReferencesWidget(node);
-        renderNodeBody(node);
-    });
-    const generate = button("Generate control map", async () => {
-        busy = true;
-        const imported = controlInputType(node._mmrpRefs.control) === "map";
-        message = imported ? "Validating control map…" : "Preparing the control job…";
-        update();
-        try {
-            if (controlLength(node) == null) {
-                throw new Error("The linked length_seconds cannot be read before execution. Use a PrimitiveFloat/PrimitiveNode duration or disconnect it and set the manager's length_seconds.");
-            }
-            if (imported) {
-                const accepted = await useExistingControlMap(node);
-                message = accepted ? "" : "Map validation finished, but settings changed. Use control map again.";
-                return;
-            }
-            const operation = invalidateControlOperation(node);
-            const control = takeControl(node._mmrpRefs.control);
-            const expected = controlSettingsFingerprint(control, controlLength(node));
-            const plan = await controlRequest("prepare", {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ control, length_seconds: controlLength(node) }),
-            });
-            const pending = await queueControlPreparation(node, plan, expected, operation);
-            message = pending ? "" : "The preparation was queued, but its result will be ignored because the control changed.";
-        } catch (error) {
-            message = error.message || error.response?.error?.message || (imported
-                ? "Control map validation failed. Use control map again."
-                : "Preparation could not be queued. Check ComfyUI's queue before retrying.");
-        } finally {
-            busy = false;
-            update();
-        }
-    });
-    generate.classList.add("mmrp-btn-primary");
-    button("Close", close);
-    modal.appendChild(footer);
+
+    // ---- state ----
+    let crop = [0, 0, 1, 1];
+    let trim = null;            // null = whole clip
+    let ratio = null;
+    let aspectChoice = null;  // the preset button last clicked; equal ratios stay distinct
+    let editing = false;        // a crop or trim drag owns the local values
+    let endDrag = null;         // removes a live drag's window listeners
+    let playing = false;
+    let previewFailed = false;
+    stageVideo.addEventListener("error", () => { previewFailed = !!stageVideo.getAttribute?.("src"); update(); });
+    const duration = () => (Number.isFinite(stageVideo.duration) && stageVideo.duration > 0 ? stageVideo.duration : null);
+    const mediaSize = () => [stageVideo.videoWidth || 0, stageVideo.videoHeight || 0];
 
     const setControl = (changes) => {
-        const next = changeControlSettings(node._mmrpRefs.control || draft, changes);
-        if (controlSettingsFingerprint(next) !== controlSettingsFingerprint(node._mmrpRefs.control || draft)) {
+        const before = node._mmrpRefs.control || draft;
+        const next = changeControlSettings(before, changes);
+        if (controlSettingsFingerprint(next) !== controlSettingsFingerprint(before)) {
             invalidateControlOperation(node);
         }
         draft = next;
         node._mmrpRefs.control = next.file ? next : null;
         message = "";
+        messageError = false;
+        undoRemove = null;
         syncReferencesWidget(node);
         renderNodeBody(node);
         update();
     };
-    inputType.onchange = () => setControl({ input_type: inputType.value });
-    source.onchange = () => setControl({ file: source.value, trim: null, crop: null });
-    mode.onchange = () => setControl({ mode: mode.value });
-    resolution.onchange = () => setControl({ resolution: Number(resolution.value) });
-    const saveEdits = () => setControl({
-        trim: trimStart.value === "" && trimEnd.value === "" ? null
-            : [Number(trimStart.value), Number(trimEnd.value)],
-        crop: crop.every((input) => input.value === "") ? null
-            : crop.map((input, index) => input.value === "" ? (index < 2 ? 0 : 1) : Number(input.value)),
+
+    const stopBoth = () => {
+        playing = false;
+        stageVideo.pause();
+        mapVideo.pause();
+        playBoth.textContent = "▶ Play with source";
+        playClip.textContent = "▶";
+    };
+    playClip.onclick = () => {
+        if (!stageVideo.paused) { stopBoth(); return; }
+        stopBoth();
+        stageVideo.currentTime = trim?.[0] || 0;
+        playClip.textContent = "■";
+        Promise.resolve(stageVideo.play()).catch(() => stopBoth());
+    };
+    stageVideo.addEventListener("pause", () => { playClip.textContent = "▶"; });
+    playBoth.onclick = () => {
+        if (playing) { stopBoth(); return; }
+        playing = true;
+        playBoth.textContent = "■ Stop";
+        stageVideo.currentTime = trim?.[0] || 0;
+        mapVideo.currentTime = 0;
+        Promise.allSettled([stageVideo.play(), mapVideo.play()]);
+    };
+    mapVideo.addEventListener("ended", () => { if (playing) stopBoth(); });
+    stageVideo.addEventListener("timeupdate", () => {
+        if (trim && !stageVideo.paused && stageVideo.currentTime >= trim[1]) {
+            stopBoth();
+            stageVideo.currentTime = trim[0];
+        }
     });
-    for (const input of [trimStart, trimEnd, ...crop]) input.onchange = saveEdits;
+    stageVideo.addEventListener("loadedmetadata", () => {
+        stageVideo.currentTime = trim?.[0] || 0;
+        update();
+    });
+    modal.addEventListener("mmrp-modal-close", () => {
+        endDrag?.();
+        stopBoth();
+        showVideo(stageVideo, "");
+        showVideo(mapVideo, "");
+        if (node._mmrpControlUpdate === update) node._mmrpControlUpdate = null;
+    });
+
+    // ---- crop ----
+    const syncCrop = () => {
+        cropRect.style.left = `${crop[0] * 100}%`;
+        cropRect.style.top = `${crop[1] * 100}%`;
+        cropRect.style.width = `${crop[2] * 100}%`;
+        cropRect.style.height = `${crop[3] * 100}%`;
+        const [width, height] = mediaSize();
+        cropSize.textContent = width && height
+            ? `${Math.round(crop[2] * width)} × ${Math.round(crop[3] * height)}` : "";
+        clearCrop.disabled = busy || normalizeCrop(crop) === null;
+        for (const button of aspectButtons) button.classList.toggle("mmrp-active", button === aspectChoice && ratio !== null);
+    };
+    const dragPointer = (event, onMove, onDone) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (busy || !current().file) return;
+        stopBoth();
+        editing = true;
+        let moved = false;
+        const move = (moveEvent) => { moved = true; onMove(moveEvent); };
+        const end = () => {
+            window.removeEventListener("mousemove", move);
+            window.removeEventListener("mouseup", up);
+            editing = false;
+            endDrag = null;
+        };
+        // Escape mid-drag closes the dialog; the release must not save an edit nobody sees.
+        const up = () => {
+            end();
+            if (!moved) { update(); return; }
+            // The click after a release outside the modal lands on the backdrop and closes it.
+            const swallow = (clickEvent) => clickEvent.stopPropagation();
+            window.addEventListener("click", swallow, true);
+            setTimeout(() => window.removeEventListener("click", swallow, true), 0);
+            if (modal.isConnected) onDone();
+        };
+        endDrag = end;
+        window.addEventListener("mousemove", move);
+        window.addEventListener("mouseup", up);
+    };
+    const startCropDrag = (event, mode) => {
+        const box = cropLayer.getBoundingClientRect();
+        if (!box.width || !box.height) return;
+        const from = { x: event.clientX, y: event.clientY, crop: crop.slice() };
+        const [width, height] = mediaSize();
+        dragPointer(event, (moveEvent) => {
+            crop = dragCrop(from.crop, mode, (moveEvent.clientX - from.x) / box.width,
+                (moveEvent.clientY - from.y) / box.height, ratio, width, height);
+            syncCrop();
+        }, () => setControl({ crop: normalizeCrop(crop) }));
+    };
+    cropRect.addEventListener("mousedown", (event) => startCropDrag(event, "move"));
+    for (const [corner, handle] of Object.entries(cropHandles)) {
+        handle.addEventListener("mousedown", (event) => startCropDrag(event, corner));
+    }
+    for (const button of aspectButtons) {
+        button.onclick = () => {
+            ratio = button._mmrpRatio;
+            aspectChoice = button;
+            const [width, height] = mediaSize();
+            if (ratio && width && height) setControl({ crop: normalizeCrop(setRectAspect(crop, ratio, width, height)) });
+            else syncCrop();
+        };
+    }
+    clearCrop.onclick = () => {
+        ratio = null;
+        aspectChoice = null;
+        setControl({ crop: null });
+    };
+
+    // ---- trim ----
+    const r2 = (value) => Math.round(value * 100) / 100;
+    const syncTrim = () => {
+        const total = duration();
+        const span = trim || (total ? [0, total] : null);
+        trimIn.disabled = trimOut.disabled = busy || !total;
+        clearTrim.disabled = busy || !trim;
+        if (!total || !span) {
+            trimSpan.style.width = "0";
+            trimRead.textContent = !current().file ? ""
+                : previewFailed ? "This browser can't play the clip, so crop and trim can't be shown." : "Loading clip…";
+            return;
+        }
+        if (document.activeElement !== trimIn) trimIn.value = span[0].toFixed(2);
+        if (document.activeElement !== trimOut) trimOut.value = span[1].toFixed(2);
+        trimSpan.style.left = `${(span[0] / total) * 100}%`;
+        trimSpan.style.width = `${((span[1] - span[0]) / total) * 100}%`;
+        inHandle.style.left = `calc(${(span[0] / total) * 100}% - 5px)`;
+        outHandle.style.left = `calc(${(span[1] / total) * 100}% - 5px)`;
+        trimRead.textContent = `${(span[1] - span[0]).toFixed(2)} s used of ${total.toFixed(2)} s`;
+    };
+    const setTrimLocal = (start, end) => {
+        const total = duration();
+        if (!total) return;
+        start = clamp01(r2(start), 0, Math.max(0, r2(total) - CONTROL_MIN_TRIM));
+        end = clamp01(r2(end), start + CONTROL_MIN_TRIM, r2(total));
+        trim = [start, end];
+        syncTrim();
+    };
+    const commitTrim = () => {
+        setControl({ trim: normalizeTrim(trim, duration()) });
+        const span = trim || [0, duration() || 0];
+        trimIn.value = span[0].toFixed(2);
+        trimOut.value = span[1].toFixed(2);
+    };
+    const dragTrim = (which) => (event) => {
+        const box = trimBar.getBoundingClientRect();
+        const total = duration();
+        if (!box.width || !total) return;
+        const span = trim || [0, total];
+        trim = span.slice();
+        dragPointer(event, (moveEvent) => {
+            const time = clamp01((moveEvent.clientX - box.left) / box.width, 0, 1) * total;
+            if (which === "in") setTrimLocal(time, trim[1]);
+            else setTrimLocal(trim[0], time);
+            stageVideo.currentTime = time;
+        }, commitTrim);
+    };
+    inHandle.addEventListener("mousedown", dragTrim("in"));
+    outHandle.addEventListener("mousedown", dragTrim("out"));
+    trimIn.addEventListener("change", () => {
+        const total = duration();
+        if (!total) return;
+        setTrimLocal(parseFloat(trimIn.value) || 0, (trim || [0, total])[1]);
+        commitTrim();
+    });
+    trimOut.addEventListener("change", () => {
+        const total = duration();
+        if (!total) return;
+        setTrimLocal((trim || [0, total])[0], parseFloat(trimOut.value) || total);
+        commitTrim();
+    });
+    clearTrim.onclick = () => setControl({ trim: null });
+
+    // ---- file selection, upload and drop ----
+    source.onchange = () => {
+        if (source.value === CONTROL_UPLOAD_OPTION) {
+            source.value = current().file;
+            uploadInput.click();
+            return;
+        }
+        setControl({ file: source.value, trim: null, crop: null });
+    };
+    resolution.onchange = () => setControl({ resolution: Number(resolution.value) });
+    const addSourceOption = (file) => {
+        if ([...source.options].some((item) => item.value === file)) return;
+        const option = make("option", "", file);
+        option.value = file;
+        source.insertBefore(option, uploadOption);
+    };
     const uploadSource = async (files) => {
         const list = Array.from(files || []);
+        const imported = controlInputType(current()) === "map";
         if (list.length !== 1 || !isVideoFile(list[0].name)) {
-            message = controlInputType(node._mmrpRefs.control || draft) === "map"
-                ? "Choose or drop one control map video." : "Choose or drop one source video.";
+            message = imported ? "Choose or drop one control map video." : "Choose or drop one source video.";
+            messageError = true;
             update();
             return;
         }
         busy = true;
-        const imported = controlInputType(node._mmrpRefs.control || draft) === "map";
         message = imported ? "Uploading control map…" : "Uploading source video…";
+        messageError = false;
         const operation = invalidateControlOperation(node);
-        const expected = controlSettingsFingerprint(node._mmrpRefs.control || draft, controlLength(node));
+        const expected = controlSettingsFingerprint(current(), controlLength(node));
         update();
         try {
             const file = await apiUpload(list[0]);
+            addSourceOption(file);
             if (node._mmrpControlOperation !== operation
-                || controlSettingsFingerprint(node._mmrpRefs.control || draft, controlLength(node)) !== expected) {
-                message = "The file was uploaded, but control settings changed while uploading. Select the uploaded file to use it.";
-                const option = document.createElement("option");
-                option.value = file;
-                option.textContent = file;
-                if (![...source.options].some((item) => item.value === file)) source.appendChild(option);
+                || controlSettingsFingerprint(current(), controlLength(node)) !== expected) {
+                message = "The file was uploaded, but the settings changed while uploading. Select the uploaded file to use it.";
                 return;
             }
             sourceRevision += 1;
-            const next = changeControlSettings(node._mmrpRefs.control || draft, {
-                file, trim: null, crop: null, map: null,
-            });
+            const next = changeControlSettings(current(), { file, trim: null, crop: null, map: null });
             // Upload overwrites the managed file; the same filename still needs a new map.
             delete next.preparation;
             draft = next;
             node._mmrpRefs.control = next;
-            const option = document.createElement("option");
-            option.value = file;
-            option.textContent = file;
-            if (![...source.options].some((item) => item.value === file)) source.appendChild(option);
             message = "";
+            undoRemove = null;
             syncReferencesWidget(node);
             renderNodeBody(node);
-        } catch (error) { message = error.message; }
-        finally { busy = false; uploadInput.value = ""; update(); }
+        } catch (error) {
+            message = error.message;
+            messageError = true;
+        } finally {
+            busy = false;
+            uploadInput.value = "";
+            update();
+        }
     };
     uploadInput.onchange = () => uploadSource(uploadInput.files);
     modal.ondragover = (event) => { event.preventDefault(); event.stopPropagation(); };
@@ -3442,89 +3753,249 @@ async function openControlModal(node) {
         if (!busy) uploadSource(event.dataTransfer.files);
     };
 
+    // ---- actions ----
+    remove.onclick = () => {
+        const removed = takeControl(node._mmrpRefs.control);
+        if (!removed) return;
+        const hadPreparation = !!removed.preparation;
+        stopBoth();
+        invalidateControlOperation(node);
+        node._mmrpRefs.control = null;
+        draft = emptyControl();
+        previous = null;
+        message = "";
+        messageError = false;
+        syncReferencesWidget(node);
+        renderNodeBody(node);
+        // Undo restores the settings and any finished map; a preparation still queued
+        // was orphaned by the invalidation above and must be generated again.
+        delete removed.preparation;
+        undoRemove = { control: removed, text: hadPreparation
+            ? "Guide removed. The queued preparation stays in ComfyUI's queue." : "Guide removed." };
+        update();
+    };
+    undo.onclick = () => {
+        if (!undoRemove) return;
+        const { control } = undoRemove;
+        undoRemove = null;
+        draft = control;
+        node._mmrpRefs.control = control;
+        syncReferencesWidget(node);
+        renderNodeBody(node);
+        update();
+    };
+    const prepare = async () => {
+        const control = current();
+        const imported = controlInputType(control) === "map";
+        busy = true;
+        stopBoth();
+        message = imported ? "Checking the control map…" : "Preparing the control job…";
+        messageError = false;
+        update();
+        try {
+            if (controlLength(node) == null) throw new Error(controlLengthFact(null).detail);
+            if (imported) {
+                const accepted = await useExistingControlMap(node);
+                message = accepted ? "" : "The check finished, but the settings changed meanwhile. Check the map again.";
+                return;
+            }
+            const operation = invalidateControlOperation(node);
+            const prepared = takeControl(node._mmrpRefs.control);
+            const expected = controlSettingsFingerprint(prepared, controlLength(node));
+            const plan = await controlRequest("prepare", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ control: prepared, length_seconds: controlLength(node) }),
+            });
+            const pending = await queueControlPreparation(node, plan, expected, operation);
+            message = pending ? "" : "The preparation was queued, but its result will be ignored because the settings changed.";
+        } catch (error) {
+            message = error.message || error.response?.error?.message || (imported
+                ? "The control map check failed. Check it again."
+                : "Preparation could not be queued. Check ComfyUI's queue before retrying.");
+            messageError = true;
+        } finally {
+            busy = false;
+            update();
+        }
+    };
+    primary.onclick = () => (controlMapCurrent(current(), controlLength(node)) ? close() : prepare());
+    redo.onclick = prepare;
+
+    const showVideo = (video, url) => {
+        if (video.dataset.source === url) return;
+        video.pause();
+        video.dataset.source = url;
+        if (url) video.src = url;
+        else { video.removeAttribute("src"); video.load(); }
+    };
+
+    // ---- one render pass over the whole dialog ----
     const update = () => {
         if (!modal.isConnected) {
-            sourcePreview.pause();
-            mapPreview.pause();
+            stopBoth();
             if (node._mmrpControlUpdate === update) node._mmrpControlUpdate = null;
             return;
         }
-        const control = node._mmrpRefs.control || draft;
+        const control = current();
         const imported = controlInputType(control) === "map";
-        inputType.value = imported ? "map" : "source";
-        setFieldLabel(source, imported ? "Control map file" : "Source video");
-        setFieldLabel(resolution, imported ? "Map resolution" : "Detection resolution");
-        emptySourceOption.textContent = imported ? "Choose a control map video…" : "Choose a source video…";
-        upload.textContent = imported ? "Upload control map…" : "Upload source…";
-        generate.textContent = imported ? "Use control map" : "Generate control map";
-        sourcePreview._mmrpLabel.textContent = imported ? "Selected map file" : "Source video";
-        mapPreview._mmrpLabel.textContent = imported ? "Map file preview" : "Prepared control map";
-        hint.textContent = imported
-            ? "Drop an existing Pose, Depth or Edges map here or select one below. Use control map validates the file without a detector or queue job. Rendering normalizes it to 24 fps, applies crop, trim and map resolution, and short maps hold their final frame. The preview shows the original map file; it does not show the normalized render input. Settings or duration changes require Use control map again. Changes are saved immediately."
-            : "Drop a source video here or select one below. Generate queues only control preparation; rendering stays a separate action. Pose and Depth use optional controlnet_aux processors and may download missing detector weights. Changes are saved immediately; closing keeps the preparation job.";
-        source.value = control.file;
-        mode.value = control.mode;
-        resolution.value = String(control.resolution);
-        [trimStart, trimEnd].forEach((input, i) => {
-            if (document.activeElement !== input) input.value = control.trim?.[i] ?? "";
-        });
-        crop.forEach((input, i) => {
-            if (document.activeElement !== input) input.value = control.crop?.[i] ?? "";
-        });
+        const lengthSeconds = controlLength(node);
+        const pending = !!control.preparation && !control.preparation.error;
+        const ready = controlMapCurrent(control, lengthSeconds);
+        if (control.map?.file) previous = { file: control.file, map: takeControl(control.map) };
+        // A map from the other tab is not "out of date", just not this tab's map.
+        const stale = !ready && !pending && !!previous?.map?.file && !!control.file
+            && (previous.map.recipe?.input_type || "source") === controlInputType(control);
         const capability = modes.find((item) => item.id === control.mode);
-        const pending = control.preparation && !control.preparation.error;
-        const ready = controlMapCurrent(control, controlLength(node));
-        for (const [video, hidden] of [[sourcePreview, imported && ready], [mapPreview, imported && !ready]]) {
-            video.parentElement.hidden = hidden;
-            // The asset panel's display:flex overrides the browser's [hidden] style.
-            video.parentElement.style.display = hidden ? "none" : "";
-            if (hidden) video.pause();
+        const modeLabel = CONTROL_MODE_LABELS[control.mode] || "Control";
+
+        hint.textContent = imported
+            ? "Check a saved Pose, Depth or Edges map without a detector or queue job. Rendering normalizes it to 24 fps and applies the crop, trim and resolution set here."
+            : "A Pose, Depth or Edges video that steers the render. Generating queues only control preparation; rendering stays a separate Run.";
+        sourceTab.setAttribute("aria-selected", String(!imported));
+        mapTab.setAttribute("aria-selected", String(imported));
+        sourceTab.classList.toggle("mmrp-active", !imported);
+        mapTab.classList.toggle("mmrp-active", imported);
+        sourceTab.disabled = mapTab.disabled = busy;
+
+        leftTitle.textContent = imported ? "Map file" : "Source video";
+        source.setAttribute("aria-label", leftTitle.textContent);
+        emptySourceOption.textContent = imported ? "Choose a control map video…" : "Choose a source video…";
+        uploadOption.textContent = imported ? "Upload a map…" : "Upload a video…";
+        if (control.file) addSourceOption(control.file);
+        source.value = control.file;
+        source.disabled = busy;
+        stageEmpty.hidden = !!control.file;
+        stageEmpty.textContent = imported ? "Choose or drop a control map video." : "Choose or drop a source video.";
+        stage.hidden = !control.file;
+        const stageUrl = control.file ? `${controlFileUrl(control.file)}&revision=${sourceRevision}` : "";
+        if (stageVideo.dataset.source !== stageUrl) previewFailed = false;
+        showVideo(stageVideo, stageUrl);
+        if (!editing) {
+            crop = Array.isArray(control.crop) ? control.crop.slice() : [0, 0, 1, 1];
+            trim = Array.isArray(control.trim) ? control.trim.slice() : null;
         }
-        previews.style.gridTemplateColumns = imported ? "minmax(0, 1fr)" : "";
-        const unresolvedLength = controlLength(node) == null;
-        const error = unresolvedLength
-            ? "The linked length_seconds cannot be read before execution. Use a PrimitiveFloat/PrimitiveNode duration or disconnect it and set the manager's length_seconds."
-            : control.preparation?.error || (!imported && !ready && !pending && !capability?.available ? capability?.reason : "");
-        status.textContent = message || error || (pending
-            ? `${control.preparation.status === "running" ? "Preparing" : "Queued"}: ${control.preparation.prompt_id}${control.preparation.notice ? ` — ${control.preparation.notice}` : ""}`
-            : ready ? `${imported ? "Ready for render" : "Ready"}: ${control.map.frame_count} frames at ${control.map.fps} fps, ${control.map.width} × ${control.map.height}.${imported ? " The preview shows the original file." : " Preview the map, then queue your render."}`
-            : control.file ? (imported ? "Use control map to validate these settings before rendering." : "Generate a control map for these settings before rendering.")
-                : imported ? "Choose or drop a control map video." : "Choose or drop a source video.");
-        status.classList.toggle("mmrp-plan-status-error", !!error);
-        generate.disabled = busy || !!pending || unresolvedLength || !control.file || (!imported && !capability?.available);
-        upload.disabled = busy;
-        remove.disabled = !node._mmrpRefs.control;
-        for (const option of mode.options) {
-            const capability = modes.find((item) => item.id === option.value);
-            const available = imported || capability?.available;
-            const label = { pose: "Pose", depth: "Depth", edges: "Edges" }[option.value];
-            option.disabled = !available;
-            option.title = available ? "" : capability?.reason || "Processor unavailable";
-            option.textContent = `${capability?.label || label}${available ? "" : " (unavailable)"}`;
+        syncCrop();
+        syncTrim();
+        for (const button of aspectButtons) button.disabled = busy || !control.file;
+        playClip.disabled = busy || !duration();
+
+        typeLabel.textContent = imported ? "This map is a" : "Control type";
+        typeGroup.setAttribute("aria-label", typeLabel.textContent);
+        for (const button of typeButtons) {
+            const id = button.dataset.mode;
+            const option = modes.find((item) => item.id === id);
+            const available = imported || !!option?.available;
+            button.disabled = busy || !available;
+            button.title = available ? "" : option?.reason || "Processor unavailable";
+            button.textContent = `${option?.label || CONTROL_MODE_LABELS[id]}${available || !modes.length ? "" : " (unavailable)"}`;
+            button.setAttribute("aria-pressed", String(control.mode === id));
+            button.classList.toggle("mmrp-active", control.mode === id);
         }
-        const sourceUrl = control.file ? `${controlFileUrl(control.file)}&revision=${sourceRevision}` : "";
-        const mapUrl = ready ? controlFileUrl(control.map.file) : "";
-        for (const [video, url] of [[sourcePreview, sourceUrl], [mapPreview, mapUrl]]) {
-            if (video.dataset.source !== url) {
-                video.pause();
-                video.dataset.source = url;
-                if (url) video.src = url;
-                else { video.removeAttribute("src"); video.load(); }
-            }
-            video.hidden = !url;
+        typeHelp.textContent = imported
+            ? "Say what the file holds; it is checked, not regenerated."
+            : `${CONTROL_MODE_HELP[control.mode] || ""}${control.mode === "edges" ? "" : " First use may download the detector weights."}`;
+        resolutionCaption.textContent = imported ? "Map resolution" : "Resolution";
+        resolution.setAttribute("aria-label", resolutionCaption.textContent);
+        resolution.value = String(control.resolution);
+        resolution.disabled = busy;
+        resolutionHelp.textContent = imported
+            ? "Short side the map is resized to for the render."
+            : "Short side of the map, and the size the detector works at.";
+
+        // Result panel: no file, working, preparing, failed, ready, out of date, or no map yet.
+        const failure = control.preparation?.error || "";
+        const unavailable = !imported && modes.length && !capability?.available
+            ? capability?.reason || "Processor unavailable" : "";
+        let state;
+        if (!control.file) state = ["none", "No file", imported ? "Choose a map file on the left." : "Choose a source video on the left."];
+        else if (busy) state = ["run", "Working", message];
+        else if (pending) state = ["run", control.preparation.status === "running" ? "Running" : "Queued", "The map appears here when the job finishes."];
+        else if (failure) state = ["error", "Failed", failure];
+        else if (ready) state = ["ok", imported ? "Checked" : "Ready", ""];
+        else if (stale) state = ["warn", "Out of date", ""];
+        else if (unavailable) state = ["error", "Unavailable", unavailable];
+        else state = ["none", "No map yet", imported ? "Check the map before rendering." : "Generate a map for these settings."];
+        const [level, badgeText, emptyText] = state;
+        resultTitle.textContent = imported ? "Map check" : `${modeLabel} map`;
+        badge.textContent = badgeText;
+        badge.dataset.level = level;
+        const shownMap = !imported && (ready || stale) ? (ready ? control.map : previous.map) : null;
+        mapView.hidden = imported && (ready || stale);
+        mapView.classList.toggle("mmrp-ctl-stale", stale);
+        showVideo(mapVideo, shownMap ? controlFileUrl(shownMap.file) : "");
+        mapVideo.hidden = !shownMap;
+        mapEmpty.hidden = !!shownMap;
+        mapEmpty.textContent = emptyText;
+        const changed = stale ? controlChangedSettings(previous, control, lengthSeconds) : [];
+        staleNote.hidden = !stale || imported;
+        staleNote.textContent = `You changed ${changed.length ? changed.join(" and ") : "a setting"} after this map was made. It won't be used until you regenerate.`;
+        const map = ready ? control.map : stale ? previous.map : null;
+        resultMeta.hidden = !map && !pending;
+        resultMeta.textContent = pending
+            ? `Job ${control.preparation.prompt_id}${control.preparation.notice ? ` — ${control.preparation.notice}` : ""}`
+            : map ? `${stale ? "Previous map: " : ""}${map.frame_count} frames · ${map.fps} fps · ${map.width} × ${map.height}` : "";
+        const notes = [];
+        if (pending) notes.push("You can close this dialog; the job keeps running in ComfyUI's queue.");
+        if (imported && ready) notes.push("The preview on the left is the original file; rendering normalizes it to these settings.");
+        if (imported && stale) notes.push(`You changed ${changed.length ? changed.join(" and ") : "a setting"} after the check. Check the map again before rendering.`);
+        if (unavailable && (stale || failure)) notes.push(unavailable);
+        if (message && !busy) notes.push(message);
+        resultNote.textContent = notes.join(" ");
+        resultNote.hidden = !notes.length;
+        resultNote.classList.toggle("mmrp-ctl-error", messageError && !busy);
+        resultActions.hidden = !ready || pending;
+        playBoth.hidden = imported;
+        playBoth.disabled = busy;
+        redo.textContent = imported ? "Check again" : "Regenerate";
+        redo.disabled = busy || lengthSeconds == null || (!imported && !capability?.available);
+
+        // Facts under the columns.
+        const total = duration();
+        const span = trim ? (total ? Math.min(trim[1], total) : trim[1]) - trim[0] : total;
+        const lengthLine = controlLengthFact(lengthSeconds, span);
+        setFact(lengthFact, lengthLine.level, lengthLine.head, lengthLine.detail);
+        const targets = controlOutputTargets(node);
+        const applied = targets.find((target) => target.type === "MiniMaxH3FunControlNetApply");
+        if (!targets.length) {
+            setFact(wiringFact, "warn", "control_video isn't connected.",
+                "This map won't affect the render until it feeds Apply MiniMax H3 Fun ControlNet.");
+        } else if (applied) {
+            setFact(wiringFact, "ok", `control_video → ${applied.title}.`,
+                "Strength and start/end are set on that node.");
+        } else {
+            // A reroute or subgraph may still reach it; say what is seen, not that it's wrong.
+            setFact(wiringFact, "warn", `control_video → ${targets.map((target) => target.title).join(", ")}.`,
+                "Not directly Apply MiniMax H3 Fun ControlNet; make sure the map reaches it.");
         }
+
+        // Footer.
+        remove.disabled = busy || !node._mmrpRefs.control;
+        toast.hidden = !undoRemove;
+        toastText.textContent = undoRemove?.text || "";
+        primary.textContent = ready ? "Done"
+            : pending ? "Preparing…"
+                : imported ? (stale || failure ? "Check again" : "Check map")
+                    : stale || failure ? "Regenerate" : `Generate ${modeLabel.toLowerCase()} map`;
+        primary.disabled = !ready && (busy || pending || lengthSeconds == null || !control.file
+            || (!imported && !capability?.available));
     };
     node._mmrpControlUpdate = update;
     update();
     const listed = await Promise.allSettled([apiListFiles("video"), controlRequest("capabilities")]);
     if (!modal.isConnected) return;
     const files = listed[0].status === "fulfilled" ? listed[0].value : [];
-    appendFileOptions(source, files, node._mmrpRefs.control?.file || draft.file);
+    appendFileOptions(source, files, current().file);
     source.prepend(emptySourceOption);
+    source.appendChild(uploadOption);
     if (listed[1].status === "fulfilled") modes = listed[1].value.modes || [];
-    else message = listed[1].reason.message;
-    if (listed[0].status === "rejected") message = `Video listing failed: ${listed[0].reason.message}. You can still upload a video.`;
-    else if (listed[1].status === "fulfilled" || controlInputType(node._mmrpRefs.control || draft) === "map") message = "";
+    else { message = listed[1].reason.message; messageError = true; }
+    if (listed[0].status === "rejected") {
+        message = `Video listing failed: ${listed[0].reason.message}. You can still upload a video.`;
+        messageError = true;
+    } else if (listed[1].status === "fulfilled" || controlInputType(current()) === "map") {
+        message = "";
+        messageError = false;
+    }
     update();
     watchControlPreparation(node);
 }
@@ -4731,6 +5202,8 @@ function installInputControls(node) {
     node.onConnectionsChange = function () {
         previousConnections?.apply(this, arguments);
         layoutExposedInputs(this);
+        syncControlsButton(this);
+        this._mmrpControlUpdate?.();
         scheduleDraw(this);
     };
     const previousDraw = node.onDrawBackground;

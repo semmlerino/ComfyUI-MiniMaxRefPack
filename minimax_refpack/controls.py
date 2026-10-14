@@ -198,7 +198,7 @@ def capabilities(node_registry=None):
 
 def verify_source(control, prepared_recipe, input_dir, length_seconds):
     control = normalize_control(control)
-    action = "Use control map again" if control.get("input_type") == "map" else "Generate control map again"
+    action = "open ControlNet and click Check again" if control.get("input_type") == "map" else "open ControlNet and click Regenerate"
     if not isinstance(prepared_recipe, dict):
         raise ControlError(f"control recipe is invalid; {action}")
     processor = prepared_recipe.get("processor")
@@ -240,10 +240,10 @@ def load_ready(control, input_dir, length_seconds, cache):
     ready = control["map"]
     if ready is None:
         if control.get("input_type") == "map":
-            raise ControlError("control map has not been imported; click Use control map before rendering")
-        raise ControlError("control map has not been generated; click Generate control map before rendering")
+            raise ControlError("control map has not been checked; open ControlNet and click Check map before rendering")
+        raise ControlError("control map has not been generated; open ControlNet and click Generate before rendering")
     imported = control.get("input_type") == "map"
-    action = "Use control map again" if imported else "Generate control map again"
+    action = "open ControlNet and click Check again" if imported else "open ControlNet and click Regenerate"
     if imported and ready["file"] != control["file"]:
         raise ControlError("imported control and its receipt must name the same file")
     source_sha = verify_source(control, ready["recipe"], input_dir, length_seconds)
@@ -289,7 +289,7 @@ def preparation_graph(control, input_dir, length_seconds=0, node_registry=None):
     if control is None:
         raise ControlError("choose a control video first")
     if control.get("input_type") == "map":
-        raise ControlError("an existing control map is imported directly; click Use control map")
+        raise ControlError("an existing control map is imported, not prepared; click Check map on the ControlNet tab Use a map I already have")
     processor = processor_settings(control["mode"], control["resolution"], node_registry)
     source_sha = file_sha256(safe_path(input_dir, control["file"]))
     prepared_recipe = recipe(control, source_sha, length_seconds, processor)

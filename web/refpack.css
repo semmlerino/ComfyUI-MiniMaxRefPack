@@ -780,3 +780,319 @@
 .mmrp-clear-btn {
     margin-left: auto;
 }
+
+/* ---- ControlNet guide (openControlModal) ----------------------------------
+   Two tabs, then the clip with its crop/trim on the left and the type,
+   resolution and resulting map on the right; length and wiring facts below. */
+
+.mmrp-group-start {
+    margin-left: 10px;
+}
+
+.mmrp-control-modal {
+    width: min(1080px, 96vw);
+}
+
+/* Several blocks here set display:flex/grid, which beats the browser's [hidden]. */
+.mmrp-control-modal [hidden] {
+    display: none !important;
+}
+
+.mmrp-ctl-tabs {
+    display: flex;
+    gap: 2px;
+    border-bottom: 1px solid #343434;
+}
+
+.mmrp-ctl-tab {
+    background: none;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    padding: 6px 12px 8px;
+    color: #999;
+    font: inherit;
+    cursor: pointer;
+}
+
+.mmrp-ctl-tab.mmrp-active {
+    color: #e0e0e0;
+    border-bottom-color: #e0e0e0;
+}
+
+.mmrp-ctl-tab:disabled {
+    cursor: default;
+}
+
+.mmrp-ctl-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+    gap: 16px;
+    padding-top: 4px;
+}
+
+.mmrp-ctl-col {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+}
+
+.mmrp-ctl-title {
+    color: #999;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.mmrp-ctl-label {
+    color: #aaa;
+    font-size: 11px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.mmrp-ctl-help {
+    color: #888;
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.mmrp-ctl-help.mmrp-ctl-error {
+    color: #ffb4b4;
+}
+
+.mmrp-ctl-stage-box {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 200px;
+    background: #000;
+    border-radius: 4px;
+}
+
+/* Shrink-wraps the video so the crop layer's inset:0 is exactly the picture. */
+.mmrp-ctl-stage {
+    position: relative;
+    line-height: 0;
+}
+
+.mmrp-ctl-stage video {
+    display: block;
+    max-width: 100%;
+    max-height: 360px;
+}
+
+.mmrp-ctl-crop-size {
+    position: absolute;
+    left: 4px;
+    top: 4px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: rgba(0, 0, 0, 0.7);
+    color: #e0e0e0;
+    font-size: 11px;
+    line-height: 1.4;
+    pointer-events: none;
+}
+
+.mmrp-ctl-crop-size:empty {
+    display: none;
+}
+
+.mmrp-ctl-empty {
+    color: #777;
+    font-size: 12px;
+    text-align: center;
+    padding: 0 16px;
+}
+
+.mmrp-ctl-trim-read {
+    color: #888;
+    font-size: 11px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.mmrp-ctl-seg {
+    display: inline-flex;
+    align-self: flex-start;
+    border: 1px solid #444;
+    border-radius: 5px;
+    overflow: hidden;
+}
+
+.mmrp-ctl-seg-btn {
+    background: #111;
+    color: #e0e0e0;
+    border: 0;
+    border-right: 1px solid #444;
+    padding: 6px 14px;
+    font: inherit;
+    cursor: pointer;
+}
+
+.mmrp-ctl-seg-btn:last-child {
+    border-right: 0;
+}
+
+.mmrp-ctl-seg-btn.mmrp-active {
+    background: #e0e0e0;
+    color: #000;
+}
+
+.mmrp-ctl-seg-btn:disabled {
+    color: #666;
+    cursor: default;
+}
+
+.mmrp-ctl-result {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid #343434;
+    border-radius: 6px;
+    background: #151515;
+    min-height: 260px;
+}
+
+.mmrp-ctl-result-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+}
+
+.mmrp-ctl-badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: #2c2c2c;
+    color: #aaa;
+}
+
+.mmrp-ctl-badge[data-level="ok"] { background: rgba(63, 191, 127, 0.15); color: #6fd39f; }
+.mmrp-ctl-badge[data-level="run"] { background: rgba(110, 160, 255, 0.16); color: #a8c4ff; }
+.mmrp-ctl-badge[data-level="warn"] { background: rgba(224, 164, 58, 0.16); color: #e6b35a; }
+.mmrp-ctl-badge[data-level="error"] { background: rgba(208, 74, 74, 0.18); color: #ffb4b4; }
+
+.mmrp-ctl-mapview {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 220px;
+    background: #000;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.mmrp-ctl-mapview video {
+    max-width: 100%;
+    max-height: 100%;
+}
+
+.mmrp-ctl-mapview.mmrp-ctl-stale video {
+    opacity: 0.3;
+    filter: grayscale(1);
+}
+
+.mmrp-ctl-stale-note {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+    padding: 6px 8px;
+    border: 1px solid #b8862f;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.8);
+    color: #e6b35a;
+    font-size: 12px;
+}
+
+.mmrp-ctl-meta {
+    color: #aaa;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
+}
+
+.mmrp-ctl-actions {
+    display: flex;
+    gap: 6px;
+}
+
+.mmrp-ctl-facts {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.mmrp-ctl-fact {
+    display: block;
+    padding: 6px 10px;
+    border: 1px solid #2f4a3c;
+    border-radius: 4px;
+    font-size: 12px;
+}
+
+.mmrp-ctl-fact-icon {
+    display: inline-block;
+    width: 16px;
+    color: #6fd39f;
+    font-weight: 700;
+}
+
+.mmrp-ctl-fact-detail {
+    color: #999;
+}
+
+.mmrp-ctl-fact.mmrp-ctl-fact-warn {
+    border-color: #6b5326;
+    background: rgba(224, 164, 58, 0.08);
+}
+
+.mmrp-ctl-fact.mmrp-ctl-fact-warn .mmrp-ctl-fact-icon {
+    color: #e6b35a;
+}
+
+.mmrp-ctl-footer {
+    justify-content: flex-start;
+    align-items: center;
+    border-top: 1px solid #343434;
+    padding-top: 10px;
+}
+
+.mmrp-ctl-remove {
+    background: transparent;
+    border-color: transparent;
+    color: #e5776c;
+}
+
+.mmrp-ctl-toast {
+    color: #999;
+    font-size: 12px;
+}
+
+.mmrp-ctl-link {
+    background: none;
+    border: 0;
+    color: #e0e0e0;
+    text-decoration: underline;
+    font: inherit;
+    cursor: pointer;
+    margin-left: 6px;
+}
+
+.mmrp-ctl-spacer {
+    flex: 1;
+}
+
+@media (max-width: 760px) {
+    .mmrp-ctl-body {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}

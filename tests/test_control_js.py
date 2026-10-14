@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -26,6 +27,13 @@ def _run(expression, setup="", runtime=False, modal=False):
         script += _block("CONTROL-RUNTIME")
     if modal:
         text = JS.read_text()
+        # The dialog draws crop and trim with the reference editor's pure helpers.
+        start = text.index("export function editSummary(ref)")
+        script += text[start:text.index("function emptyRefs()", start)]
+        start = text.index("const ASPECT_PRESETS = [")
+        script += text[start:text.index("];", start) + 2] + "\n"
+        start = text.index("function syncControlsButton(node)")
+        script += text[start:text.index("\n}\n", start) + 3]
         start = text.index("function controlFileUrl(file)")
         end = text.index("// Config (reference pack) save/load", start)
         script += text[start:end]
@@ -163,82 +171,287 @@ def test_import_rejects_a_receipt_for_different_settings():
     assert got["saves"] == 0
 
 
-def test_map_ui_imports_when_detectors_are_unavailable_and_source_mode_stays_gated():
-    control = _map_control()
-    setup = f"""
+def _modal_setup(control, available=False, wired=False, imported=None, target="MiniMaxH3FunControlNetApply"):
+    """A fake DOM just deep enough for openControlModal, and a node around `control`.
+
+    `imported` is what the server answers an import check with.
+    """
+    outputs = ("[{name: 'control_video', links: [7]}]" if wired
+               else "[{name: 'control_video', links: []}]")
+    return f"""
     class Element {{
         constructor(tag) {{this.tag = tag; this.children = []; this.style = {{}}; this.dataset = {{}};
-            this.attributes = {{}}; this.listeners = {{}}; this.isConnected = true;
-            this.classList = {{add() {{}}, toggle() {{}}}};}}
+            this.attributes = {{}}; this.listeners = {{}}; this.isConnected = true; this.textContent = '';
+            const classes = new Set(); this.classes = classes;
+            this.classList = {{add: name => classes.add(name), contains: name => classes.has(name),
+                toggle: (name, force) => (force ?? !classes.has(name)) ? classes.add(name) : classes.delete(name)}};}}
+        set className(value) {{this.classes.clear(); String(value).split(' ').filter(Boolean).forEach(c => this.classes.add(c));}}
+        get className() {{return [...this.classes].join(' ');}}
         appendChild(child) {{this.children.push(child); child.parentElement = this; return child;}}
+        insertBefore(child, before) {{const at = this.children.indexOf(before);
+            this.children.splice(at < 0 ? this.children.length : at, 0, child); child.parentElement = this; return child;}}
         prepend(child) {{this.children.unshift(child); child.parentElement = this;}}
         setAttribute(name, value) {{this.attributes[name] = value;}}
-        removeAttribute(name) {{delete this[name];}}
+        getAttribute(name) {{return this.attributes[name];}}
+        removeAttribute(name) {{delete this.attributes[name]; delete this[name];}}
         addEventListener(name, callback) {{this.listeners[name] = callback;}}
         get options() {{return this.children;}}
         pause() {{this.paused = true;}}
         load() {{}}
+        getBoundingClientRect() {{return {{left: 0, top: 0, width: 100, height: 100}};}}
     }}
     const document = {{createElement: tag => new Element(tag), activeElement: null}};
+    const window = {{listeners: {{}}, addEventListener(name, callback) {{this.listeners[name] = callback;}},
+        removeEventListener(name, callback) {{if (this.listeners[name] === callback) delete this.listeners[name];}}}};
     let modal;
     const createPlannerModal = () => {{modal = new Element('div'); return {{modal, close() {{modal.isConnected = false;}}}};}};
-    const apiListFiles = async () => ['pose.mp4'];
+    const apiListFiles = async () => [{json.dumps(control["file"])}];
+    const apiUpload = async () => {{throw new Error('Unexpected upload');}};
     const appendFileOptions = (select, files, current) => {{select.children = [];
         for (const file of new Set([current, ...files].filter(Boolean))) {{const option = new Element('option');
             option.value = file; option.textContent = file; select.appendChild(option);}}}};
     const isVideoFile = () => true;
-    const ready = {json.dumps(control)};
-    const node = {{_mmrpRefs: fromReferencesEnvelope({{references: [], control: {{...ready, map: null}}}}),
-        widgets: [{{name: 'length_seconds', value: 4}}]}};
+    const ready = {json.dumps(imported or control)};
+    const start = {json.dumps(control)};
+    const target = {{type: {json.dumps(target)}, title: {json.dumps("Apply MiniMax H3 Fun ControlNet" if target == "MiniMaxH3FunControlNetApply" else target)}}};
+    const node = {{_mmrpRefs: fromReferencesEnvelope({{references: [], control: start}}),
+        widgets: [{{name: 'length_seconds', value: 4}}, {{name: 'width', value: 720}}, {{name: 'height', value: 1280}}],
+        outputs: {outputs}, graph: {{links: new Map([[7, {{target_id: 3}}]]), getNodeById: id => id === 3 ? target : null}}}};
+    node._mmrpBody = {{controlsButton: new Element('button')}};
+    // Not a live node: a restored preparation is shown, never polled.
+    const liveNodes = new Set();
     const widgetByName = (node, name) => node.widgets?.find(widget => widget.name === name);
     const requests = [];
-    const syncReferencesWidget = () => {{}};
-    const renderNodeBody = () => node._mmrpControlUpdate?.();
+    let saves = 0;
+    const syncReferencesWidget = () => {{saves++;}};
+    const renderNodeBody = () => {{syncControlsButton(node); node._mmrpControlUpdate?.();}};
     const api = {{queuePrompt() {{throw new Error('Unexpected queue');}}, fetchApi: async (path) => {{
         requests.push(path);
         return {{ok: true, json: async () => path.endsWith('/capabilities')
-            ? {{modes: ['pose', 'depth', 'edges'].map(id => ({{id, label: id, available: false, reason: 'No detector'}}))}}
+            ? {{modes: ['pose', 'depth', 'edges'].map(id => ({{id, label: id[0].toUpperCase() + id.slice(1),
+                available: {json.dumps(available)}, reason: 'No detector'}}))}}
             : {{control: ready}}}};
     }}}};
     const elements = root => [root, ...root.children.flatMap(elements)];
+    const find = text => elements(modal).find(el => el.textContent === text);
+    const byClass = name => elements(modal).find(el => el.classList.contains(name));
+    const view = () => ({{badge: byClass('mmrp-ctl-badge').textContent,
+        primary: byClass('mmrp-btn-primary').textContent, primaryDisabled: !!byClass('mmrp-btn-primary').disabled,
+        note: byClass('mmrp-ctl-stale-note').hidden ? null : byClass('mmrp-ctl-stale-note').textContent,
+        map: elements(byClass('mmrp-ctl-mapview')).find(el => el.tag === 'video').dataset.source || null,
+        mapShown: !byClass('mmrp-ctl-mapview').hidden && !elements(byClass('mmrp-ctl-mapview')).find(el => el.tag === 'video').hidden,
+        stageShown: !byClass('mmrp-ctl-stage').hidden,
+        redo: byClass('mmrp-ctl-actions').hidden ? null : byClass('mmrp-ctl-actions').children[1].textContent,
+        facts: elements(modal).filter(el => el.classList.contains('mmrp-ctl-fact')).map(row =>
+            [row.classList.contains('mmrp-ctl-fact-warn') ? 'warn' : 'ok', row._head.textContent]),
+        button: node._mmrpBody.controlsButton.textContent}});
     """
-    # The author display:flex rule overrides the browser's default [hidden] style.
-    got = _run("(async () => {await openControlModal(node);"
-               "const all = elements(modal); const button = all.find(el => el.textContent === 'Use control map');"
-               "const visiblePreviews = () => all.filter(el => el.tag === 'video' && el.parentElement.style.display !== 'none');"
-               "const beforeValidation = visiblePreviews().map(el => el._mmrpLabel.textContent);"
-               "const enabled = !button.disabled; const type = all.find(el => el.attributes['aria-label'] === 'Control input');"
-               "const semantic = all.find(el => el.attributes['aria-label'] === 'Control type');"
-               "const mapOptionsEnabled = semantic.options.every(option => !option.disabled);"
-               "await button.onclick();"
-               "const preview = all.find(el => el.tag === 'video' && el._mmrpLabel.textContent === 'Map file preview');"
-               "const originalPreview = preview.dataset.source; const imported = node._mmrpRefs.control.input_type;"
-               "const importedPreviews = visiblePreviews().map(el => el._mmrpLabel.textContent);"
-               "type.value = 'source'; type.onchange();"
-               "node._mmrpRefs.control = {...ready, input_type: 'source', map: {...ready.map, file: 'generated.mp4',"
-               "recipe: {...ready.map.recipe, input_type: 'source'}}}; node._mmrpControlUpdate();"
-               "const sourcePreviews = visiblePreviews().filter(el => !el.hidden).map(el => el._mmrpLabel.textContent);"
-               "return {enabled, mapOptionsEnabled, imported, originalPreview, sourceDisabled: button.disabled,"
-               "beforeValidation, importedPreviews, sourcePreviews, sourceButton: button.textContent, requests};})()", setup, runtime=True, modal=True)
-    assert got == {
-        "enabled": True, "mapOptionsEnabled": True, "imported": "map",
-        "originalPreview": "/view?filename=pose.mp4&type=input",
-        "beforeValidation": ["Selected map file"],
-        "importedPreviews": ["Map file preview"],
-        "sourcePreviews": ["Source video", "Prepared control map"],
-        "sourceDisabled": True, "sourceButton": "Generate control map",
-        "requests": ["/minimax_refpack/control/capabilities", "/minimax_refpack/control/import"],
+
+
+def _ready_source_control() -> dict[str, Any]:
+    crop, trim = [0.25, 0, 0.5, 1], [1, 5.5]
+    return {
+        "file": "source.mp4", "mode": "edges", "resolution": 512, "trim": trim, "crop": crop,
+        "map": {
+            "file": "control_maps/source_edges.mp4", "source_sha256": "source", "sha256": "map",
+            "recipe": {"input_type": "source", "source_sha256": "source", "mode": "edges",
+                       "resolution": 512, "crop": crop, "trim": trim, "length_seconds": 4, "fps": 24},
+            "frame_count": 107, "fps": 24, "width": 512, "height": 910,
+        },
     }
 
 
-def test_existing_map_ui_is_explicit_and_distinct_from_source_generation():
+def test_map_tab_imports_without_detectors_and_source_tab_stays_gated():
+    control = {**_map_control(), "map": None}
+    got = _run("(async () => {await openControlModal(node); const before = view();"
+               "const typesEnabled = elements(modal).filter(el => el.dataset.mode).every(el => !el.disabled);"
+               "const stage = elements(modal).find(el => el.tag === 'video').dataset.source;"
+               "await byClass('mmrp-btn-primary').onclick(); const checked = view();"
+               "const imported = node._mmrpRefs.control.input_type;"
+               "find('Make from a video').onclick(); const source = view();"
+               "return {before, typesEnabled, stage, checked, imported, source, requests};})()",
+               _modal_setup(control, imported=_map_control()), runtime=True, modal=True)
+    assert got["before"]["badge"] == "No map yet"
+    assert (got["before"]["primary"], got["before"]["primaryDisabled"]) == ("Check map", False)
+    assert got["typesEnabled"] is True
+    assert got["stage"] == "/view?filename=pose.mp4&type=input&revision=0"
+    assert got["imported"] == "map"
+    assert (got["checked"]["badge"], got["checked"]["primary"]) == ("Checked", "Done")
+    # One preview of an imported map: the file on the left, no second copy on the right.
+    assert (got["before"]["stageShown"], got["checked"]["stageShown"], got["checked"]["mapShown"]) == (True, True, False)
+    assert got["checked"]["redo"] == "Check again"
+    assert got["checked"]["button"] == "ControlNet: Pose · not wired"
+    # Switching task drops the imported receipt; with no detector, generating stays off
+    # and the imported map is not presented as this tab's out-of-date map.
+    assert got["source"]["badge"] == "Unavailable"
+    assert got["source"]["primaryDisabled"] is True
+    assert got["source"]["note"] is None
+    assert got["requests"] == ["/minimax_refpack/control/capabilities", "/minimax_refpack/control/import"]
+
+
+def test_ready_map_goes_out_of_date_and_names_what_changed():
+    got = _run("(async () => {syncControlsButton(node); await openControlModal(node); const before = view();"
+               "find('Clear crop').onclick(); const after = view();"
+               "return {before, after, stored: node._mmrpRefs.control.map, crop: node._mmrpRefs.control.crop};})()",
+               _modal_setup(_ready_source_control(), available=True, wired=True), runtime=True, modal=True)
+    before, after = got["before"], got["after"]
+    assert (before["badge"], before["primary"]) == ("Ready", "Done")
+    assert before["map"] == "/view?filename=source_edges.mp4&type=input&subfolder=control_maps"
+    assert (before["stageShown"], before["mapShown"], before["redo"]) == (True, True, "Regenerate")
+    assert before["button"] == "ControlNet: Edges"
+    assert before["facts"] == [
+        ["ok", "Render 4.0 s → 107 frames at 24 fps."],
+        ["ok", "control_video → Apply MiniMax H3 Fun ControlNet."],
+    ]
+    # The stored map is gone, as before; the dialog still shows it, greyed, with why.
+    assert got["stored"] is None and got["crop"] is None
+    assert (after["badge"], after["primary"], after["primaryDisabled"]) == ("Out of date", "Regenerate", False)
+    assert after["map"] == before["map"] and after["mapShown"] is True
+    assert "You changed the crop after this map was made" in after["note"]
+    assert after["button"] == "ControlNet: needs map"
+
+
+def test_remove_guide_can_be_undone_without_its_queued_preparation():
+    control = {**_ready_source_control(), "preparation": {"prompt_id": "p1", "status": "queued"}}
+    got = _run("(async () => {await openControlModal(node); byClass('mmrp-ctl-remove').onclick();"
+               "const removed = node._mmrpRefs.control; const toast = byClass('mmrp-ctl-toast');"
+               "const message = toast.hidden ? null : toast.children[0].textContent; const button = view().button;"
+               "find('Undo').onclick();"
+               "return {removed, message, button, restored: node._mmrpRefs.control, toastHidden: toast.hidden};})()",
+               _modal_setup(control, available=True, wired=True), runtime=True, modal=True)
+    assert got["removed"] is None
+    assert got["message"] == "Guide removed. The queued preparation stays in ComfyUI's queue."
+    assert got["button"] == "ControlNet"
+    assert got["restored"]["file"] == "source.mp4"
+    assert got["restored"]["map"] == _ready_source_control()["map"]
+    assert "preparation" not in got["restored"]
+    assert got["toastHidden"] is True
+
+
+def test_unwired_output_is_reported_in_dialog_and_on_node_button():
+    got = _run("(async () => {syncControlsButton(node); await openControlModal(node); return view();})()",
+               _modal_setup(_ready_source_control(), available=True), runtime=True, modal=True)
+    assert got["facts"][1] == ["warn", "control_video isn't connected."]
+    assert got["button"] == "ControlNet: Edges · not wired"
+
+
+def test_current_map_can_be_rebuilt_without_changing_a_setting():
+    got = _run("(async () => {await openControlModal(node); const actions = byClass('mmrp-ctl-actions');"
+               "await actions.children[1].onclick(); return {requests, view: view()};})()",
+               _modal_setup(_ready_source_control(), available=True, wired=True), runtime=True, modal=True)
+    # The fake server answers prepare with no workflow, so the queue step refuses it;
+    # what matters is that the rebuild asked the server instead of closing.
+    assert got["requests"] == ["/minimax_refpack/control/capabilities", "/minimax_refpack/control/prepare"]
+
+
+def test_a_drag_released_after_the_dialog_closed_saves_nothing():
+    got = _run("(async () => {await openControlModal(node); const before = node._mmrpRefs.control.crop;"
+               "const rect = byClass('mmrp-crop-rect');"
+               "rect.listeners.mousedown({clientX: 10, clientY: 10, preventDefault() {}, stopPropagation() {}});"
+               "window.listeners.mousemove({clientX: 40, clientY: 10});"
+               "const up = window.listeners.mouseup; modal.isConnected = false; modal.listeners['mmrp-modal-close']();"
+               "const left = Object.keys(window.listeners);"
+               "up?.(); return {before, after: node._mmrpRefs.control.crop, saves, left};})()",
+               _modal_setup(_ready_source_control(), available=True, wired=True), runtime=True, modal=True)
+    assert got["after"] == got["before"]
+    assert got["saves"] == 0
+    assert got["left"] == []
+
+
+def test_node_button_reports_a_preparation_in_progress():
+    control = {**_ready_source_control(), "map": None, "preparation": {"prompt_id": "p1", "status": "running"}}
+    got = _run("(() => {syncControlsButton(node); return node._mmrpBody.controlsButton.textContent;})()",
+               _modal_setup(control, available=True, wired=True), runtime=True, modal=True)
+    assert got == "ControlNet: preparing"
+
+
+def test_a_render_length_change_is_named_as_what_changed():
+    control = _ready_source_control()
+    got = _run(f"controlChangedSettings({{file: 'source.mp4', map: {json.dumps(control['map'])}}}, "
+               f"{json.dumps(control)}, 6)")
+    assert got == ["the render length"]
+
+
+def test_output_feeding_another_node_is_flagged_but_still_counts_as_wired():
+    got = _run("(async () => {syncControlsButton(node); await openControlModal(node); return view();})()",
+               _modal_setup(_ready_source_control(), available=True, wired=True, target="PreviewImage"),
+               runtime=True, modal=True)
+    assert got["facts"][1] == ["warn", "control_video → PreviewImage."]
+    assert got["button"] == "ControlNet: Edges"
+
+
+def test_a_click_without_a_drag_keeps_an_old_full_frame_crop_and_its_map():
+    control = _ready_source_control()
+    control["crop"] = [0, 0, 1, 1]
+    control["map"]["recipe"]["crop"] = [0, 0, 1, 1]
+    got = _run("(async () => {await openControlModal(node); const rect = byClass('mmrp-crop-rect');"
+               "rect.listeners.mousedown({clientX: 10, clientY: 10, preventDefault() {}, stopPropagation() {}});"
+               "window.listeners.mouseup(); return {crop: node._mmrpRefs.control.crop,"
+               "map: !!node._mmrpRefs.control.map, saves, badge: view().badge};})()",
+               _modal_setup(control, available=True, wired=True), runtime=True, modal=True)
+    assert got == {"crop": [0, 0, 1, 1], "map": True, "saves": 0, "badge": "Ready"}
+
+
+def test_switching_tabs_and_back_restores_the_ready_map():
+    got = _run("(async () => {await openControlModal(node); find('Use a map I already have').onclick();"
+               "const away = {type: node._mmrpRefs.control.input_type, map: node._mmrpRefs.control.map};"
+               "find('Make from a video').onclick(); return {away, back: view(),"
+               "map: node._mmrpRefs.control.map?.file};})()",
+               _modal_setup(_ready_source_control(), available=True, wired=True), runtime=True, modal=True)
+    assert got["away"] == {"type": "map", "map": None}
+    assert (got["back"]["badge"], got["back"]["primary"]) == ("Ready", "Done")
+    assert got["map"] == "control_maps/source_edges.mp4"
+
+
+def test_no_second_rebuild_while_one_is_queued():
+    control = {**_ready_source_control(), "preparation": {"prompt_id": "p1", "status": "queued"}}
+    got = _run("(async () => {await openControlModal(node); return view();})()",
+               _modal_setup(control, available=True, wired=True), runtime=True, modal=True)
+    assert (got["badge"], got["primary"], got["primaryDisabled"], got["redo"]) == ("Queued", "Done", False, None)
+
+
+@pytest.mark.parametrize("seconds", [0.25, 0.9375, 1, 1.0625, 4, 4.2, 5, 8, 10.04, 12.5])
+def test_target_frames_match_the_server(seconds):
+    from minimax_refpack import controls
+    assert _run(f"controlTargetFrames({seconds})") == controls.target_frames(seconds)
+
+
+def test_length_fact_reports_hold_cut_cover_unknown_and_clip_length():
+    got = _run("[controlLengthFact(4, 2.5), controlLengthFact(4, 6), controlLengthFact(8, 8),"
+               "controlLengthFact(null, 3), controlLengthFact(0, 3), controlLengthFact(4, null), controlLengthFact(0.2, 3)]"
+               ".map(f => [f.level, f.head, f.detail])")
+    assert got == [
+        ["warn", "Render 4.0 s → 107 frames at 24 fps.",
+         "The clip gives 2.50 s; the map holds its last frame for the final 1.96 s."],
+        ["ok", "Render 4.0 s → 107 frames at 24 fps.", "The last 1.54 s of the clip are not used."],
+        ["ok", "Render 8.0 s → 192 frames at 24 fps.", "The clip covers it."],
+        ["warn", "Render length unknown.", got[3][2]],
+        ["ok", "length_seconds is 0.", "The map keeps the clip's own length, cut down to MiniMax's 17k+5 frame grid."],
+        ["ok", "Render 4.0 s → 107 frames at 24 fps.", ""],
+        ["warn", "Render 0.20 s is too short.", "A control map needs at least 5 frames at 24 fps (0.21 s)."],
+    ]
+    assert "PrimitiveFloat" in got[3][2]
+
+
+def test_output_targets_read_map_and_object_link_tables():
+    got = _run("(() => {const target = {comfyClass: 'MiniMaxH3FunControlNetApply', title: 'Apply'};"
+               "const node = (links) => ({outputs: [{name: 'prompt', links: [1]}, {name: 'control_video', links: [7]}],"
+               "graph: {links, getNodeById: id => id === 3 ? target : null}});"
+               "return [controlOutputTargets(node(new Map([[7, {target_id: 3}]]))),"
+               "controlOutputTargets(node({7: {target_id: 3}})), controlOutputTargets({outputs: []}),"
+               "controlOutputTargets(node(new Map()))];})()")
+    expected = [{"type": "MiniMaxH3FunControlNetApply", "title": "Apply"}]
+    assert got == [expected, expected, [], []]
+
+
+def test_dialog_keeps_preparation_and_rendering_separate_in_its_wording():
     text = JS.read_text()
-    assert "Generate from source video" in text
-    assert "Use existing control map" in text
-    assert "Use control map" in text
+    assert "Make from a video" in text
+    assert "Use a map I already have" in text
+    assert "Check map" in text
     assert "Map resolution" in text
     assert "24 fps" in text
-    assert "hold" in text
+    assert "holds its last frame" in text
 
 
 def test_portable_config_saves_and_loads_imported_map_and_duration():
@@ -497,7 +710,7 @@ def test_ui_keeps_preparation_separate_from_render_and_restores_config_control()
     modal = text.split("async function openControlModal(node)", 1)[1].split(
         "// Config (reference pack) save/load", 1
     )[0]
-    assert "Generate control map" in modal
+    assert "Generate ${modeLabel.toLowerCase()} map" in modal
     assert "only control preparation" in modal
     assert "may download" in modal
     assert "app.queuePrompt" not in modal
