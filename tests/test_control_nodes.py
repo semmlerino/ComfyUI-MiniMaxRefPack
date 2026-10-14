@@ -21,7 +21,7 @@ def setup_source(tmp_path, *, crop=None, trim=None, seconds=1):
 
 def test_source_decode_is_cpu_aligned_trimmed_and_resized(tmp_path):
     control, recipe = setup_source(tmp_path, crop=[0, 0, 0.5, 1], trim=[0.25, 1.5])
-    frames = control_nodes._prepare_frames(control, recipe, tmp_path)
+    frames = controls.prepare_frames(control, recipe, tmp_path)
     assert frames.device.type == "cpu"
     assert frames.dtype == torch.float32
     assert frames.shape == (39, 96, 64, 3)
@@ -31,13 +31,13 @@ def test_source_replacement_before_preparation_is_rejected(tmp_path):
     control, recipe = setup_source(tmp_path)
     (tmp_path / control["file"]).write_bytes(b"replaced")
     with pytest.raises(controls.ControlError, match="stale"):
-        control_nodes._prepare_frames(control, recipe, tmp_path)
+        controls.prepare_frames(control, recipe, tmp_path)
 
 
 @pytest.mark.parametrize("seconds,count", [(5, 124), (8, 192)])
 def test_target_duration_snaps_up_and_short_source_holds_last_frame(tmp_path, seconds, count):
     control, recipe = setup_source(tmp_path, seconds=seconds)
-    frames = control_nodes._prepare_frames(control, recipe, tmp_path)
+    frames = controls.prepare_frames(control, recipe, tmp_path)
     assert frames.shape[0] == count
     assert torch.equal(frames[-1], frames[47])
     assert not torch.equal(frames[0], frames[-1])
@@ -45,7 +45,7 @@ def test_target_duration_snaps_up_and_short_source_holds_last_frame(tmp_path, se
 
 def test_source_driven_length_snaps_down_without_padding(tmp_path):
     control, recipe = setup_source(tmp_path, seconds=0)
-    assert control_nodes._prepare_frames(control, recipe, tmp_path).shape[0] == 39
+    assert controls.prepare_frames(control, recipe, tmp_path).shape[0] == 39
 
 
 def test_prepared_output_is_checked_against_existing_media_budget(tmp_path, monkeypatch):
@@ -53,7 +53,7 @@ def test_prepared_output_is_checked_against_existing_media_budget(tmp_path, monk
     monkeypatch.setattr(media, "load_video", lambda *a, **k: (torch.zeros(48, 48, 64, 3), None))
     monkeypatch.setattr(media, "_decode_budget", lambda: 1000)
     with pytest.raises(controls.ControlError, match="decode budget"):
-        control_nodes._prepare_frames(control, recipe, tmp_path)
+        controls.prepare_frames(control, recipe, tmp_path)
 
 
 def test_decode_window_covers_complete_snapped_target(tmp_path, monkeypatch):
@@ -66,7 +66,7 @@ def test_decode_window_covers_complete_snapped_target(tmp_path, monkeypatch):
         return original(path, **kwargs)
 
     monkeypatch.setattr(media, "load_video", load)
-    control_nodes._prepare_frames(control, recipe, tmp_path)
+    controls.prepare_frames(control, recipe, tmp_path)
     assert seen == [[0, 124 / 24]]
 
 
@@ -83,7 +83,7 @@ def test_streamed_h264_map_round_trip_and_history_receipt(tmp_path, monkeypatch)
     assert ready["file"].startswith("control_maps/source-edges-")
     with av.open(str(tmp_path / ready["file"])) as container:
         stream = container.streams.video[0]
-        assert float(stream.average_rate) == 24
+        assert stream.average_rate == 24
         assert stream.codec_context.name == "h264"
         assert stream.codec_context.pix_fmt == "yuv420p"
         assert len(list(container.decode(stream))) == 39

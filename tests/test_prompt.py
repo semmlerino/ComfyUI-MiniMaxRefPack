@@ -935,7 +935,6 @@ def test_any_classifier_failure_falls_back_to_standard(monkeypatch, failure):
 
 def test_explicit_job_type_never_calls_the_classifier(monkeypatch, tmp_path):
     calls = []
-    real_post = prompt.requests.post
 
     def counting_post(url, headers=None, json=None, timeout=None):  # noqa: A002
         calls.append(json.get("model"))

@@ -11,7 +11,7 @@ import pytest
 import torch
 from PIL import Image
 
-from minimax_refpack import control_nodes, controls, media, nodes, refs, routes
+from minimax_refpack import controls, media, nodes, refs, routes
 from .conftest import write_clip
 
 
@@ -162,28 +162,28 @@ def test_imported_receipt_cannot_reference_a_second_file(saved_map, tmp_path):
 
 
 def test_import_rejects_a_file_replaced_while_decoding(saved_map, tmp_path, monkeypatch):
-    original = control_nodes._prepare_frames
+    original = controls.prepare_frames
 
     def decode(*args, **kwargs):
         frames = original(*args, **kwargs)
         write_clip(tmp_path / saved_map["file"], n=60, fps=30, size=(64, 48), container="mp4", marker="gray")
         return frames
 
-    monkeypatch.setattr(control_nodes, "_prepare_frames", decode)
+    monkeypatch.setattr(controls, "prepare_frames", decode)
     with pytest.raises(controls.ControlError, match="changed|stale"):
         controls.import_map(saved_map, tmp_path, 1)
 
 
 def test_load_rejects_an_imported_map_replaced_during_decode(saved_map, tmp_path, monkeypatch):
     ready = controls.import_map(saved_map, tmp_path, 1)
-    original = control_nodes._prepare_frames
+    original = controls.prepare_frames
 
     def decode(*args, **kwargs):
         frames = original(*args, **kwargs)
         write_clip(tmp_path / saved_map["file"], n=60, fps=30, size=(64, 48), container="mp4", marker="gray")
         return frames
 
-    monkeypatch.setattr(control_nodes, "_prepare_frames", decode)
+    monkeypatch.setattr(controls, "prepare_frames", decode)
     with pytest.raises(controls.ControlError, match="changed|stale"):
         controls.load_ready(ready, tmp_path, 1, media.MediaCache())
 

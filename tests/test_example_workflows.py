@@ -152,7 +152,7 @@ def test_no_link_points_at_a_node_that_is_not_there(path):
     """Deleting a node by hand can leave a link behind, which breaks the graph on load."""
     graph = json.loads(path.read_text())
     ids = {n["id"] for n in graph.get("nodes", [])}
-    dangling = [l for l in graph.get("links", []) if l[1] not in ids or l[3] not in ids]
+    dangling = [link for link in graph.get("links", []) if link[1] not in ids or link[3] not in ids]
     assert not dangling, f"{path.name}: {len(dangling)} link(s) reference a missing node"
 
 

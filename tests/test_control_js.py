@@ -38,6 +38,7 @@ def _run(expression, setup="", runtime=False, modal=False):
         end = text.index("// Config (reference pack) save/load", start)
         script += text[start:end]
     script += f"\nconsole.log(JSON.stringify(await ({expression})));\n"
+    assert NODE is not None
     result = subprocess.run(
         [NODE, "--input-type=module", "-e", script],
         capture_output=True, text=True, check=False, timeout=10,
@@ -46,7 +47,7 @@ def _run(expression, setup="", runtime=False, modal=False):
     return json.loads(result.stdout)
 
 
-def _control():
+def _control() -> dict[str, Any]:
     return {
         "file": "source.mp4", "mode": "edges", "resolution": 512,
         "trim": [1, 3], "crop": [0, 0, 1, 1],
@@ -59,7 +60,7 @@ def _control():
     }
 
 
-def _map_control():
+def _map_control() -> dict[str, Any]:
     return {
         "input_type": "map", "file": "pose.mp4", "mode": "pose",
         "resolution": 512, "trim": None, "crop": None,

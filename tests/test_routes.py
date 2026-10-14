@@ -13,7 +13,6 @@ import os
 import pytest
 
 from minimax_refpack import routes
-from minimax_refpack.refs import Reference, ReferenceSet
 
 
 class FakeRequest:

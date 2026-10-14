@@ -6,8 +6,9 @@ import os
 from pathlib import Path
 import re
 import tempfile
+from typing import Any
 
-from . import controls, media
+from . import controls
 
 
 def _config(control_json, recipe_json):
@@ -22,57 +23,8 @@ def _config(control_json, recipe_json):
 
 
 def _input_dir():
-    import folder_paths
+    import folder_paths  # pyright: ignore[reportMissingImports]
     return folder_paths.get_input_directory()
-
-
-def _prepare_frames(control, prepared_recipe, input_dir, cache=None):
-    import torch
-    import torch.nn.functional as functional
-
-    seconds = prepared_recipe.get("length_seconds", 0)
-    controls.verify_source(control, prepared_recipe, input_dir, seconds)
-    requested_count = controls.target_frames(seconds)
-    trim = control["trim"]
-    if seconds:
-        start = trim[0] if trim else 0
-        decode_seconds = requested_count / controls.FPS
-        end = min(trim[1], start + decode_seconds) if trim else start + decode_seconds
-        trim = [start, end]
-    path = controls.safe_path(input_dir, control["file"])
-    imported = control.get("input_type") == "map"
-    try:
-        if imported:
-            import av
-            with av.open(path) as container:
-                formats = container.format.name.split(",")
-                if (not container.streams.video
-                    or any(name.endswith("_pipe") or name in ("image2", "image2pipe") for name in formats)):
-                    raise controls.ControlError("imported control map must be a video with at least 5 frames")
-        loader = media.load_video if cache is None else cache.video
-        frames, _audio = loader(path, target_fps=controls.FPS, crop=control["crop"], trim=trim)
-    except Exception as error:
-        if not imported or isinstance(error, controls.ControlError):
-            raise
-        raise controls.ControlError(f"cannot read imported control map video: {error}") from error
-    available = int(frames.shape[0])
-    count = requested_count if requested_count is not None else 5 + ((available - 5) // 17) * 17
-    if count < 5:
-        raise controls.ControlError("control source must contain at least 5 frames at 24 fps")
-    height, width = map(int, frames.shape[1:3])
-    scale = control["resolution"] / min(width, height)
-    # Only even dimensions for playback; a 64-pixel grid here would distort the source.
-    out_w = max(2, round(width * scale / 2) * 2)
-    out_h = max(2, round(height * scale / 2) * 2)
-    if count * out_w * out_h * 3 * 4 > media._decode_budget():
-        raise controls.ControlError("prepared control frames exceed the reference decode budget; reduce resolution or duration")
-    # One destination and one temporary frame, rather than a full resized batch copy.
-    result = torch.empty((count, out_h, out_w, 3), dtype=torch.float32, device="cpu")
-    for index in range(count):
-        frame = frames[min(index, available - 1)].to(device="cpu", dtype=torch.float32).permute(2, 0, 1)[None]
-        resized = functional.interpolate(frame, size=(out_h, out_w), mode="bilinear", align_corners=False)
-        result[index].copy_(resized[0].permute(1, 2, 0))
-    return result
 
 
 class MiniMaxH3ControlSource:
@@ -94,7 +46,7 @@ class MiniMaxH3ControlSource:
 
     def load(self, control_json, recipe_json):
         control, prepared_recipe = _config(control_json, recipe_json)
-        return (_prepare_frames(control, prepared_recipe, _input_dir()),)
+        return (controls.prepare_frames(control, prepared_recipe, _input_dir()),)
 
 
 def map_name_stem(source_file):
@@ -108,7 +60,7 @@ def write_map(images, control, prepared_recipe, input_dir):
     import av
     import numpy as np
 
-    shape = tuple(getattr(images, "shape", ()))
+    shape: tuple[int, ...] = tuple(getattr(images, "shape", ()))
     if len(shape) != 4 or shape[-1] != 3 or shape[0] < 5 or (shape[0] - 5) % 17:
         raise controls.ControlError("control map expects IMAGE frames [17k+5, height, width, 3]")
     count, height, width, _channels = shape
@@ -186,7 +138,7 @@ class MiniMaxH3ControlMapSave:
         # Saving is an explicit preparation action; re-queue repairs a removed map too.
         return float("nan")
 
-    def save(self, images, control_json, recipe_json):
+    def save(self, images, control_json, recipe_json) -> dict[str, Any]:
         control, prepared_recipe = _config(control_json, recipe_json)
         ready = write_map(images, control, prepared_recipe, _input_dir())
         return {"ui": {"control_map": [ready]}, "result": ()}

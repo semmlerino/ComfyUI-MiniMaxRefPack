@@ -1,4 +1,4 @@
-"""Control-map configuration and preparation graphs; no detector execution here."""
+"""Control-map configuration, preparation graphs and CPU frame decoding; no detector execution here."""
 
 import hashlib
 import json
@@ -6,6 +6,8 @@ import math
 import os
 from pathlib import Path
 import uuid
+
+from . import media
 
 MODES = {
     "pose": ("Pose", "DWPreprocessor"),
@@ -215,16 +217,64 @@ def verify_source(control, prepared_recipe, input_dir, length_seconds):
     return source_sha
 
 
+def prepare_frames(control, prepared_recipe, input_dir, cache=None):
+    """Decode, crop, trim and resize a source or imported map to the recipe's frames, on CPU."""
+    import torch
+    import torch.nn.functional as functional
+
+    seconds = prepared_recipe.get("length_seconds", 0)
+    verify_source(control, prepared_recipe, input_dir, seconds)
+    requested_count = target_frames(seconds)
+    trim = control["trim"]
+    if requested_count is not None:
+        start = trim[0] if trim else 0
+        decode_seconds = requested_count / FPS
+        end = min(trim[1], start + decode_seconds) if trim else start + decode_seconds
+        trim = [start, end]
+    path = safe_path(input_dir, control["file"])
+    imported = control.get("input_type") == "map"
+    try:
+        if imported:
+            import av
+            with av.open(path) as container:
+                formats = container.format.name.split(",")
+                if (not container.streams.video
+                    or any(name.endswith("_pipe") or name in ("image2", "image2pipe") for name in formats)):
+                    raise ControlError("imported control map must be a video with at least 5 frames")
+        loader = media.load_video if cache is None else cache.video
+        frames, _audio = loader(path, target_fps=FPS, crop=control["crop"], trim=trim)
+    except Exception as error:
+        if not imported or isinstance(error, ControlError):
+            raise
+        raise ControlError(f"cannot read imported control map video: {error}") from error
+    available = int(frames.shape[0])
+    count = requested_count if requested_count is not None else 5 + ((available - 5) // 17) * 17
+    if count < 5:
+        raise ControlError("control source must contain at least 5 frames at 24 fps")
+    height, width = map(int, frames.shape[1:3])
+    scale = control["resolution"] / min(width, height)
+    # Only even dimensions for playback; a 64-pixel grid here would distort the source.
+    out_w = max(2, round(width * scale / 2) * 2)
+    out_h = max(2, round(height * scale / 2) * 2)
+    if count * out_w * out_h * 3 * 4 > media._decode_budget():
+        raise ControlError("prepared control frames exceed the reference decode budget; reduce resolution or duration")
+    # One destination and one temporary frame, rather than a full resized batch copy.
+    result = torch.empty((count, out_h, out_w, 3), dtype=torch.float32, device="cpu")
+    for index in range(count):
+        frame = frames[min(index, available - 1)].to(device="cpu", dtype=torch.float32).permute(2, 0, 1)[None]
+        resized = functional.interpolate(frame, size=(out_h, out_w), mode="bilinear", align_corners=False)
+        result[index].copy_(resized[0].permute(1, 2, 0))
+    return result
+
+
 def import_map(raw, input_dir, length_seconds=0):
     """Validate a standalone map on CPU and return its receipt without writing media."""
-    from .control_nodes import _prepare_frames
-
     if not isinstance(raw, dict) or raw.get("input_type") != "map":
         raise ControlError("choose input_type map to import an existing control map")
     control = normalize_control({**raw, "map": None})
     source_sha = file_sha256(safe_path(input_dir, control["file"]))
     prepared_recipe = recipe(control, source_sha, length_seconds, None)
-    frames = _prepare_frames(control, prepared_recipe, input_dir)
+    frames = prepare_frames(control, prepared_recipe, input_dir)
     verify_source(control, prepared_recipe, input_dir, length_seconds)
     count, height, width, _channels = map(int, frames.shape)
     control["map"] = {
@@ -256,8 +306,7 @@ def load_ready(control, input_dir, length_seconds, cache):
     if file_sha256(path) != ready["sha256"]:
         raise ControlError(f"control map file changed; {action}")
     if imported:
-        from .control_nodes import _prepare_frames
-        frames = _prepare_frames(control, ready["recipe"], input_dir, cache=cache)
+        frames = prepare_frames(control, ready["recipe"], input_dir, cache=cache)
         verify_source(control, ready["recipe"], input_dir, length_seconds)
     else:
         frames, _audio = cache.video(path, target_fps=FPS)
