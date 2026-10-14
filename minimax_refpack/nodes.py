@@ -345,7 +345,7 @@ class MiniMaxH3ReferencePack:
     ):
         openrouter_model = openrouter_model or (model or "")
         local_model_slug = local_model_slug or (model_override or "")
-        import folder_paths
+        import folder_paths  # pyright: ignore[reportMissingImports]
 
         reference_set = refs.ReferenceSet.from_json(references_json)
         sig = _files_signature(reference_set, folder_paths.get_input_directory())
@@ -396,7 +396,7 @@ class MiniMaxH3ReferencePack:
         # by a stale one riding alongside it.
         openrouter_model = openrouter_model or (model or "")
         local_model_slug = local_model_slug or (model_override or "")
-        import folder_paths
+        import folder_paths  # pyright: ignore[reportMissingImports]
 
         started = time.perf_counter()
         reference_set = refs.ReferenceSet.from_json(references_json)

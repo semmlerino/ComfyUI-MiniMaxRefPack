@@ -121,9 +121,17 @@ def target_frames(length_seconds):
     return 5 + ((count - 5 + 16) // 17) * 17
 
 
+def require_control(raw):
+    """normalize_control for callers that need a control, not an absent one."""
+    control = normalize_control(raw)
+    if control is None:
+        raise ControlError("control is required")
+    return control
+
+
 def recipe(control, source_sha256, length_seconds, processor):
     """Filename-independent identity, so portable staging may rename both files."""
-    control = normalize_control(control)
+    control = require_control(control)
     result = {
         "source_sha256": _digest(source_sha256, "control source_sha256"),
         "mode": control["mode"], "resolution": control["resolution"],
@@ -199,7 +207,7 @@ def capabilities(node_registry=None):
 
 
 def verify_source(control, prepared_recipe, input_dir, length_seconds):
-    control = normalize_control(control)
+    control = require_control(control)
     action = "open ControlNet and click Check again" if control.get("input_type") == "map" else "open ControlNet and click Regenerate"
     if not isinstance(prepared_recipe, dict):
         raise ControlError(f"control recipe is invalid; {action}")
@@ -271,7 +279,7 @@ def import_map(raw, input_dir, length_seconds=0):
     """Validate a standalone map on CPU and return its receipt without writing media."""
     if not isinstance(raw, dict) or raw.get("input_type") != "map":
         raise ControlError("choose input_type map to import an existing control map")
-    control = normalize_control({**raw, "map": None})
+    control = require_control({**raw, "map": None})
     source_sha = file_sha256(safe_path(input_dir, control["file"]))
     prepared_recipe = recipe(control, source_sha, length_seconds, None)
     frames = prepare_frames(control, prepared_recipe, input_dir)
@@ -286,7 +294,7 @@ def import_map(raw, input_dir, length_seconds=0):
 
 
 def load_ready(control, input_dir, length_seconds, cache):
-    control = normalize_control(control)
+    control = require_control(control)
     ready = control["map"]
     if ready is None:
         if control.get("input_type") == "map":

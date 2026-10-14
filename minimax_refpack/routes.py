@@ -25,14 +25,21 @@ from .refs import ReferenceError, validate_crop
 from . import controls, endpoint, logs, media, prompt
 
 try:
-    from server import PromptServer
+    from server import PromptServer  # pyright: ignore[reportMissingImports]
 except ImportError:  # pragma: no cover - exercised only when ComfyUI isn't on sys.path
     PromptServer = None
 
 try:
-    import folder_paths
+    import folder_paths  # pyright: ignore[reportMissingImports]
 except ImportError:  # pragma: no cover - same as above
     folder_paths = None
+
+
+def _folders():
+    """ComfyUI's folder_paths; the routes are only registered inside ComfyUI, where it imports."""
+    if folder_paths is None:
+        raise web.HTTPServiceUnavailable(text="ComfyUI folder_paths is not available")
+    return folder_paths
 
 
 def _safe_join(base_dir: str, name: str) -> str | None:
@@ -61,7 +68,7 @@ def _safe_join(base_dir: str, name: str) -> str | None:
 
 
 async def probe_route(request: web.Request) -> web.Response:
-    input_dir = folder_paths.get_input_directory()
+    input_dir = _folders().get_input_directory()
     name = request.query.get("file", "")
     path = _safe_join(input_dir, name)
     if path is None or not os.path.isfile(path):
@@ -102,7 +109,7 @@ def _parse_seconds_param(raw: str | None) -> float | None:
 
 
 async def thumb_route(request: web.Request) -> web.Response:
-    input_dir = folder_paths.get_input_directory()
+    input_dir = _folders().get_input_directory()
     name = request.query.get("file", "")
     path = _safe_join(input_dir, name)
     if path is None or not os.path.isfile(path):
@@ -159,14 +166,14 @@ async def list_files_route(request: web.Request) -> web.Response:
     kind = request.query.get("kind", "")
     if kind not in ("image", "video", "audio"):
         return web.Response(status=400, text="kind must be image, video or audio")
-    input_dir = folder_paths.get_input_directory()
+    input_dir = _folders().get_input_directory()
     # CU/folder_paths.py:229 - the same content-type filter the core input pickers use;
     # it keys on the extension, so a `sub/name.ext` entry filters like `name.ext`.
     files = _input_files_one_level(input_dir)
     # An audio reference may point at a video file (its soundtrack); core's LoadAudio
     # lists the same pair (nodes_audio.py:364).
     types = ["audio", "video"] if kind == "audio" else [kind]
-    return web.json_response({"files": folder_paths.filter_files_content_types(files, types)})
+    return web.json_response({"files": _folders().filter_files_content_types(files, types)})
 
 
 async def system_prompt_route(request: web.Request) -> web.Response:
@@ -225,7 +232,7 @@ async def control_prepare_route(request):
             raise controls.ControlError("control preparation body must be an object")
         result = await asyncio.to_thread(
             controls.preparation_graph, body.get("control"),
-            folder_paths.get_input_directory(), body.get("length_seconds", 0),
+            _folders().get_input_directory(), body.get("length_seconds", 0),
         )
         return web.json_response(result)
     except (ValueError, TypeError) as error:
@@ -243,7 +250,7 @@ async def control_import_route(request):
         async with _CONTROL_IMPORT_LOCK:
             worker = asyncio.create_task(asyncio.to_thread(
                 controls.import_map, body.get("control"),
-                folder_paths.get_input_directory(), body.get("length_seconds", 0),
+                _folders().get_input_directory(), body.get("length_seconds", 0),
             ))
             try:
                 control = await asyncio.shield(worker)

@@ -150,7 +150,7 @@ def _open_container(path: str):
 
 def _audio_load_fn():
     """Indirection point so tests can substitute a fake without comfy_extras installed."""
-    from comfy_extras.nodes_audio import load as _load
+    from comfy_extras.nodes_audio import load as _load  # pyright: ignore[reportMissingImports]
 
     return _load
 
@@ -186,7 +186,7 @@ def load_image(path: str, crop=None, max_edge: int = 0):
         if crop is not None:
             img = img.crop(_crop_box(crop, img.width, img.height))
         if max_edge:
-            img.thumbnail((max_edge, max_edge), Image.LANCZOS)
+            img.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
         fields["out"] = f"{img.width}x{img.height}"
         arr = np.array(img).astype(np.float32) / 255.0
         return torch.from_numpy(arr)[None, ...]
@@ -388,7 +388,7 @@ class _FrameConverter:
             img = img[..., :3]
         return img
 
-    def _aligned(self, frame):
+    def _aligned(self, frame) -> Any:
         """Pad to a multiple of 32 and smear the border, video_types.py:381-397.
 
         Not cosmetic: on a 66x34 frame, skipping it differs by max 0.372, and 56 of the
@@ -399,6 +399,7 @@ class _FrameConverter:
         diverged from - the whole decoder is asserted against it frame for frame.
         """
         import av
+        import av.filter
 
         if self._align is None:
             pad_w = ((frame.width + 31) // 32) * 32
@@ -471,9 +472,9 @@ class _PassResult:
     __slots__ = ("sink", "box", "audio", "n_src", "src_fps", "needs_recount", "reason")
 
     def __init__(self):
-        self.sink = None
-        self.box = None
-        self.audio = None
+        self.sink: Any = None
+        self.box: Any = None
+        self.audio: Any = None
         self.n_src = 0
         self.src_fps = 1.0
         self.needs_recount = False
@@ -597,6 +598,7 @@ class _AudioCollector:
 
     def feed(self, raw) -> None:
         import av
+        import av.audio.resampler
 
         if self._resampler is None:
             # Deferred initialisation, not a look-ahead: the rate arrives WITH the first
@@ -744,6 +746,7 @@ def _decode_pass(path, target_fps, crop, start_time, duration, *, n_src_hint, wa
     hint never asks for another.
     """
     import av
+    import av.error
 
     result = _PassResult()
     with _open_container(path) as container:
@@ -813,6 +816,8 @@ def _decode_pass(path, target_fps, crop, start_time, duration, *, n_src_hint, wa
                     continue
                 try:
                     for frame in packet.decode():
+                        if not isinstance(frame, av.VideoFrame):
+                            continue
                         # Guarded `pts is None`, `_save_transcoded`'s form (:637):
                         # `get_components_internal` compares unguarded and would TypeError.
                         if frame.pts is not None and frame.pts < start_pts:

@@ -306,7 +306,7 @@ def _tensor_to_jpeg_b64(tensor) -> str:
     arr = (arr * 255.0).astype(np.uint8)
     img = Image.fromarray(arr, "RGB")
     # thumbnail() shrinks in place and never enlarges, which is the behaviour we want.
-    img.thumbnail((VLM_IMAGE_LONG_EDGE, VLM_IMAGE_LONG_EDGE), Image.LANCZOS)
+    img.thumbnail((VLM_IMAGE_LONG_EDGE, VLM_IMAGE_LONG_EDGE), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=VLM_JPEG_QUALITY)
     return base64.b64encode(buf.getvalue()).decode("ascii")

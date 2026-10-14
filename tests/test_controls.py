@@ -189,3 +189,13 @@ def test_http_prepare_returns_graph_without_submission(prepared, monkeypatch):
     control["file"] = "../outside.mp4"
     response = asyncio.run(routes.control_prepare_route(Request()))
     assert response.status == 400
+
+
+@pytest.mark.parametrize("call", [
+    lambda: controls.recipe(None, "0" * 64, 1, None),
+    lambda: controls.verify_source(None, {}, ".", 1),
+    lambda: controls.load_ready(None, ".", 1, None),
+])
+def test_absent_control_is_a_control_error(call):
+    with pytest.raises(controls.ControlError, match="required"):
+        call()

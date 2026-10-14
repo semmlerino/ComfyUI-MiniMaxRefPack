@@ -43,3 +43,13 @@ addopts = "--import-mode=importlib"
 markers = [
     "slow: real-media decodes and subprocess RSS probes; deselect with `-m 'not slow'`",
 ]
+
+[tool.basedpyright]
+# Standard, not basedpyright's default "recommended": the package passes it with no
+# errors. The tests drive the code with fakes (a stub request for aiohttp's Request,
+# plain dicts for receipts), so those rules are warnings under tests/.
+typeCheckingMode = "standard"
+executionEnvironments = [
+    { root = "tests", extraPaths = ["."], reportArgumentType = "warning", reportAttributeAccessIssue = "warning", reportOptionalSubscript = "warning", reportOptionalMemberAccess = "warning", reportCallIssue = "warning", reportIndexIssue = "warning", reportOperatorIssue = "warning", reportOptionalOperand = "warning", reportGeneralTypeIssues = "warning", reportPossiblyUnboundVariable = "warning" },
+    { root = "." },
+]

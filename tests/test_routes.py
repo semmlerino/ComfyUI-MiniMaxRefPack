@@ -260,3 +260,11 @@ def test_list_files_for_audio_includes_video_files(input_dir):
 
     resp = run(routes.list_files_route(FakeRequest(query={"kind": "audio"})))
     assert sorted(body_json(resp)["files"]) == ["b.mp4", "c.wav"]
+
+
+def test_routes_answer_503_outside_comfyui(monkeypatch):
+    from aiohttp import web
+
+    monkeypatch.setattr(routes, "folder_paths", None)
+    with pytest.raises(web.HTTPServiceUnavailable):
+        run(routes.list_files_route(FakeRequest(query={"kind": "video"})))
