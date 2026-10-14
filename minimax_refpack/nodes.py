@@ -174,7 +174,7 @@ class MiniMaxH3ReferencePack:
     # The declaration order IS the on-canvas order, and litegraph restores saved values
     # POSITIONALLY, so this list is a wire format as much as a layout. Reordering it (as
     # happened for 0.3.3) scrambles every workflow saved before the change unless
-    # web/refpack.js remaps them on load - see remapWidgetValues there, and keep the two
+    # web/lib/migrate.js remaps them on load - see remapWidgetValues there, and keep the two
     # in step. Grouped by decision flow, agreed with Aviv 2026-08-17: the mode first,
     # then that mode's settings, then what to write, then the target video, then how the
     # references are prepared.

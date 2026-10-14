@@ -1,41 +1,17 @@
 """Tile reorder: the pure move and midpoint-crossing index math, as shipped.
 
-The block between web/refpack.js's MMRP-REORDER markers is extracted and executed
-under node, so these tests run the browser code itself. The pointer listeners,
+moveRefInKind and slotIndexAtX are imported from web/lib/references.js under node, so
+these tests run the browser code itself. The pointer listeners,
 grab cursor and Escape-to-cancel path need a real canvas and are not covered.
 """
 
 import json
-import pathlib
-import shutil
-import subprocess
 
-import pytest
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-REFPACK_JS = REPO_ROOT / "web" / "refpack.js"
-
-NODE = shutil.which("node")
-requires_node = pytest.mark.skipif(NODE is None, reason="node is not installed")
-
-
-def _extract(marker: str = "MMRP-REORDER") -> str:
-    text = REFPACK_JS.read_text()
-    start = text.find(f"// >>> {marker}")
-    end = text.find(f"// <<< {marker}")
-    assert start != -1 and end != -1, f"the {marker} markers are gone from web/refpack.js"
-    return text[start:end]
+from _js import WEB, evaluate, requires_node
 
 
 def run_js(expression: str):
-    assert NODE is not None
-    script = _extract() + f"\nconsole.log(JSON.stringify({expression}));\n"
-    proc = subprocess.run(
-        [NODE, "--input-type=module", "-e", script],
-        capture_output=True, text=True, check=False,
-    )
-    assert proc.returncode == 0, f"node failed: {proc.stderr}"
-    return json.loads(proc.stdout.strip())
+    return evaluate(expression, "references")
 
 
 def _move(refs, kind, src, dst):
@@ -61,18 +37,12 @@ def _pictures(*names):
 X0, TILE, GAP = 10, 131, 6
 
 
-def test_the_markers_survive_in_the_shipped_file():
-    assert "function moveRefInKind" in _extract()
-    assert "function slotIndexAtX" in _extract()
-
-
+@requires_node
 def test_live_canvas_passes_the_shipped_tile_geometry():
-    text = REFPACK_JS.read_text()
+    text = (WEB / "refpack.js").read_text()
     assert "slotIndexAtX(pos.x, count, CL.x0, CL.tile, CL.gap)" in text
     assert "if (hit.type === \"tile\") beginReorder(node, e, hit);" in text
-    assert "x0: 10," in text
-    assert "tile: 131," in text
-    assert "gap: 6," in text
+    assert evaluate("[CL.x0, CL.tile, CL.gap]", "layout") == [X0, TILE, GAP]
 
 
 @requires_node

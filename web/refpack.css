@@ -7,9 +7,9 @@
  * refpack.js draw()). Palette stays LTX Director's flat neutral greyscale, no
  * gradients; the only colour anywhere is #ff4444 (danger / selection).
  *
- * FIXED GEOMETRY: the node is fixed-size (refpack.js fixedSize()), and that
+ * FIXED GEOMETRY: the node is fixed-size (lib/layout.js fixedSize()), and that
  * arithmetic assumes the heights pinned here — .mmrp-uploads 30px, .mmrp-direction
- * 110px, .mmrp-block gap 8px (CONTENT.uploadsH / promptH / gap in refpack.js),
+ * 110px, .mmrp-block gap 8px (CONTENT.uploadsH / promptH / gap in lib/layout.js),
  * and .mmrp-preview matches CL.tile (131px). Change one side only in lockstep
  * with the other.
  */
@@ -204,7 +204,7 @@
    OUTLINE, never border: refpack.js paints the slab's own edge rather than using a
    CSS border precisely to keep a border-vs-content-box mismatch out of canvas
    hit-testing, and the block's heights are pinned against the fixed-size arithmetic
-   in refpack.js. An outline reserves no layout space at any offset (this one is pulled
+   in lib/layout.js. An outline reserves no layout space at any offset (this one is pulled
    inside the rounded edge with a negative one), so the highlight cannot shift the
    node's geometry by a pixel. */
 .mmrp-dragover .mmrp-canvas {

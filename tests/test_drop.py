@@ -1,9 +1,9 @@
 """Drag-and-drop file routing, as the shipped browser code actually decides it.
 
 Dropped files are sorted by what they ARE, not by where the pointer landed, which is
-what lets one gesture fill all three sections. The router is extracted from
-web/refpack.js between its MMRP-DROP markers and executed under node, so this tests
-the shipped code rather than a copy of it that can drift out from under the tests.
+what lets one gesture fill all three sections. The router is web/lib/drop.js,
+imported under node, so this tests the shipped code rather than a copy of it that can
+drift out from under the tests.
 
 SCOPE, honestly: this covers the pure router only. The drag listeners, the
 preventDefault that stops ComfyUI hijacking the drop into a LoadImage node, and
@@ -11,40 +11,13 @@ addFiles' caps and uploads are NOT exercised here - they need a real browser.
 """
 
 import json
-import pathlib
-import shutil
-import subprocess
 
 import pytest
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-REFPACK_JS = REPO_ROOT / "web" / "refpack.js"
-
-NODE = shutil.which("node")
-requires_node = pytest.mark.skipif(NODE is None, reason="node is not installed")
-
-
-def _extract_drop_js() -> str:
-    """The marked block from the shipped file, or a hard failure if the markers moved."""
-    text = REFPACK_JS.read_text()
-    start = text.find("// >>> MMRP-DROP")
-    end = text.find("// <<< MMRP-DROP")
-    assert start != -1 and end != -1, (
-        "the MMRP-DROP markers are gone from web/refpack.js - this test extracts the "
-        "real shipped code through them, so removing them silently stops the drop "
-        "router from being covered at all"
-    )
-    return text[start:end]
+from _js import evaluate, requires_node
 
 
 def _run_js(expression: str):
-    script = _extract_drop_js() + f"\nconsole.log(JSON.stringify({expression}));\n"
-    proc = subprocess.run(
-        [NODE, "--input-type=module", "-e", script],
-        capture_output=True, text=True, check=False,
-    )
-    assert proc.returncode == 0, f"node failed: {proc.stderr}"
-    return json.loads(proc.stdout.strip())
+    return evaluate(expression, "drop")
 
 
 def _bucket(files):
@@ -65,22 +38,6 @@ def _bucket(files):
 
 def _file(name, type_=""):
     return {"name": name, "type": type_}
-
-
-# ---- the block is still there --------------------------------------------------
-
-
-def test_the_markers_survive_in_the_shipped_file():
-    """The migration test's own failure mode: markers deleted, coverage silently zero."""
-    assert "bucketDroppedFiles" in _extract_drop_js()
-
-
-@requires_node
-def test_the_extracted_block_runs_with_nothing_else_around_it():
-    """The constraint that makes every other test here possible: the block closes over
-    no module-level constant and touches no DOM. A closure over KINDS or CAPS compiles
-    fine in the browser and dies right here with a ReferenceError."""
-    assert _run_js("typeof bucketDroppedFiles") == "function"
 
 
 # ---- routing -------------------------------------------------------------------

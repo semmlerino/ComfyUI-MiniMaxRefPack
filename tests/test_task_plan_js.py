@@ -1,45 +1,21 @@
 """Exercise the task-plan/reference transport code from the shipped browser module."""
 
 import json
-import shutil
-import subprocess
-from pathlib import Path
 
 import pytest
 
+from _js import WEB, evaluate, requires_node, run
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-REFPACK_JS = REPO_ROOT / "web" / "refpack.js"
-REFPACK_CSS = REPO_ROOT / "web" / "refpack.css"
-NODE = shutil.which("node")
-requires_node = pytest.mark.skipif(NODE is None, reason="node is not installed")
-
-
-def _extract_js() -> str:
-    text = REFPACK_JS.read_text()
-    start = text.find("// >>> MMRP-TASK-PLAN")
-    end = text.find("// <<< MMRP-TASK-PLAN")
-    assert start != -1 and end != -1, "the MMRP-TASK-PLAN test seam is missing"
-    return text[start:end]
+REFPACK_JS = WEB / "refpack.js"
+REFPACK_CSS = WEB / "refpack.css"
 
 
 def _run(expression: str):
-    script = _extract_js() + f"\nconsole.log(JSON.stringify({expression}));\n"
-    proc = subprocess.run(
-        [NODE, "--input-type=module", "-e", script],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert proc.returncode == 0, f"node failed: {proc.stderr}"
-    return json.loads(proc.stdout.strip())
+    return evaluate(expression, "references")
 
 
 def test_task_plan_shows_and_refreshes_picture_and_video_thumbnails():
-    text = REFPACK_JS.read_text()
-    start = text.index("async function openTaskPlanModal(node)")
-    end = text.index("// Config (reference pack) save/load", start)
-    modal = text[start:end]
+    modal = REFPACK_JS.read_text()  # each string below occurs only in openTaskPlanModal
 
     assert 'if (kind === "image" || kind === "video")' in modal
     assert 'thumbnail.className = "mmrp-plan-thumbnail-image"' in modal
@@ -49,10 +25,7 @@ def test_task_plan_shows_and_refreshes_picture_and_video_thumbnails():
 
 
 def test_task_plan_primary_video_control_explains_and_requires_a_driver_role():
-    text = REFPACK_JS.read_text()
-    start = text.index("async function openTaskPlanModal(node)")
-    end = text.index("// Config (reference pack) save/load", start)
-    modal = text[start:end]
+    modal = REFPACK_JS.read_text()  # each string below occurs only in openTaskPlanModal
 
     assert 'document.createTextNode("Primary video")' in modal
     assert "Primary edit / continuation video" not in modal
@@ -262,10 +235,6 @@ def test_audio_only_on_the_editing_source_invalidates_a_replacement_plan():
 
     (Converting a video in FRONT of the driver cannot invalidate on position - the
     driver moves up into <Video 1>, which is the valid slot.)"""
-    text = REFPACK_JS.read_text()
-    start = text.find("// >>> MMRP-AUDIO-ONLY")
-    end = text.find("// <<< MMRP-AUDIO-ONLY")
-    assert start != -1 and end != -1, "the MMRP-AUDIO-ONLY test seam is missing"
     refs = {
         "images": [{"file": "face.png", "roles": ["reference_generation"]}],
         "videos": [
@@ -275,19 +244,14 @@ def test_audio_only_on_the_editing_source_invalidates_a_replacement_plan():
         "audios": [],
         "taskPlan": {"mode": "explicit", "specialization": "character_replacement"},
     }
-    script = (
-        _extract_js() + text[start:end]
-        + "\nconst refs = " + json.dumps(refs) + ";"
-        + "\nconst converted = videoToAudioOnly(refs, 0, 3);"
-        + "\nconsole.log(JSON.stringify({before: deriveTaskPlanState(refs).error,"
-        + " after: deriveTaskPlanState(converted.refs).error,"
-        + " audios: converted.refs.audios}));\n"
+    got = run(
+        "const refs = " + json.dumps(refs) + ";"
+        "\nconst converted = videoToAudioOnly(refs, 0, 3);"
+        "\nconsole.log(JSON.stringify({before: deriveTaskPlanState(refs).error,"
+        " after: deriveTaskPlanState(converted.refs).error,"
+        " audios: converted.refs.audios}));\n",
+        "references",
     )
-    proc = subprocess.run(
-        [NODE, "--input-type=module", "-e", script], capture_output=True, text=True, check=False
-    )
-    assert proc.returncode == 0, f"node failed: {proc.stderr}"
-    got = json.loads(proc.stdout.strip())
 
     assert got["before"] is None
     assert got["after"] == 'A replacement specialization requires "Use as editing source".'

@@ -1,8 +1,8 @@
 # What ships to the ComfyUI registry is what a USER needs to run the node. Everything
 # below is development apparatus and is excluded deliberately.
 #
-# The immediate reason is concrete: tests/test_migration.py extracts the migration block
-# from web/refpack.js and executes it under node via subprocess, which is a legitimate way
+# The immediate reason is concrete: tests/test_migration.py imports web/lib/migrate.js
+# and executes it under node via subprocess, which is a legitimate way
 # to test shipped JS and also exactly the pattern an automated malware scanner flags.
 # 0.3.0 contained no subprocess/exec/eval anywhere and went Active; 0.3.3 and 0.3.4 shipped
 # that file and both sat at NodeVersionStatusPending. Keeping the apparatus out of the zip

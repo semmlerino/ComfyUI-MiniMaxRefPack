@@ -151,7 +151,7 @@ def test_the_widgets_are_named_and_ordered_as_declared():
     # Grouped by decision flow (Aviv, 2026-08-17): the mode, then that mode's settings,
     # then what to write, then the target video, then reference prep; later widgets are
     # appended. This order is a WIRE FORMAT - widgets_values is positional - so changing
-    # it means updating ORDER_CURRENT in web/refpack.js too, which test_migration.py asserts.
+    # it means updating ORDER_CURRENT in web/lib/migrate.js too, which test_migration.py asserts.
     assert list(spec["required"]) + [name for name in spec["optional"] if name not in nodes.wired.INPUT_TYPES] == [
         "direction", "references_json", "system_prompt", "prompt_provider",
         "openrouter_api_key", "openrouter_model", "reasoning_effort", "api_base",

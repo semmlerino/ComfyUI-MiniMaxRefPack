@@ -6,53 +6,26 @@ migration every workflow saved at 0.3.1 opens with `true` in a combo and refuses
 - a worse regression than the bug 0.3.1 was released to fix.
 
 Two independent guards, tested independently:
-  - web/refpack.js repairs the graph the user is looking at. Extracted from the real file
-    between its MMRP-MIGRATE markers and executed under node, so this tests the shipped
-    code rather than a copy of it that can drift.
+  - web/lib/migrate.js repairs the graph the user is looking at. Imported from the real
+    file under node, so this tests the shipped code rather than a copy of it that can
+    drift.
   - nodes._provider_of catches an API client or script that posts a stored prompt and
     never loaded a browser at all.
 """
 
 import json
-import pathlib
-import shutil
-import subprocess
 import sys
 import types
 
 import pytest
+from _js import evaluate, requires_node
 
 from minimax_refpack import endpoint, nodes
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-REFPACK_JS = REPO_ROOT / "web" / "refpack.js"
-
-NODE = shutil.which("node")
-requires_node = pytest.mark.skipif(NODE is None, reason="node is not installed")
-
-
-def _extract_migration_js() -> str:
-    """The marked block from the shipped file, or a hard failure if the markers moved."""
-    text = REFPACK_JS.read_text()
-    start = text.find("// >>> MMRP-MIGRATE")
-    end = text.find("// <<< MMRP-MIGRATE")
-    assert start != -1 and end != -1, (
-        "the MMRP-MIGRATE markers are gone from web/refpack.js - this test extracts the "
-        "real shipped code through them, so removing them silently stops the migration "
-        "from being covered at all"
-    )
-    return text[start:end]
-
 
 def _run_js(expression: str):
-    """Evaluate an expression against the extracted block and return its JSON result."""
-    script = _extract_migration_js() + f"\nconsole.log(JSON.stringify({expression}));\n"
-    proc = subprocess.run(
-        [NODE, "--input-type=module", "-e", script],
-        capture_output=True, text=True, check=False,
-    )
-    assert proc.returncode == 0, f"node failed: {proc.stderr}"
-    return json.loads(proc.stdout.strip())
+    """Evaluate an expression against web/lib/migrate.js and return its JSON result."""
+    return evaluate(expression, "migrate")
 
 
 # ---- the browser half ----------------------------------------------------------
@@ -320,20 +293,8 @@ def test_the_frame_switch_only_keeps_a_real_boolean_true(raw, expected):
 # the PAINT - litegraph kept drawing the hidden widgets at their last_y from when they
 # were visible. Suppressing draw and dropping last_y is the fix, and this pins it.
 
-def _extract_visibility_js() -> str:
-    text = REFPACK_JS.read_text()
-    start = text.find("// >>> MMRP-VISIBILITY")
-    end = text.find("// <<< MMRP-VISIBILITY")
-    assert start != -1 and end != -1, "the MMRP-VISIBILITY markers are gone from refpack.js"
-    return text[start:end]
-
-
 def _run_vis_js(expression: str):
-    script = _extract_visibility_js() + f"\nconsole.log(JSON.stringify({expression}));\n"
-    proc = subprocess.run([NODE, "--input-type=module", "-e", script],
-                          capture_output=True, text=True, check=False)
-    assert proc.returncode == 0, f"node failed: {proc.stderr}"
-    return json.loads(proc.stdout.strip())
+    return evaluate(expression, "widgets")
 
 
 @requires_node

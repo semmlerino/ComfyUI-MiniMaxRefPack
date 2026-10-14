@@ -1,22 +1,19 @@
 """Exercise the shipped socket menu with a minimal LiteGraph node."""
-import json
-from pathlib import Path
-import subprocess
+from _js import requires_node, run
 
 
+@requires_node
 def test_expose_hide_and_link_protection():
-    text = (Path(__file__).resolve().parent.parent / "web/refpack.js").read_text()
-    block = text.split("// >>> MMRP-INPUTS", 1)[1].split("// <<< MMRP-INPUTS", 1)[0]
-    script = block + '''
-    const fixedSize = () => [1340, 1000];
-    const scheduleDraw = () => {};
+    script = '''
     const node = {
         inputs: Object.entries(REFERENCE_INPUTS).map(([name, type]) => ({name, type, link: null})),
         removeInput(index) { this.inputs.splice(index, 1); },
         addInput(name, type) { this.inputs.push({name, type, link: null}); },
         setSize() {}, setDirtyCanvas() {},
     };
-    installInputControls(node);
+    const redrawn = [];
+    const changed = [];
+    installInputControls(node, {redraw: (n) => redrawn.push(n), connectionsChanged: (n) => changed.push(n)});
     const initiallyCompact = node.inputs.length === 0;
     const menu = () => { const options = []; node.getExtraMenuOptions(null, options); return options[0].submenu.options; };
     menu().find(item => item.content === "Expose image_1").callback();
@@ -27,17 +24,18 @@ def test_expose_hide_and_link_protection():
     menu().find(item => item.content === "Hide image_1").callback();
     const hidden = node.inputs.length === 0;
     menu().find(item => item.content === "Expose direction").callback();
+    node.onConnectionsChange();
     console.log(JSON.stringify({initiallyCompact, exposed, protectedLink, hidden,
-        direction: node.inputs[0].name === "direction"}));
+        direction: node.inputs[0].name === "direction",
+        redrawnPerMenuAction: redrawn.length === 3 && redrawn.every(n => n === node),
+        connectionsChangedOnce: changed.length === 1 && changed[0] === node}));
     '''
-    result = subprocess.run(["node", "--input-type=module", "-e", script], text=True, capture_output=True, check=True)
-    assert all(json.loads(result.stdout).values())
+    assert all(run(script, "inputs", "layout").values())
 
 
+@requires_node
 def test_reference_input_rows_reserve_space_before_widgets_and_reflow():
-    text = (Path(__file__).resolve().parent.parent / "web/refpack.js").read_text()
-    block = text.split("// >>> MMRP-INPUTS", 1)[1].split("// <<< MMRP-INPUTS", 1)[0]
-    script = block + '''
+    script = '''
     const setting = {name: "width", widget: {name: "width"}, pos: [10, 100]};
     const node = {
         _mmrpDomWidget: {last_y: 300},
@@ -54,5 +52,4 @@ def test_reference_input_rows_reserve_space_before_widgets_and_reflow():
     const reflowed = node.inputs[1].pos[1] === 14 && node.inputs[2].pos[1] === 38 && node.widgets_start_y === 64;
     console.log(JSON.stringify({separated, settingUnchanged, reflowed, fits: bottom > second}));
     '''
-    result = subprocess.run(["node", "--input-type=module", "-e", script], text=True, capture_output=True, check=True)
-    assert all(json.loads(result.stdout).values())
+    assert all(run(script, "inputs", "layout").values())

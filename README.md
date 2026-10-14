@@ -103,6 +103,8 @@ After provisioning the development environment with `uv sync --no-install-projec
 
 The fast gate uses up to four pytest workers; set `REFPACK_WORKERS` to a lower positive integer on a memory-constrained machine. Direct `pytest` usage remains supported, including `pytest -m slow` when focused debugging is useful.
 
+The browser code is `web/refpack.js`, the ComfyUI extension, plus the modules in `web/lib/`. Tests import those modules under Node (`tests/_js.py`), so the JS tests need `node` on `PATH` and skip without it. Keep each lib module free of ComfyUI imports, DOM access at load time and module-level state: ComfyUI loads every `web/**/*.js` as an extension, and Node has to import them bare. Anything a module needs from the extension, such as ComfyUI's `api` or the node body's repaint, is passed in by `refpack.js`.
+
 ## Example workflow
 
 A complete Reference-to-Video graph ships with the pack: **Workflow → Browse Templates → ComfyUI-MiniMaxRefPack**, or drag `example_workflows/MiniMax R2V - Auto Prompting + Reference Manager.json` onto the canvas.

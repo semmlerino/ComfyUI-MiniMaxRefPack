@@ -67,9 +67,24 @@ def test_the_shipped_package_never_executes_anything_dynamically(path):
 
 def test_the_web_assets_ship():
     """The inverse failure: over-broad ignores that drop something the node needs."""
-    for needed in ("web/refpack.js", "web/refpack.css", "__init__.py", "requirements.txt"):
+    for needed in ("web/refpack.js", "web/refpack.css", "web/lib/", "web/lib/*.js", "__init__.py",
+                   "requirements.txt"):
         lines = [
             line.strip() for line in COMFYIGNORE.read_text().splitlines()
             if line.strip() and not line.strip().startswith("#")
         ]
         assert needed not in lines, f"{needed} is required at runtime and must ship"
+
+
+# Dynamic code in shipped JS is as visible to the scanner as it is in Python, and the
+# lib modules are loaded by ComfyUI as extensions in their own right, so they may not
+# reach for ComfyUI's scripts either: refpack.js imports those and passes them in.
+JS_FORBIDDEN = re.compile(r"(?<![\w.])eval\s*\(|\bnew\s+Function\s*\(|scripts/(app|api)\.js")
+
+
+@pytest.mark.parametrize(
+    "path", sorted((REPO_ROOT / "web" / "lib").glob("*.js")), ids=lambda p: p.name
+)
+def test_the_shipped_lib_modules_neither_execute_strings_nor_import_comfyui(path):
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        assert not JS_FORBIDDEN.search(line), f"web/lib/{path.name}:{number}: {line.strip()}"

@@ -1,41 +1,18 @@
 """"Use audio only": the pure video -> audio reference conversion, as shipped.
 
-The block between web/refpack.js's MMRP-AUDIO-ONLY markers is extracted and executed
-under node, so these tests run the browser code itself. The chip, the modal button,
+videoToAudioOnly is imported from web/lib/references.js under node, so these tests run
+the browser code itself. The chip, the modal button,
 applyRefs and the plan-button error state need a real browser and are not covered.
 """
 
 import json
-import pathlib
-import shutil
-import subprocess
 
 import pytest
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-REFPACK_JS = REPO_ROOT / "web" / "refpack.js"
-
-NODE = shutil.which("node")
-requires_node = pytest.mark.skipif(NODE is None, reason="node is not installed")
+from _js import evaluate, requires_node
 
 
-def _extract(marker: str) -> str:
-    text = REFPACK_JS.read_text()
-    start = text.find(f"// >>> {marker}")
-    end = text.find(f"// <<< {marker}")
-    assert start != -1 and end != -1, f"the {marker} markers are gone from web/refpack.js"
-    return text[start:end]
-
-
-def run_js(expression: str, *markers: str):
-    script = "".join(_extract(m) for m in markers or ("MMRP-AUDIO-ONLY",))
-    script += f"\nconsole.log(JSON.stringify({expression}));\n"
-    proc = subprocess.run(
-        [NODE, "--input-type=module", "-e", script],
-        capture_output=True, text=True, check=False,
-    )
-    assert proc.returncode == 0, f"node failed: {proc.stderr}"
-    return json.loads(proc.stdout.strip())
+def run_js(expression: str):
+    return evaluate(expression, "references")
 
 
 def _convert(refs, index, cap=3):
@@ -112,8 +89,3 @@ def test_refuses_a_bad_index(index):
 
     assert got["out"]["error"]
     assert got["out"]["refs"] == refs
-
-
-@requires_node
-def test_the_block_runs_with_nothing_else_around_it():
-    assert run_js("typeof videoToAudioOnly") == "function"

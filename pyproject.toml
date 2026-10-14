@@ -38,7 +38,7 @@ Icon = ""
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = [".", "tests"]
 addopts = "--import-mode=importlib"
 markers = [
     "slow: real-media decodes and subprocess RSS probes; deselect with `-m 'not slow'`",
