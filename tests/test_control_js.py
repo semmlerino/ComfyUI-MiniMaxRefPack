@@ -171,10 +171,12 @@ def test_import_rejects_a_receipt_for_different_settings():
     assert got["saves"] == 0
 
 
-def _modal_setup(control, available=False, wired=False, imported=None, target="MiniMaxH3FunControlNetApply"):
+def _modal_setup(control, available=False, wired=False, imported=None, target="MiniMaxH3FunControlNetApply",
+                 files=None):
     """A fake DOM just deep enough for openControlModal, and a node around `control`.
 
-    `imported` is what the server answers an import check with.
+    `imported` is what the server answers an import check with; `files` is the input
+    video listing (default: just the control's own file).
     """
     outputs = ("[{name: 'control_video', links: [7]}]" if wired
                else "[{name: 'control_video', links: []}]")
@@ -205,8 +207,10 @@ def _modal_setup(control, available=False, wired=False, imported=None, target="M
         removeEventListener(name, callback) {{if (this.listeners[name] === callback) delete this.listeners[name];}}}};
     let modal;
     const createPlannerModal = () => {{modal = new Element('div'); return {{modal, close() {{modal.isConnected = false;}}}};}};
-    const apiListFiles = async () => [{json.dumps(control["file"])}];
-    const apiUpload = async () => {{throw new Error('Unexpected upload');}};
+    const apiListFiles = async () => {json.dumps(files if files is not None else [control["file"]])};
+    const uploads = [];
+    const apiUpload = async (file, subfolder) => {{uploads.push([file.name, subfolder || null]);
+        return subfolder ? `${{subfolder}}/${{file.name}}` : file.name;}};
     const appendFileOptions = (select, files, current) => {{select.children = [];
         for (const file of new Set([current, ...files].filter(Boolean))) {{const option = new Element('option');
             option.value = file; option.textContent = file; select.appendChild(option);}}}};
@@ -287,6 +291,41 @@ def test_map_tab_imports_without_detectors_and_source_tab_stays_gated():
     assert got["source"]["primaryDisabled"] is True
     assert got["source"]["note"] is None
     assert got["requests"] == ["/minimax_refpack/control/capabilities", "/minimax_refpack/control/import"]
+
+
+def test_picker_lists_control_maps_on_the_map_tab_unless_all_are_asked_for():
+    files = ["clip.mp4", "control_maps/clip-pose-1.mp4", "videos/plate.mp4", "control_maps/old.mp4"]
+    got = _run(f"[controlPickerFiles({json.dumps(files)}, false, false),"
+               f" controlPickerFiles({json.dumps(files)}, true, false),"
+               f" controlPickerFiles({json.dumps(files)}, true, true)]")
+    assert got == [files, ["control_maps/clip-pose-1.mp4", "control_maps/old.mp4"], files]
+
+
+def test_map_tab_picker_starts_in_control_maps_and_uploads_there():
+    files = ["clip.mp4", "control_maps/clip-pose-1.mp4", "videos/plate.mp4"]
+    got = _run("(async () => {await openControlModal(node);"
+               "const select = byClass('mmrp-source-select');"
+               "const listed = () => select.options.map(o => o.value).filter(v => v && !v.startsWith('\\u0000'));"
+               "const showAll = elements(modal).find(el => el.tag === 'input' && el.type === 'checkbox');"
+               "const mapTab = listed(); const toggleShown = !showAll.parentElement.hidden;"
+               "showAll.checked = true; showAll.onchange(); const all = listed();"
+               "showAll.checked = false; showAll.onchange();"
+               "await modal.ondrop({preventDefault() {}, stopPropagation() {}, dataTransfer: {files: [{name: 'new.mp4'}]}});"
+               "const uploaded = node._mmrpRefs.control.file;"
+               "find('Make from a video').onclick(); const sourceTab = listed();"
+               "const toggleHidden = !!showAll.parentElement.hidden;"
+               "await modal.ondrop({preventDefault() {}, stopPropagation() {}, dataTransfer: {files: [{name: 'plate2.mp4'}]}});"
+               "return {mapTab, toggleShown, all, uploaded, sourceTab, toggleHidden, uploads};})()",
+               _modal_setup({**_map_control(), "map": None}, files=files), runtime=True, modal=True)
+    # The current file stays listed even outside control_maps/, so the select can show it.
+    assert got["mapTab"] == ["pose.mp4", "control_maps/clip-pose-1.mp4"]
+    assert got["toggleShown"] is True
+    assert got["all"] == ["pose.mp4", *files]
+    assert got["uploaded"] == "control_maps/new.mp4"
+    # The source tab lists every video again; the file carried over from the map tab stays first.
+    assert got["sourceTab"] == ["control_maps/new.mp4", *files]
+    assert got["toggleHidden"] is True
+    assert got["uploads"] == [["new.mp4", "control_maps"], ["plate2.mp4", None]]
 
 
 def test_ready_map_goes_out_of_date_and_names_what_changed():

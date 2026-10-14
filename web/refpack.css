@@ -908,6 +908,19 @@
     padding: 0 16px;
 }
 
+.mmrp-ctl-showall {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: #888;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.mmrp-ctl-showall[hidden] {
+    display: none;
+}
+
 .mmrp-ctl-trim-read {
     color: #888;
     font-size: 11px;

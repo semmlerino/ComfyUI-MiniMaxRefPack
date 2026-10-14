@@ -80,7 +80,7 @@ def test_streamed_h264_map_round_trip_and_history_receipt(tmp_path, monkeypatch)
     assert result["result"] == ()
     assert ready["frame_count"] == 39
     assert ready["fps"] == 24
-    assert ready["file"].startswith("control_maps/edges-")
+    assert ready["file"].startswith("control_maps/source-edges-")
     with av.open(str(tmp_path / ready["file"])) as container:
         stream = container.streams.video[0]
         assert float(stream.average_rate) == 24
@@ -111,6 +111,17 @@ def test_regeneration_preserves_previous_reviewed_artifact(tmp_path):
     assert first["file"] != second["file"]
     assert controls.file_sha256(tmp_path / first["file"]) == first["sha256"]
     assert controls.file_sha256(tmp_path / second["file"]) == second["sha256"]
+
+
+@pytest.mark.parametrize("file,stem", [
+    ("source.mp4", "source"),
+    ("videos/In Wien (final).mp4", "In_Wien_final"),
+    ("clips/.hidden.mov", "hidden"),
+    ("???.mp4", "source"),
+    (f"{'a' * 80}.mp4", "a" * 48),
+])
+def test_map_name_carries_its_source_video_stem(file, stem):
+    assert control_nodes.map_name_stem(file) == stem
 
 
 def test_control_maps_directory_symlink_cannot_escape_input(tmp_path):

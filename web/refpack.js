@@ -849,6 +849,13 @@ function controlChangedSettings(previous, control, lengthSeconds) {
     if (lengthSeconds != null && !same("length_seconds")) changed.push("the render length");
     return changed;
 }
+
+// The map tab's picker. Generated maps live in control_maps/, so only those are listed
+// until the user asks for every input video; the source tab always lists them all.
+const CONTROL_MAPS_DIR = "control_maps";
+function controlPickerFiles(files, imported, showAll) {
+    return imported && !showAll ? files.filter((file) => file.startsWith(`${CONTROL_MAPS_DIR}/`)) : files;
+}
 // <<< MMRP-CONTROL
 
 // >>> MMRP-CONTROL-RUNTIME
@@ -1091,15 +1098,16 @@ function cloneRefs(refs) {
 // API helpers
 // ---------------------------------------------------------------------------
 
-async function apiUpload(file) {
+async function apiUpload(file, subfolder = "") {
     const form = new FormData();
     form.append("image", file);
     form.append("type", "input");
     form.append("overwrite", "true");
+    if (subfolder) form.append("subfolder", subfolder);
     const res = await fetch("/upload/image", { method: "POST", body: form });
     if (!res.ok) throw new Error(`upload failed: ${res.status}`);
     const info = await res.json();
-    return info.name;
+    return info.subfolder ? `${info.subfolder}/${info.name}` : info.name;
 }
 
 async function apiListFiles(kind) {
@@ -3354,6 +3362,12 @@ async function openControlModal(node) {
     uploadOption.value = CONTROL_UPLOAD_OPTION;
     source.appendChild(emptySourceOption);
     source.appendChild(uploadOption);
+    const showAllLabel = left.appendChild(make("label", "mmrp-ctl-showall"));
+    const showAll = showAllLabel.appendChild(make("input"));
+    showAll.type = "checkbox";
+    showAllLabel.appendChild(make("span", "", `Show all input videos, not just ${CONTROL_MAPS_DIR}/`));
+    let videoFiles = null;    // the input listing, once it arrives
+    let pickerKey = null;     // which list the picker holds: tab and show-all
 
     const stageBox = left.appendChild(make("div", "mmrp-ctl-stage-box"));
     const stageEmpty = stageBox.appendChild(make("div", "mmrp-ctl-empty"));
@@ -3697,6 +3711,15 @@ async function openControlModal(node) {
         setControl({ file: source.value, trim: null, crop: null });
     };
     resolution.onchange = () => setControl({ resolution: Number(resolution.value) });
+    showAll.onchange = () => update();
+    const fillPicker = (imported) => {
+        const key = `${imported}:${showAll.checked}`;
+        if (videoFiles === null || key === pickerKey) return;
+        pickerKey = key;
+        appendFileOptions(source, controlPickerFiles(videoFiles, imported, showAll.checked), current().file);
+        source.prepend(emptySourceOption);
+        source.appendChild(uploadOption);
+    };
     const addSourceOption = (file) => {
         if ([...source.options].some((item) => item.value === file)) return;
         const option = make("option", "", file);
@@ -3719,7 +3742,8 @@ async function openControlModal(node) {
         const expected = controlSettingsFingerprint(current(), controlLength(node));
         update();
         try {
-            const file = await apiUpload(list[0]);
+            const file = await apiUpload(list[0], imported ? CONTROL_MAPS_DIR : "");
+            if (videoFiles && !videoFiles.includes(file)) videoFiles.push(file);
             addSourceOption(file);
             if (node._mmrpControlOperation !== operation
                 || controlSettingsFingerprint(current(), controlLength(node)) !== expected) {
@@ -3860,7 +3884,9 @@ async function openControlModal(node) {
         leftTitle.textContent = imported ? "Map file" : "Source video";
         source.setAttribute("aria-label", leftTitle.textContent);
         emptySourceOption.textContent = imported ? "Choose a control map video…" : "Choose a source video…";
-        uploadOption.textContent = imported ? "Upload a map…" : "Upload a video…";
+        uploadOption.textContent = imported ? `Upload a map to ${CONTROL_MAPS_DIR}/…` : "Upload a video…";
+        showAllLabel.hidden = !imported;
+        fillPicker(imported);
         if (control.file) addSourceOption(control.file);
         source.value = control.file;
         source.disabled = busy;
@@ -3983,10 +4009,7 @@ async function openControlModal(node) {
     update();
     const listed = await Promise.allSettled([apiListFiles("video"), controlRequest("capabilities")]);
     if (!modal.isConnected) return;
-    const files = listed[0].status === "fulfilled" ? listed[0].value : [];
-    appendFileOptions(source, files, current().file);
-    source.prepend(emptySourceOption);
-    source.appendChild(uploadOption);
+    videoFiles = listed[0].status === "fulfilled" ? listed[0].value : [];
     if (listed[1].status === "fulfilled") modes = listed[1].value.modes || [];
     else { message = listed[1].reason.message; messageError = true; }
     if (listed[0].status === "rejected") {

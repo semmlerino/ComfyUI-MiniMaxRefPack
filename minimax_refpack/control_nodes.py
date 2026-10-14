@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 from pathlib import Path
+import re
 import tempfile
 
 from . import controls, media
@@ -96,6 +97,12 @@ class MiniMaxH3ControlSource:
         return (_prepare_frames(control, prepared_recipe, _input_dir()),)
 
 
+def map_name_stem(source_file):
+    """The source video's name as a filename-safe prefix, so a map says what it was made from."""
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(source_file).stem).strip("_-")[:48].strip("_-")
+    return stem or "source"
+
+
 def write_map(images, control, prepared_recipe, input_dir):
     """Write browser-playable H.264 one frame at a time, then publish atomically."""
     import av
@@ -145,7 +152,8 @@ def write_map(images, control, prepared_recipe, input_dir):
         map_sha = controls.file_sha256(temporary)
         # Include encoded bytes in the final name: regenerating a recipe must not
         # overwrite another workflow's reviewed map if detector output changes.
-        relative = f"control_maps/{control['mode']}-{digest[:16]}-{map_sha}.mp4"
+        name = f"{map_name_stem(control['file'])}-{control['mode']}-{digest[:8]}-{map_sha[:16]}.mp4"
+        relative = f"control_maps/{name}"
         destination = controls.safe_path(input_dir, relative)
         os.replace(temporary, destination)
     except Exception:
