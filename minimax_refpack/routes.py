@@ -210,6 +210,8 @@ async def detect_route(request):
 
 # ---- explicit control preparation ---------------------------------------------
 
+_CONTROL_IMPORT_LOCK = asyncio.Lock()
+
 
 async def control_capabilities_route(request):
     return web.json_response(controls.capabilities())
@@ -230,6 +232,39 @@ async def control_prepare_route(request):
         return web.json_response({"error": str(error)}, status=400)
 
 
+async def control_import_route(request):
+    """Validate an existing map on CPU without creating or submitting a prompt."""
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise controls.ControlError("control import body must be an object")
+        # Each decoder is bounded, but concurrent modal requests must not multiply
+        # its memory budget. A canceled request keeps ownership until its CPU work ends.
+        async with _CONTROL_IMPORT_LOCK:
+            worker = asyncio.create_task(asyncio.to_thread(
+                controls.import_map, body.get("control"),
+                folder_paths.get_input_directory(), body.get("length_seconds", 0),
+            ))
+            try:
+                control = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # Repeated cancellation must not cancel the task that owns the thread.
+                # Keep its budget reservation until decoding actually finishes.
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break  # the canceled HTTP request has no error response
+                if not worker.cancelled():
+                    worker.exception()  # consume an error if completion beat cancellation
+                raise
+        return web.json_response({"control": control})
+    except (ValueError, TypeError) as error:
+        return web.json_response({"error": str(error)}, status=400)
+
+
 # ---- registration -------------------------------------------------------------
 
 _ROUTES: tuple[tuple[str, str, object], ...] = (
@@ -240,6 +275,7 @@ _ROUTES: tuple[tuple[str, str, object], ...] = (
     ("GET", "/minimax_refpack/detect", detect_route),
     ("GET", "/minimax_refpack/control/capabilities", control_capabilities_route),
     ("POST", "/minimax_refpack/control/prepare", control_prepare_route),
+    ("POST", "/minimax_refpack/control/import", control_import_route),
 )
 
 if PromptServer is not None and getattr(PromptServer, "instance", None) is not None:

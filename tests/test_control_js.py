@@ -20,10 +20,15 @@ def _block(name):
     )[0]
 
 
-def _run(expression, setup="", runtime=False):
+def _run(expression, setup="", runtime=False, modal=False):
     script = _block("TASK-PLAN") + _block("CONTROL") + setup
     if runtime:
         script += _block("CONTROL-RUNTIME")
+    if modal:
+        text = JS.read_text()
+        start = text.index("function controlFileUrl(file)")
+        end = text.index("// Config (reference pack) save/load", start)
+        script += text[start:end]
     script += f"\nconsole.log(JSON.stringify(await ({expression})));\n"
     result = subprocess.run(
         [NODE, "--input-type=module", "-e", script],
@@ -44,6 +49,220 @@ def _control():
             "width": 512, "height": 288,
         },
     }
+
+
+def _map_control():
+    return {
+        "input_type": "map", "file": "pose.mp4", "mode": "pose",
+        "resolution": 512, "trim": None, "crop": None,
+        "map": {
+            "file": "pose.mp4", "source_sha256": "source", "sha256": "map",
+            "recipe": {"input_type": "map", "source_sha256": "source",
+                       "mode": "pose", "resolution": 512, "trim": None, "crop": None,
+                       "length_seconds": 4, "fps": 24, "processor": None,
+                       "frame_policy": "24fps-target-ceil-17k+5-last-frame-hold-v2"},
+            "frame_count": 107, "fps": 24, "width": 512, "height": 288,
+        },
+    }
+
+
+def _import_setup(deferred=False):
+    control = _map_control()
+    pending = {**control, "map": None}
+    return f"""
+    const ready = {json.dumps(control)};
+    const node = {{_mmrpRefs: fromReferencesEnvelope({{references: [], control: {json.dumps(pending)}}}),
+        widgets: [{{name: 'length_seconds', value: 4}}]}};
+    const widgetByName = (node, name) => node.widgets?.find(widget => widget.name === name);
+    const requests = [];
+    const responses = [];
+    let saves = 0;
+    const syncReferencesWidget = () => {{saves++;}};
+    const renderNodeBody = () => {{}};
+    const api = {{queuePrompt: () => {{throw new Error('Imported maps must not queue');}},
+        fetchApi: (path, options) => {{requests.push({{path, body: JSON.parse(options.body)}});
+            return {'new Promise(resolve => responses.push(resolve))' if deferred else 'Promise.resolve({ok: true, json: async () => ({control: ready})})'};
+        }}}};
+    """
+
+
+def test_existing_map_round_trip_and_input_kind_affects_readiness():
+    control = _map_control()
+    envelope = {"references": [], "control": control}
+    assert _run(f"toReferencesEnvelope(fromReferencesEnvelope({json.dumps(envelope)}))") == envelope
+    got = _run("(() => {const control = " + json.dumps(control)
+               + "; return {current: controlMapCurrent(control, 4),"
+               "source: controlMapCurrent({...control, input_type: 'source'}, 4),"
+               "duration: controlMapCurrent(control, 5),"
+               "differentIdentity: controlSettingsFingerprint(control, 4) !== controlSettingsFingerprint({...control, input_type: 'source'}, 4),"
+               "cleared: changeControlSettings(control, {input_type: 'source'}).map};})()")
+    assert got == {"current": True, "source": False, "duration": False,
+                   "differentIdentity": True, "cleared": None}
+
+
+def test_source_recipe_without_input_kind_remains_current():
+    control = _map_control()
+    del control["input_type"]
+    del control["map"]["recipe"]["input_type"]
+    assert _run(f"controlMapCurrent({json.dumps(control)}, 4)") is True
+
+
+def test_source_pending_fingerprint_before_input_kind_was_added_still_matches():
+    got = _run("(() => {const control = {file: 's.mp4', mode: 'edges', resolution: 512};"
+               "const settings = controlSettings(control, 4); delete settings.input_type;"
+               "return controlSettingsMatch(control, 4, JSON.stringify(settings));})()")
+    assert got is True
+
+
+def test_use_existing_map_validates_and_saves_without_detector_or_comfy_queue():
+    got = _run("(async () => {const imported = await useExistingControlMap(node);"
+               "return {imported, current: node._mmrpRefs.control, requests, saves};})()",
+               _import_setup(), runtime=True)
+    assert got["imported"] == _map_control()
+    assert got["current"] == _map_control()
+    assert got["saves"] == 1
+    assert len(got["requests"]) == 1
+    assert got["requests"][0]["path"] == "/minimax_refpack/control/import"
+    assert got["requests"][0]["body"]["control"]["input_type"] == "map"
+    assert got["requests"][0]["body"]["length_seconds"] == 4
+
+
+@pytest.mark.parametrize("mutation", [
+    "node._mmrpRefs.control.file = 'other.mp4'",
+    "node._mmrpRefs.control.input_type = 'source'",
+    "node.widgets[0].value = 5",
+    "node._mmrpRefs.control = null",
+    "invalidateControlOperation(node)",
+])
+def test_import_late_result_cannot_restore_removed_changed_or_invalidated_settings(mutation):
+    got = _run("(async () => {const pending = useExistingControlMap(node);"
+               + mutation + "; responses[0]({ok: true, json: async () => ({control: ready})});"
+               "const imported = await pending; return {imported, saves};})()",
+               _import_setup(deferred=True), runtime=True)
+    assert got == {"imported": None, "saves": 0}
+
+
+def test_newer_import_wins_when_identical_requests_finish_out_of_order():
+    got = _run("(async () => {const first = useExistingControlMap(node);"
+               "const second = useExistingControlMap(node);"
+               "const newer = structuredClone(ready); newer.map.sha256 = 'newer';"
+               "responses[1]({ok: true, json: async () => ({control: newer})}); await second;"
+               "responses[0]({ok: true, json: async () => ({control: ready})});"
+               "return {first: await first, sha: node._mmrpRefs.control.map.sha256, saves};})()",
+               _import_setup(deferred=True), runtime=True)
+    assert got == {"first": None, "sha": "newer", "saves": 1}
+
+
+def test_import_rejects_a_receipt_for_different_settings():
+    got = _run("(async () => {const pending = useExistingControlMap(node);"
+               "ready.map.recipe.length_seconds = 5;"
+               "responses[0]({ok: true, json: async () => ({control: ready})});"
+               "try {await pending;} catch (error) {return {message: error.message, saves};}})()",
+               _import_setup(deferred=True), runtime=True)
+    assert "different settings" in got["message"]
+    assert got["saves"] == 0
+
+
+def test_map_ui_imports_when_detectors_are_unavailable_and_source_mode_stays_gated():
+    control = _map_control()
+    setup = f"""
+    class Element {{
+        constructor(tag) {{this.tag = tag; this.children = []; this.style = {{}}; this.dataset = {{}};
+            this.attributes = {{}}; this.listeners = {{}}; this.isConnected = true;
+            this.classList = {{add() {{}}, toggle() {{}}}};}}
+        appendChild(child) {{this.children.push(child); child.parentElement = this; return child;}}
+        prepend(child) {{this.children.unshift(child); child.parentElement = this;}}
+        setAttribute(name, value) {{this.attributes[name] = value;}}
+        removeAttribute(name) {{delete this[name];}}
+        addEventListener(name, callback) {{this.listeners[name] = callback;}}
+        get options() {{return this.children;}}
+        pause() {{this.paused = true;}}
+        load() {{}}
+    }}
+    const document = {{createElement: tag => new Element(tag), activeElement: null}};
+    let modal;
+    const createPlannerModal = () => {{modal = new Element('div'); return {{modal, close() {{modal.isConnected = false;}}}};}};
+    const apiListFiles = async () => ['pose.mp4'];
+    const appendFileOptions = (select, files, current) => {{select.children = [];
+        for (const file of new Set([current, ...files].filter(Boolean))) {{const option = new Element('option');
+            option.value = file; option.textContent = file; select.appendChild(option);}}}};
+    const isVideoFile = () => true;
+    const ready = {json.dumps(control)};
+    const node = {{_mmrpRefs: fromReferencesEnvelope({{references: [], control: {{...ready, map: null}}}}),
+        widgets: [{{name: 'length_seconds', value: 4}}]}};
+    const widgetByName = (node, name) => node.widgets?.find(widget => widget.name === name);
+    const requests = [];
+    const syncReferencesWidget = () => {{}};
+    const renderNodeBody = () => node._mmrpControlUpdate?.();
+    const api = {{queuePrompt() {{throw new Error('Unexpected queue');}}, fetchApi: async (path) => {{
+        requests.push(path);
+        return {{ok: true, json: async () => path.endsWith('/capabilities')
+            ? {{modes: ['pose', 'depth', 'edges'].map(id => ({{id, label: id, available: false, reason: 'No detector'}}))}}
+            : {{control: ready}}}};
+    }}}};
+    const elements = root => [root, ...root.children.flatMap(elements)];
+    """
+    # The author display:flex rule overrides the browser's default [hidden] style.
+    got = _run("(async () => {await openControlModal(node);"
+               "const all = elements(modal); const button = all.find(el => el.textContent === 'Use control map');"
+               "const visiblePreviews = () => all.filter(el => el.tag === 'video' && el.parentElement.style.display !== 'none');"
+               "const beforeValidation = visiblePreviews().map(el => el._mmrpLabel.textContent);"
+               "const enabled = !button.disabled; const type = all.find(el => el.attributes['aria-label'] === 'Control input');"
+               "const semantic = all.find(el => el.attributes['aria-label'] === 'Control type');"
+               "const mapOptionsEnabled = semantic.options.every(option => !option.disabled);"
+               "await button.onclick();"
+               "const preview = all.find(el => el.tag === 'video' && el._mmrpLabel.textContent === 'Map file preview');"
+               "const originalPreview = preview.dataset.source; const imported = node._mmrpRefs.control.input_type;"
+               "const importedPreviews = visiblePreviews().map(el => el._mmrpLabel.textContent);"
+               "type.value = 'source'; type.onchange();"
+               "node._mmrpRefs.control = {...ready, input_type: 'source', map: {...ready.map, file: 'generated.mp4',"
+               "recipe: {...ready.map.recipe, input_type: 'source'}}}; node._mmrpControlUpdate();"
+               "const sourcePreviews = visiblePreviews().filter(el => !el.hidden).map(el => el._mmrpLabel.textContent);"
+               "return {enabled, mapOptionsEnabled, imported, originalPreview, sourceDisabled: button.disabled,"
+               "beforeValidation, importedPreviews, sourcePreviews, sourceButton: button.textContent, requests};})()", setup, runtime=True, modal=True)
+    assert got == {
+        "enabled": True, "mapOptionsEnabled": True, "imported": "map",
+        "originalPreview": "/view?filename=pose.mp4&type=input",
+        "beforeValidation": ["Selected map file"],
+        "importedPreviews": ["Map file preview"],
+        "sourcePreviews": ["Source video", "Prepared control map"],
+        "sourceDisabled": True, "sourceButton": "Generate control map",
+        "requests": ["/minimax_refpack/control/capabilities", "/minimax_refpack/control/import"],
+    }
+
+
+def test_existing_map_ui_is_explicit_and_distinct_from_source_generation():
+    text = JS.read_text()
+    assert "Generate from source video" in text
+    assert "Use existing control map" in text
+    assert "Use control map" in text
+    assert "Map resolution" in text
+    assert "24 fps" in text
+    assert "hold" in text
+
+
+def test_portable_config_saves_and_loads_imported_map_and_duration():
+    text = JS.read_text()
+    build = text[text.index("function buildConfig(node, name)"):text.index("function downloadJson(filename, obj)")]
+    apply = text[text.index("async function applyConfig(node, data, sourceLabel)"):text.index("function openLoadConfigPanel(node, anchorBtn)")]
+    control = _map_control()
+    setup = f"""
+    {build}
+    {apply}
+    const widgetByName = (node, name) => node.widgets?.find(widget => widget.name === name);
+    const missingFiles = async () => new Set();
+    const applyRefs = (node, refs) => {{node._mmrpRefs = refs;}};
+    const renderNodeBody = () => {{}};
+    const setWidget = (node, name, value) => {{widgetByName(node, name).value = value;}};
+    const node = {{_mmrpRefs: fromReferencesEnvelope({{references: [], control: {json.dumps(control)}}}),
+        widgets: [{{name: 'length_seconds', value: 4}}]}};
+    const restored = {{_mmrpRefs: fromReferencesEnvelope({{references: []}}),
+        widgets: [{{name: 'length_seconds', value: 8}}]}};
+    """
+    got = _run("(async () => {const config = buildConfig(node, 'imported');"
+               "await applyConfig(restored, config, 'test'); return {saved: config.control,"
+               "restored: restored._mmrpRefs.control, length: controlLength(restored)};})()", setup)
+    assert got == {"saved": control, "restored": control, "length": 4}
 
 
 def test_control_round_trips_outside_reference_roles_and_tags():

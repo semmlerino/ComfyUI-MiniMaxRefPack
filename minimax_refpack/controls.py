@@ -61,6 +61,9 @@ def normalize_control(raw):
         return None
     if not isinstance(raw, dict):
         raise ControlError("control must be an object")
+    input_type = raw.get("input_type", "source")
+    if input_type not in ("source", "map"):
+        raise ControlError("control input_type must be source or map")
     filename = raw.get("file")
     # Validate the name even when no input directory is available yet.
     _filename(filename)
@@ -93,8 +96,11 @@ def normalize_control(raw):
         ready = {field: ready[field] for field in (
             "file", "source_sha256", "recipe", "sha256", "frame_count", "fps", "width", "height"
         )}
-    return {"file": filename, "mode": mode, "resolution": resolution,
-            "crop": crop, "trim": trim, "map": ready}
+    result = {"file": filename, "mode": mode, "resolution": resolution,
+              "crop": crop, "trim": trim, "map": ready}
+    if "input_type" in raw:
+        result["input_type"] = input_type
+    return result
 
 
 def duration(value):
@@ -116,13 +122,17 @@ def target_frames(length_seconds):
 def recipe(control, source_sha256, length_seconds, processor):
     """Filename-independent identity, so portable staging may rename both files."""
     control = normalize_control(control)
-    return {
+    result = {
         "source_sha256": _digest(source_sha256, "control source_sha256"),
         "mode": control["mode"], "resolution": control["resolution"],
         "crop": control["crop"], "trim": control["trim"],
         "length_seconds": duration(length_seconds), "fps": FPS,
         "frame_policy": FRAME_POLICY, "processor": processor,
     }
+    if control.get("input_type") == "map":
+        result["input_type"] = "map"
+        result["processor"] = None
+    return result
 
 
 def registry():
@@ -188,33 +198,69 @@ def capabilities(node_registry=None):
 
 def verify_source(control, prepared_recipe, input_dir, length_seconds):
     control = normalize_control(control)
-    if not isinstance(prepared_recipe, dict) or not isinstance(prepared_recipe.get("processor"), dict):
-        raise ControlError("control recipe is invalid; Generate control map again")
-    processor = prepared_recipe["processor"]
-    if processor.get("class_type") != MODES[control["mode"]][1] or not isinstance(processor.get("inputs"), dict):
-        raise ControlError("control recipe processor does not match its mode; Generate control map again")
+    action = "Use control map again" if control.get("input_type") == "map" else "Generate control map again"
+    if not isinstance(prepared_recipe, dict):
+        raise ControlError(f"control recipe is invalid; {action}")
+    processor = prepared_recipe.get("processor")
+    if control.get("input_type") == "map":
+        if prepared_recipe.get("input_type") != "map" or processor is not None:
+            raise ControlError(f"imported control recipe is invalid; {action}")
+    elif (not isinstance(processor, dict) or processor.get("class_type") != MODES[control["mode"]][1]
+          or not isinstance(processor.get("inputs"), dict)):
+        raise ControlError(f"control recipe processor does not match its mode; {action}")
     source_sha = file_sha256(safe_path(input_dir, control["file"]))
     expected = recipe(control, source_sha, length_seconds, processor)
     if prepared_recipe != expected:
-        raise ControlError("control map is stale: source, crop, trim, resolution or duration changed; Generate control map again")
+        raise ControlError(f"control map is stale: input, mode, crop, trim, resolution or duration changed; {action}")
     return source_sha
+
+
+def import_map(raw, input_dir, length_seconds=0):
+    """Validate a standalone map on CPU and return its receipt without writing media."""
+    from .control_nodes import _prepare_frames
+
+    if not isinstance(raw, dict) or raw.get("input_type") != "map":
+        raise ControlError("choose input_type map to import an existing control map")
+    control = normalize_control({**raw, "map": None})
+    source_sha = file_sha256(safe_path(input_dir, control["file"]))
+    prepared_recipe = recipe(control, source_sha, length_seconds, None)
+    frames = _prepare_frames(control, prepared_recipe, input_dir)
+    verify_source(control, prepared_recipe, input_dir, length_seconds)
+    count, height, width, _channels = map(int, frames.shape)
+    control["map"] = {
+        "file": control["file"], "source_sha256": source_sha,
+        "recipe": prepared_recipe, "sha256": source_sha,
+        "frame_count": count, "fps": FPS, "width": width, "height": height,
+    }
+    return control
 
 
 def load_ready(control, input_dir, length_seconds, cache):
     control = normalize_control(control)
     ready = control["map"]
     if ready is None:
+        if control.get("input_type") == "map":
+            raise ControlError("control map has not been imported; click Use control map before rendering")
         raise ControlError("control map has not been generated; click Generate control map before rendering")
+    imported = control.get("input_type") == "map"
+    action = "Use control map again" if imported else "Generate control map again"
+    if imported and ready["file"] != control["file"]:
+        raise ControlError("imported control and its receipt must name the same file")
     source_sha = verify_source(control, ready["recipe"], input_dir, length_seconds)
     if ready["source_sha256"] != source_sha:
-        raise ControlError("control map source digest is stale; Generate control map again")
+        raise ControlError(f"control map input digest is stale; {action}")
     expected_count = target_frames(length_seconds)
     if expected_count is not None and ready["frame_count"] != expected_count:
-        raise ControlError("control map frame count does not match the requested duration; Generate control map again")
+        raise ControlError(f"control map frame count does not match the requested duration; {action}")
     path = safe_path(input_dir, ready["file"])
     if file_sha256(path) != ready["sha256"]:
-        raise ControlError("control map file changed; Generate control map again")
-    frames, _audio = cache.video(path, target_fps=FPS)
+        raise ControlError(f"control map file changed; {action}")
+    if imported:
+        from .control_nodes import _prepare_frames
+        frames = _prepare_frames(control, ready["recipe"], input_dir, cache=cache)
+        verify_source(control, ready["recipe"], input_dir, length_seconds)
+    else:
+        frames, _audio = cache.video(path, target_fps=FPS)
     if tuple(frames.shape) != (ready["frame_count"], ready["height"], ready["width"], 3):
         raise ControlError("control map dimensions or frame count do not match its receipt")
     return frames
@@ -242,6 +288,8 @@ def preparation_graph(control, input_dir, length_seconds=0, node_registry=None):
     control = normalize_control(control)
     if control is None:
         raise ControlError("choose a control video first")
+    if control.get("input_type") == "map":
+        raise ControlError("an existing control map is imported directly; click Use control map")
     processor = processor_settings(control["mode"], control["resolution"], node_registry)
     source_sha = file_sha256(safe_path(input_dir, control["file"]))
     prepared_recipe = recipe(control, source_sha, length_seconds, processor)

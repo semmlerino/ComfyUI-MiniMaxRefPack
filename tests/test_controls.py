@@ -122,6 +122,14 @@ def test_outbox_renames_and_transient_preparation_do_not_change_recipe(prepared)
     assert "file" not in moved["map"]["recipe"]
 
 
+def test_explicit_source_input_type_keeps_legacy_generated_recipe_valid(prepared):
+    directory, control, plan = prepared
+    explicit = {**control, "input_type": "source"}
+    assert controls.verify_source(explicit, plan["recipe"], directory, 1) == control["map"]["source_sha256"]
+    assert controls.preparation_graph(explicit, directory, 1, {"Canny": Edges})["recipe"] == plan["recipe"]
+    assert "input_type" not in plan["recipe"]
+
+
 @pytest.mark.parametrize("mutation", ["source", "map", "duration", "resolution", "trim", "crop"])
 def test_overwrites_and_recipe_changes_reject_stale_maps(prepared, mutation):
     directory, control, _plan = prepared

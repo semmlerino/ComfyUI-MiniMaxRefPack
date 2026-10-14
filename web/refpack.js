@@ -621,8 +621,13 @@ function normalizePrimaryVideo(refs) {
 // Preparation is a separate queue entry. These helpers are also exercised without
 // a browser or GPU by tests/test_control_js.py.
 // >>> MMRP-CONTROL
+function controlInputType(control) {
+    return control?.input_type === "map" ? "map" : "source";
+}
+
 function controlSettings(control, lengthSeconds = 0) {
     return {
+        input_type: controlInputType(control),
         file: control?.file || "", mode: control?.mode || "pose",
         resolution: Number(control?.resolution ?? 512),
         trim: control?.trim || null, crop: control?.crop || null,
@@ -640,6 +645,21 @@ function ensureControlOutput(node) {
 
 function controlSettingsFingerprint(control, lengthSeconds = 0) {
     return JSON.stringify(controlSettings(control, lengthSeconds));
+}
+
+function controlSettingsMatch(control, lengthSeconds, fingerprint) {
+    try {
+        const settings = JSON.parse(fingerprint);
+        // Pending source jobs saved before input_type existed retain their identity.
+        settings.input_type ??= "source";
+        return controlRecipeFingerprint(settings)
+            === controlRecipeFingerprint(controlSettings(control, lengthSeconds));
+    } catch (_) { return false; }
+}
+
+function invalidateControlOperation(node) {
+    node._mmrpControlOperation = (node._mmrpControlOperation || 0) + 1;
+    return node._mmrpControlOperation;
 }
 
 function changeControlSettings(control, changes) {
@@ -688,6 +708,8 @@ function controlMapCurrent(control, lengthSeconds) {
     const recipe = control?.map?.recipe;
     if (!control?.map?.file || !recipe) return false;
     const expected = controlSettings(control, lengthSeconds);
+    if ((recipe.input_type || "source") !== expected.input_type) return false;
+    if (expected.input_type === "map" && control.map.file !== control.file) return false;
     return ["mode", "resolution", "crop", "trim", "length_seconds"].every(
         (key) => JSON.stringify(recipe[key] ?? null) === JSON.stringify(expected[key])
     );
@@ -704,7 +726,7 @@ function controlRecipeFingerprint(recipe) {
 function canApplyControlMap(control, preparation, map, lengthSeconds) {
     return lengthSeconds != null && !!control && !!map?.file
         && control.preparation?.prompt_id === preparation.prompt_id
-        && controlSettingsFingerprint(control, lengthSeconds) === preparation.settings_fingerprint
+        && controlSettingsMatch(control, lengthSeconds, preparation.settings_fingerprint)
         && controlRecipeFingerprint(map.recipe) === controlRecipeFingerprint(preparation.recipe);
 }
 
@@ -725,11 +747,15 @@ function controlHistoryState(history, promptId, outputNodeId) {
         : { state: "failed", map: null, message: "Preparation completed without a control map." };
 }
 
-async function queueControlPreparation(node, plan, expectedFingerprint) {
+async function queueControlPreparation(node, plan, expectedFingerprint, operation = null) {
     if (controlLength(node) == null) {
         throw new Error("The linked length_seconds cannot be read before execution. Connect a PrimitiveFloat/PrimitiveNode duration or disconnect it and set length_seconds on the manager.");
     }
-    if (controlSettingsFingerprint(node._mmrpRefs.control, controlLength(node)) !== expectedFingerprint) {
+    if (controlInputType(node._mmrpRefs.control) === "map") {
+        throw new Error("Use control map to validate an existing map without detector preparation.");
+    }
+    if ((operation != null && node._mmrpControlOperation !== operation)
+        || controlSettingsFingerprint(node._mmrpRefs.control, controlLength(node)) !== expectedFingerprint) {
         throw new Error("Control settings changed while preparing the job. Generate again.");
     }
     if (!plan.prompt || !plan.workflow || plan.output_node_id == null || !plan.recipe) {
@@ -739,7 +765,8 @@ async function queueControlPreparation(node, plan, expectedFingerprint) {
     if (!result?.prompt_id) throw new Error("Preparation was not accepted by ComfyUI.");
     // The request may finish after the user removes the control or changes its source.
     // The queue entry remains visible in ComfyUI; its result cannot restore those edits.
-    if (!node._mmrpRefs.control
+    if ((operation != null && node._mmrpControlOperation !== operation)
+        || !node._mmrpRefs.control
         || controlSettingsFingerprint(node._mmrpRefs.control, controlLength(node)) !== expectedFingerprint) {
         return null;
     }
@@ -760,6 +787,35 @@ async function controlRequest(path, options) {
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || `Control request failed: ${response.status}`);
     return data;
+}
+
+async function useExistingControlMap(node) {
+    const lengthSeconds = controlLength(node);
+    const control = takeControl(node._mmrpRefs.control);
+    if (!control?.file || controlInputType(control) !== "map") {
+        throw new Error("Choose an existing control map first.");
+    }
+    if (lengthSeconds == null) {
+        throw new Error("The linked length_seconds cannot be read before execution. Use a PrimitiveFloat/PrimitiveNode duration or disconnect it and set the manager's length_seconds.");
+    }
+    const expected = controlSettingsFingerprint(control, lengthSeconds);
+    const operation = invalidateControlOperation(node);
+    const data = await controlRequest("import", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ control, length_seconds: lengthSeconds }),
+    });
+    if (node._mmrpControlOperation !== operation || !node._mmrpRefs.control
+        || controlLength(node) == null
+        || controlSettingsFingerprint(node._mmrpRefs.control, controlLength(node)) !== expected) return null;
+    const imported = takeControl(data.control);
+    if (!imported || controlSettingsFingerprint(imported, lengthSeconds) !== expected
+        || !controlMapCurrent(imported, lengthSeconds)) {
+        throw new Error("The server returned a control map for different settings. Use control map again.");
+    }
+    node._mmrpRefs.control = imported;
+    syncReferencesWidget(node);
+    renderNodeBody(node);
+    return imported;
 }
 
 function watchControlPreparation(node) {
@@ -2202,11 +2258,13 @@ function renderNodeBody(node) {
     }
     if (body.controlsButton) {
         const control = refs.control;
+        const imported = controlInputType(control) === "map";
         const pending = control?.preparation && !control.preparation.error;
         const ready = controlMapCurrent(control, controlLength(node));
         body.controlsButton.textContent = !control ? "Controls" : pending
-            ? "Controls: preparing" : ready ? `Controls: ${control.mode}` : "Controls: needs map";
-        body.controlsButton.title = "Prepare a separate Pose, Depth or Edges control video";
+            ? "Controls: preparing" : ready ? `Controls: ${control.mode}${imported ? " map" : ""}`
+                : imported ? "Controls: validate map" : "Controls: needs map";
+        body.controlsButton.title = "Generate or use a separate Pose, Depth or Edges control video";
         body.controlsButton.classList.toggle("mmrp-plan-error", !!control && !pending && !ready);
     }
     if (refs.control?.preparation && !refs.control.preparation.error) watchControlPreparation(node);
@@ -3153,14 +3211,31 @@ async function openControlModal(node) {
     fields.className = "mmrp-plan-controls";
     const field = (label, element) => {
         const wrapper = document.createElement("label");
-        wrapper.textContent = label;
+        const caption = document.createElement("span");
+        caption.textContent = label;
+        wrapper.appendChild(caption);
+        element._mmrpLabel = caption;
         element.setAttribute("aria-label", label);
         wrapper.appendChild(element);
         fields.appendChild(wrapper);
         return element;
     };
+    const setFieldLabel = (element, label) => {
+        element._mmrpLabel.textContent = label;
+        element.setAttribute("aria-label", label);
+    };
+    const inputType = field("Control input", document.createElement("select"));
+    for (const [id, label] of [["source", "Generate from source video"], ["map", "Use existing control map"]]) {
+        const option = document.createElement("option");
+        option.value = id;
+        option.textContent = label;
+        inputType.appendChild(option);
+    }
     const source = field("Source video", document.createElement("select"));
     source.className = "mmrp-source-select";
+    const emptySourceOption = document.createElement("option");
+    emptySourceOption.value = "";
+    source.appendChild(emptySourceOption);
     const mode = field("Control type", document.createElement("select"));
     for (const [id, label] of [["pose", "Pose"], ["depth", "Depth"], ["edges", "Edges"]]) {
         const option = document.createElement("option");
@@ -3206,6 +3281,7 @@ async function openControlModal(node) {
         panel.appendChild(label);
         panel.appendChild(video);
         previews.appendChild(panel);
+        video._mmrpLabel = label;
         return video;
     };
     const sourcePreview = preview("Source video");
@@ -3248,30 +3324,41 @@ async function openControlModal(node) {
     modal.appendChild(uploadInput);
     const upload = button("Upload source…", () => uploadInput.click());
     const remove = button("Remove control", () => {
+        const hadPreparation = !!node._mmrpRefs.control?.preparation;
+        invalidateControlOperation(node);
         node._mmrpRefs.control = null;
         draft = { file: "", mode: "pose", resolution: 512, trim: null, crop: null, map: null };
-        message = "Control removed. Any already queued preparation remains in ComfyUI's queue.";
+        message = hadPreparation ? "Control removed. Any already queued preparation remains in ComfyUI's queue." : "Control removed.";
         syncReferencesWidget(node);
         renderNodeBody(node);
     });
     const generate = button("Generate control map", async () => {
         busy = true;
-        message = "Preparing the control job…";
+        const imported = controlInputType(node._mmrpRefs.control) === "map";
+        message = imported ? "Validating control map…" : "Preparing the control job…";
         update();
         try {
             if (controlLength(node) == null) {
                 throw new Error("The linked length_seconds cannot be read before execution. Use a PrimitiveFloat/PrimitiveNode duration or disconnect it and set the manager's length_seconds.");
             }
+            if (imported) {
+                const accepted = await useExistingControlMap(node);
+                message = accepted ? "" : "Map validation finished, but settings changed. Use control map again.";
+                return;
+            }
+            const operation = invalidateControlOperation(node);
             const control = takeControl(node._mmrpRefs.control);
             const expected = controlSettingsFingerprint(control, controlLength(node));
             const plan = await controlRequest("prepare", {
                 method: "POST", headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ control, length_seconds: controlLength(node) }),
             });
-            const pending = await queueControlPreparation(node, plan, expected);
+            const pending = await queueControlPreparation(node, plan, expected, operation);
             message = pending ? "" : "The preparation was queued, but its result will be ignored because the control changed.";
         } catch (error) {
-            message = error.message || error.response?.error?.message || "Preparation could not be queued. Check ComfyUI's queue before retrying.";
+            message = error.message || error.response?.error?.message || (imported
+                ? "Control map validation failed. Use control map again."
+                : "Preparation could not be queued. Check ComfyUI's queue before retrying.");
         } finally {
             busy = false;
             update();
@@ -3283,6 +3370,9 @@ async function openControlModal(node) {
 
     const setControl = (changes) => {
         const next = changeControlSettings(node._mmrpRefs.control || draft, changes);
+        if (controlSettingsFingerprint(next) !== controlSettingsFingerprint(node._mmrpRefs.control || draft)) {
+            invalidateControlOperation(node);
+        }
         draft = next;
         node._mmrpRefs.control = next.file ? next : null;
         message = "";
@@ -3290,6 +3380,7 @@ async function openControlModal(node) {
         renderNodeBody(node);
         update();
     };
+    inputType.onchange = () => setControl({ input_type: inputType.value });
     source.onchange = () => setControl({ file: source.value, trim: null, crop: null });
     mode.onchange = () => setControl({ mode: mode.value });
     resolution.onchange = () => setControl({ resolution: Number(resolution.value) });
@@ -3303,18 +3394,22 @@ async function openControlModal(node) {
     const uploadSource = async (files) => {
         const list = Array.from(files || []);
         if (list.length !== 1 || !isVideoFile(list[0].name)) {
-            message = "Choose or drop one source video.";
+            message = controlInputType(node._mmrpRefs.control || draft) === "map"
+                ? "Choose or drop one control map video." : "Choose or drop one source video.";
             update();
             return;
         }
         busy = true;
-        message = "Uploading source video…";
+        const imported = controlInputType(node._mmrpRefs.control || draft) === "map";
+        message = imported ? "Uploading control map…" : "Uploading source video…";
+        const operation = invalidateControlOperation(node);
         const expected = controlSettingsFingerprint(node._mmrpRefs.control || draft, controlLength(node));
         update();
         try {
             const file = await apiUpload(list[0]);
-            if (controlSettingsFingerprint(node._mmrpRefs.control || draft, controlLength(node)) !== expected) {
-                message = "The source was uploaded, but control settings changed while uploading. Select the uploaded file to use it.";
+            if (node._mmrpControlOperation !== operation
+                || controlSettingsFingerprint(node._mmrpRefs.control || draft, controlLength(node)) !== expected) {
+                message = "The file was uploaded, but control settings changed while uploading. Select the uploaded file to use it.";
                 const option = document.createElement("option");
                 option.value = file;
                 option.textContent = file;
@@ -3355,6 +3450,18 @@ async function openControlModal(node) {
             return;
         }
         const control = node._mmrpRefs.control || draft;
+        const imported = controlInputType(control) === "map";
+        inputType.value = imported ? "map" : "source";
+        setFieldLabel(source, imported ? "Control map file" : "Source video");
+        setFieldLabel(resolution, imported ? "Map resolution" : "Detection resolution");
+        emptySourceOption.textContent = imported ? "Choose a control map video…" : "Choose a source video…";
+        upload.textContent = imported ? "Upload control map…" : "Upload source…";
+        generate.textContent = imported ? "Use control map" : "Generate control map";
+        sourcePreview._mmrpLabel.textContent = imported ? "Selected map file" : "Source video";
+        mapPreview._mmrpLabel.textContent = imported ? "Map file preview" : "Prepared control map";
+        hint.textContent = imported
+            ? "Drop an existing Pose, Depth or Edges map here or select one below. Use control map validates the file without a detector or queue job. Rendering normalizes it to 24 fps, applies crop, trim and map resolution, and short maps hold their final frame. The preview shows the original map file; it does not show the normalized render input. Settings or duration changes require Use control map again. Changes are saved immediately."
+            : "Drop a source video here or select one below. Generate queues only control preparation; rendering stays a separate action. Pose and Depth use optional controlnet_aux processors and may download missing detector weights. Changes are saved immediately; closing keeps the preparation job.";
         source.value = control.file;
         mode.value = control.mode;
         resolution.value = String(control.resolution);
@@ -3367,18 +3474,34 @@ async function openControlModal(node) {
         const capability = modes.find((item) => item.id === control.mode);
         const pending = control.preparation && !control.preparation.error;
         const ready = controlMapCurrent(control, controlLength(node));
+        for (const [video, hidden] of [[sourcePreview, imported && ready], [mapPreview, imported && !ready]]) {
+            video.parentElement.hidden = hidden;
+            // The asset panel's display:flex overrides the browser's [hidden] style.
+            video.parentElement.style.display = hidden ? "none" : "";
+            if (hidden) video.pause();
+        }
+        previews.style.gridTemplateColumns = imported ? "minmax(0, 1fr)" : "";
         const unresolvedLength = controlLength(node) == null;
         const error = unresolvedLength
             ? "The linked length_seconds cannot be read before execution. Use a PrimitiveFloat/PrimitiveNode duration or disconnect it and set the manager's length_seconds."
-            : control.preparation?.error || (!ready && !pending && !capability?.available ? capability?.reason : "");
+            : control.preparation?.error || (!imported && !ready && !pending && !capability?.available ? capability?.reason : "");
         status.textContent = message || error || (pending
             ? `${control.preparation.status === "running" ? "Preparing" : "Queued"}: ${control.preparation.prompt_id}${control.preparation.notice ? ` — ${control.preparation.notice}` : ""}`
-            : ready ? `Ready: ${control.map.frame_count} frames at ${control.map.fps} fps, ${control.map.width} × ${control.map.height}. Preview the map, then queue your render.`
-            : control.file ? "Generate a control map for these settings before rendering." : "Choose or drop a source video.");
+            : ready ? `${imported ? "Ready for render" : "Ready"}: ${control.map.frame_count} frames at ${control.map.fps} fps, ${control.map.width} × ${control.map.height}.${imported ? " The preview shows the original file." : " Preview the map, then queue your render."}`
+            : control.file ? (imported ? "Use control map to validate these settings before rendering." : "Generate a control map for these settings before rendering.")
+                : imported ? "Choose or drop a control map video." : "Choose or drop a source video.");
         status.classList.toggle("mmrp-plan-status-error", !!error);
-        generate.disabled = busy || !!pending || unresolvedLength || !control.file || !capability?.available;
+        generate.disabled = busy || !!pending || unresolvedLength || !control.file || (!imported && !capability?.available);
         upload.disabled = busy;
         remove.disabled = !node._mmrpRefs.control;
+        for (const option of mode.options) {
+            const capability = modes.find((item) => item.id === option.value);
+            const available = imported || capability?.available;
+            const label = { pose: "Pose", depth: "Depth", edges: "Edges" }[option.value];
+            option.disabled = !available;
+            option.title = available ? "" : capability?.reason || "Processor unavailable";
+            option.textContent = `${capability?.label || label}${available ? "" : " (unavailable)"}`;
+        }
         const sourceUrl = control.file ? `${controlFileUrl(control.file)}&revision=${sourceRevision}` : "";
         const mapUrl = ready ? controlFileUrl(control.map.file) : "";
         for (const [video, url] of [[sourcePreview, sourceUrl], [mapPreview, mapUrl]]) {
@@ -3392,24 +3515,16 @@ async function openControlModal(node) {
         }
     };
     node._mmrpControlUpdate = update;
+    update();
     const listed = await Promise.allSettled([apiListFiles("video"), controlRequest("capabilities")]);
     if (!modal.isConnected) return;
     const files = listed[0].status === "fulfilled" ? listed[0].value : [];
     appendFileOptions(source, files, node._mmrpRefs.control?.file || draft.file);
-    const empty = document.createElement("option");
-    empty.value = "";
-    empty.textContent = "Choose a source video…";
-    source.prepend(empty);
+    source.prepend(emptySourceOption);
     if (listed[1].status === "fulfilled") modes = listed[1].value.modes || [];
     else message = listed[1].reason.message;
-    if (listed[0].status === "rejected") message = `Source listing failed: ${listed[0].reason.message}. You can still upload a video.`;
-    else if (listed[1].status === "fulfilled") message = "";
-    for (const option of mode.options) {
-        const capability = modes.find((item) => item.id === option.value);
-        option.disabled = !capability?.available;
-        option.title = capability?.reason || "";
-        option.textContent = `${capability?.label || option.textContent}${capability?.available ? "" : " (unavailable)"}`;
-    }
+    if (listed[0].status === "rejected") message = `Video listing failed: ${listed[0].reason.message}. You can still upload a video.`;
+    else if (listed[1].status === "fulfilled" || controlInputType(node._mmrpRefs.control || draft) === "map") message = "";
     update();
     watchControlPreparation(node);
 }
@@ -3569,6 +3684,7 @@ async function applyConfig(node, data, sourceLabel) {
     const missing = await missingFiles(data.references);
     const list = data.references.map((r) => ({ ...r, missing: missing.has(r.file) }));
     node._mmrpSelected = null;
+    invalidateControlOperation(node);
     applyRefs(node, fromReferencesEnvelope({ references: list, task_plan: data.task_plan, control: data.control }));
 
     const directionWidget = widgetByName(node, "direction");
@@ -4709,6 +4825,7 @@ app.registerExtension({
             const origOnConfigure = node.onConfigure;
             node.onConfigure = function (info) {
                 const out = origOnConfigure ? origOnConfigure.apply(this, arguments) : undefined;
+                invalidateControlOperation(this);
                 ensureControlOutput(this);
                 // configure() has just applied widgets_values POSITIONALLY, which for any
                 // graph saved before 0.3.3 means the values landed in the wrong widgets.

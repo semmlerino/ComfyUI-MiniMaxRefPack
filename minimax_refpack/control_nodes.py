@@ -25,7 +25,7 @@ def _input_dir():
     return folder_paths.get_input_directory()
 
 
-def _prepare_frames(control, prepared_recipe, input_dir):
+def _prepare_frames(control, prepared_recipe, input_dir, cache=None):
     import torch
     import torch.nn.functional as functional
 
@@ -38,10 +38,22 @@ def _prepare_frames(control, prepared_recipe, input_dir):
         decode_seconds = requested_count / controls.FPS
         end = min(trim[1], start + decode_seconds) if trim else start + decode_seconds
         trim = [start, end]
-    frames, _audio = media.load_video(
-        controls.safe_path(input_dir, control["file"]), target_fps=controls.FPS,
-        crop=control["crop"], trim=trim,
-    )
+    path = controls.safe_path(input_dir, control["file"])
+    imported = control.get("input_type") == "map"
+    try:
+        if imported:
+            import av
+            with av.open(path) as container:
+                formats = container.format.name.split(",")
+                if (not container.streams.video
+                    or any(name.endswith("_pipe") or name in ("image2", "image2pipe") for name in formats)):
+                    raise controls.ControlError("imported control map must be a video with at least 5 frames")
+        loader = media.load_video if cache is None else cache.video
+        frames, _audio = loader(path, target_fps=controls.FPS, crop=control["crop"], trim=trim)
+    except Exception as error:
+        if not imported or isinstance(error, controls.ControlError):
+            raise
+        raise controls.ControlError(f"cannot read imported control map video: {error}") from error
     available = int(frames.shape[0])
     count = requested_count if requested_count is not None else 5 + ((available - 5) // 17) * 17
     if count < 5:
