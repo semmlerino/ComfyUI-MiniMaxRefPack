@@ -579,7 +579,8 @@ def test_control_completion_does_not_make_reference_role_planner_stale():
                f"refs.control = {json.dumps(_control())};"
                "return referencesFingerprint(refs) === before;})()")
     assert got is True
-    assert "working.control = takeControl(node._mmrpRefs.control)" in (WEB / "refpack.js").read_text()
+    # Apply commits the live receipt, not the planner's copy: see
+    # test_task_plan_js.py::test_apply_keeps_a_control_receipt_that_landed_while_open.
 
 
 def test_history_requires_success_and_surfaces_execution_failure():

@@ -125,3 +125,24 @@ export const ASPECT_PRESETS = [
     ["16:9", 16 / 9],
     ["9:16", 9 / 16],
 ];
+
+// The trim window the editor accepts: 2dp seconds inside the clip, with the in-point
+// at least 0.05s before the out-point.
+export function clampTrim(start, end, duration) {
+    const r2 = (v) => Math.round(v * 100) / 100;
+    const s = clamp01(r2(start), 0, Math.max(0, r2(duration) - 0.05));
+    return [s, clamp01(r2(end), s + 0.05, r2(duration))];
+}
+
+// Writes the editor's crop and trim onto `target` the way Save serialises them: an
+// edit that covers the whole frame or clip, or one the kind cannot carry, is removed.
+// Returns the normalised pair.
+export function applyEdit(target, kind, crop, trim, duration) {
+    const nc = kind !== "audio" ? normalizeCrop(crop) : null;
+    if (nc) target.crop = nc;
+    else delete target.crop;
+    const nt = kind !== "image" ? normalizeTrim(trim, duration) : null;
+    if (nt) target.trim = nt;
+    else delete target.trim;
+    return { crop: nc, trim: nt };
+}

@@ -282,6 +282,77 @@ export function normalizePrimaryVideo(refs) {
     return refs;
 }
 
+// ---------------------------------------------------------------------------
+// The task-plan dialog's edits, applied to its working copy. lib/task_plan_ui.js
+// draws the controls; these decide what a click does to the references.
+// ---------------------------------------------------------------------------
+
+const DRIVER_ROLES = ["video_editing", "video_continuation"];
+
+export function hasDriverRole(reference) {
+    return (reference.roles || []).some((role) => DRIVER_ROLES.includes(role));
+}
+
+// The plan a workflow without one starts from: its legacy job_type decides the mode.
+export function initialTaskPlan(legacyJobType) {
+    return { mode: legacyJobType === "auto" ? "auto" : "explicit", specialization: "none" };
+}
+
+// A new file drops the old one's crop/trim. A video starts with its soundtrack on
+// unless the probe already knows the new file is silent, which also removes the
+// soundtrack roles it can no longer play.
+export function changeReferenceSource(reference, kind, file, hasAudio) {
+    reference.file = file;
+    reference.missing = false;
+    delete reference.crop;
+    delete reference.trim;
+    if (kind !== "video") return;
+    const knownSilent = hasAudio === false;
+    reference.use_soundtrack = !knownSilent;
+    if (knownSilent) {
+        reference.roles = (reference.roles || []).filter((role) => !AUDIO_ONLY_ROLES.includes(role));
+    }
+}
+
+// At most one primary video.
+export function setPrimaryVideo(refs, reference, primary) {
+    if (primary) for (const video of refs.videos) video.primary = false;
+    reference.primary = primary;
+}
+
+// Roles stay in TASK_ROLE_OPTIONS order. Giving a video its first driver role makes it
+// primary when no video is; taking a primary video's last driver role unmarks it.
+export function toggleTaskRole(refs, kind, reference, roleId, checked) {
+    const current = new Set(reference.roles || []);
+    if (checked) current.add(roleId);
+    else current.delete(roleId);
+    reference.roles = TASK_ROLE_OPTIONS[kind].map(([id]) => id).filter((id) => current.has(id));
+    if (kind !== "video" || !DRIVER_ROLES.includes(roleId)) return;
+    if (checked && !refs.videos.some((video) => video.primary)) reference.primary = true;
+    else if (!checked && reference.primary && !hasDriverRole(reference)) reference.primary = false;
+}
+
+// Whether a video's soundtrack role can be ticked: the soundtrack must be on and not
+// known to be silent.
+export function soundtrackRoleUnavailable(reference, roleId, hasAudio) {
+    return AUDIO_ONLY_ROLES.includes(roleId) && (!reference.use_soundtrack || hasAudio === false);
+}
+
+// What Apply commits: an explicit plan with exactly one driver video and none marked
+// primary gets that video as primary, and the primary video moves to <Video 1>. The
+// dialog's copy of the control receipt may be stale, so the live one rides along.
+// Returns the derived state; on an error the caller keeps the dialog open.
+export function finishTaskPlan(refs, liveControl) {
+    if (refs.taskPlan.mode === "explicit" && !refs.videos.some((video) => video.primary)) {
+        const drivers = refs.videos.filter(hasDriverRole);
+        if (drivers.length === 1) drivers[0].primary = true;
+    }
+    normalizePrimaryVideo(refs);
+    const state = deriveTaskPlanState(refs);
+    if (!state.error) refs.control = takeControl(liveControl);
+    return state;
+}
+
 export function emptyRefs() {
     return { images: [], videos: [], audios: [], taskPlan: null, control: null };
 }

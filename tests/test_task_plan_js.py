@@ -1,12 +1,11 @@
-"""Exercise the task-plan/reference transport code from the shipped browser module."""
+"""Exercise the task-plan/reference transport code and the task plan dialog from the shipped browser modules."""
 
 import json
 
 import pytest
 
-from _js import WEB, evaluate, requires_node, run
+from _js import FAKE_DOM, WEB, evaluate, requires_node, run
 
-REFPACK_JS = WEB / "refpack.js"
 REFPACK_CSS = WEB / "refpack.css"
 
 
@@ -14,23 +13,193 @@ def _run(expression: str):
     return evaluate(expression, "references")
 
 
-def test_task_plan_shows_and_refreshes_picture_and_video_thumbnails():
-    modal = REFPACK_JS.read_text()  # each string below occurs only in openTaskPlanModal
+def _dialog(envelope: dict, body: str, *, probes: dict | None = None, job_type: str = "auto",
+            files: dict | None = None):
+    """Open the real task plan dialog on a node holding `envelope` and run `body`.
 
-    assert 'if (kind === "image" || kind === "video")' in modal
-    assert 'thumbnail.className = "mmrp-plan-thumbnail-image"' in modal
-    assert "thumbnail.src = thumbUrl(reference.file, reference)" in modal
-    assert modal.count("refreshThumbnail();") == 2  # initial render + Source change
+    `probes` is the soundtrack probe cache (file -> has audio); `files` the input listing
+    per kind. `body` sees `modal`, `node`, `applied` (what Apply committed), `dropped`
+    (thumbnails invalidated) and the row helpers, and must evaluate to one JSON value.
+    """
+    setup = FAKE_DOM + f"""
+    const node = {{_mmrpRefs: fromReferencesEnvelope({json.dumps(envelope)}),
+        widgets: [{{name: 'job_type', value: {json.dumps(job_type)}}}]}};
+    const dropped = [];
+    let applied = null;
+    const ui = createTaskPlanUi({{
+        createPlannerModal, appendFileOptions,
+        apiListFiles: async (kind) => ({json.dumps(files or {})})[kind] || [],
+        thumbUrl: (file) => `/thumb/${{file}}`, dropThumb: (file) => dropped.push(file),
+        probeResults: new Map(Object.entries({json.dumps(probes or {})})),
+        applyRefs: (target, refs) => {{ applied = refs; target._mmrpRefs = refs; }},
+    }});
+    await ui.openTaskPlanModal(node);
+    const modal = byClass(document.body, 'mmrp-task-modal')[0];
+    const rows = byClass(modal, 'mmrp-plan-asset');
+    const role = (row, id) => all(rows[row]).find(el => el.dataset.roleControl === 'true' && el.value === id);
+    const primary = (row) => all(rows[row]).find(el => el.dataset.primaryControl === 'true');
+    const choose = (select, value) => {{ select.value = value; fire(select, 'change'); }};
+    const status = () => byClass(modal, 'mmrp-plan-status')[0];
+    const apply = () => fire(byText(modal, 'Apply plan'), 'click');
+    """
+    return evaluate(body, "references", "task_plan_ui", "modal", setup=setup)
+
+
+@requires_node
+def test_task_plan_shows_and_refreshes_picture_and_video_thumbnails():
+    envelope = {"references": [
+        {"kind": "image", "file": "face.png"},
+        {"kind": "video", "file": "plate.mp4", "trim": [1, 2]},
+        {"kind": "audio", "file": "voice.wav"},
+    ]}
+    got = _dialog(envelope, """(() => {
+        const thumbs = () => rows.map(row => byClass(row, 'mmrp-plan-thumbnail-image').map(img => [img.src, img.alt]));
+        const before = thumbs();
+        choose(byClass(rows[1], 'mmrp-source-select')[0], 'other.mp4');
+        return {before, after: thumbs(), dropped, video: node._mmrpRefs.videos[0]};
+    })()""", files={"video": ["plate.mp4", "other.mp4"]})
+
+    assert got["before"] == [
+        [["/thumb/face.png", "Picture preview: face.png"]],
+        [["/thumb/plate.mp4", "Video preview: plate.mp4"]],
+        [],
+    ]
+    assert got["after"][1] == [["/thumb/other.mp4", "Video preview: other.mp4"]]
+    assert got["dropped"] == ["plate.mp4"]
+    assert got["video"]["file"] == "plate.mp4"  # the node keeps its refs until Apply
     assert ".mmrp-plan-thumbnail-image" in REFPACK_CSS.read_text()
 
 
+@requires_node
 def test_task_plan_primary_video_control_explains_and_requires_a_driver_role():
-    modal = REFPACK_JS.read_text()  # each string below occurs only in openTaskPlanModal
+    envelope = {"references": [{"kind": "video", "file": "plate.mp4", "use_soundtrack": True}],
+                "task_plan": {"mode": "explicit"}}
+    got = _dialog(envelope, """(() => {
+        const state = () => ({primary: primary(0).checked, disabled: primary(0).disabled});
+        const start = state();
+        fire(Object.assign(role(0, 'video_editing'), {checked: true}), 'change');
+        const driven = state();
+        fire(Object.assign(role(0, 'video_editing'), {checked: false}), 'change');
+        return {start, driven, undriven: state(),
+                label: primary(0).parentElement.children[1].textContent,
+                help: byClass(rows[0], 'mmrp-primary-help')[0].textContent};
+    })()""")
 
-    assert 'document.createTextNode("Primary video")' in modal
-    assert "Primary edit / continuation video" not in modal
-    assert 'primaryControl.dataset.requiresDriver = "true"' in modal
-    assert "Replacement plans use the editing source." in modal
+    assert got["start"] == {"primary": False, "disabled": True}
+    assert got["driven"] == {"primary": True, "disabled": False}  # first driver role marks it
+    assert got["undriven"] == {"primary": False, "disabled": True}
+    assert got["label"] == "Primary video"
+    assert "Replacement plans use the editing source." in got["help"]
+
+
+@requires_node
+def test_apply_commits_the_plan_and_resets_the_legacy_job_type():
+    envelope = {"references": [
+        {"kind": "video", "file": "guide.mp4", "use_soundtrack": True},
+        {"kind": "video", "file": "plate.mp4", "use_soundtrack": True},
+    ]}
+    got = _dialog(envelope, """(() => {
+        const disabledAtOpen = role(1, 'video_editing').disabled;
+        fire(Object.assign(role(1, 'video_editing'), {checked: true}), 'change');
+        fire(Object.assign(role(0, 'reference_generation'), {checked: true}), 'change');
+        const prefix = status().textContent;
+        apply();
+        return {disabledAtOpen, prefix, envelope: toReferencesEnvelope(applied),
+                jobType: node.widgets[0].value};
+    })()""", job_type="replacement")
+
+    assert got["disabledAtOpen"] is False  # legacy job_type=replacement opens explicit
+    assert got["prefix"].startswith("Derived prefix: [video editing")
+    # The primary editing source moves to <Video 1>.
+    assert [r["file"] for r in got["envelope"]["references"]] == ["plate.mp4", "guide.mp4"]
+    assert got["envelope"]["references"][0]["primary"] is True
+    assert got["envelope"]["task_plan"] == {"mode": "explicit"}
+    assert got["jobType"] == "auto"
+
+
+@requires_node
+def test_a_silent_new_source_loses_its_soundtrack_roles():
+    envelope = {"references": [{"kind": "video", "file": "plate.mp4", "use_soundtrack": True,
+                                "roles": ["reference_generation", "audio_reuse"]}],
+                "task_plan": {"mode": "explicit"}}
+    got = _dialog(envelope, """(() => {
+        const before = role(0, 'audio_reuse').disabled;
+        choose(byClass(rows[0], 'mmrp-source-select')[0], 'silent.mp4');
+        return {before, after: role(0, 'audio_reuse').disabled, checked: role(0, 'audio_reuse').checked};
+    })()""", probes={"silent.mp4": False}, files={"video": ["plate.mp4", "silent.mp4"]})
+
+    assert got == {"before": False, "after": True, "checked": False}
+
+
+@requires_node
+def test_references_changed_while_open_block_apply():
+    envelope = {"references": [{"kind": "image", "file": "face.png", "roles": ["reference_generation"]}],
+                "task_plan": {"mode": "explicit"}}
+    got = _dialog(envelope, """(() => {
+        node._mmrpRefs = fromReferencesEnvelope({references: []});
+        apply();
+        return {applied, status: status().textContent,
+                save: byText(modal, 'Apply plan').disabled};
+    })()""")
+
+    assert got["applied"] is None
+    assert got["status"].startswith("References changed while this planner was open.")
+    assert got["save"] is True
+
+
+@requires_node
+def test_apply_keeps_a_control_receipt_that_landed_while_open():
+    envelope = {"references": [{"kind": "image", "file": "face.png", "roles": ["reference_generation"]}],
+                "task_plan": {"mode": "explicit"}}
+    receipt = {"source": {"file": "plate.mp4"}, "mode": "pose", "map": {"file": "control_maps/plate_pose.mp4"}}
+    got = _dialog(envelope, f"""(() => {{
+        node._mmrpRefs.control = {json.dumps(receipt)};
+        apply();
+        return applied.control;
+    }})()""")
+
+    assert got == receipt
+
+
+@requires_node
+@pytest.mark.parametrize("has_audio,soundtrack,roles", [
+    (None, True, ["reference_generation", "audio_reuse"]),   # probe pending: sound back on
+    (True, True, ["reference_generation", "audio_reuse"]),
+    (False, False, ["reference_generation"]),                # known silent: sound roles go
+])
+def test_a_new_video_source_drops_edits_and_resets_its_soundtrack(has_audio, soundtrack, roles):
+    got = _run(f"""(() => {{
+        const reference = {{file: 'old.mp4', missing: true, crop: [0, 0, 0.5, 1], trim: [1, 2],
+            use_soundtrack: false, roles: ['reference_generation', 'audio_reuse']}};
+        changeReferenceSource(reference, 'video', 'new.mp4', {json.dumps(has_audio)});
+        return reference;
+    }})()""")
+
+    assert got == {"file": "new.mp4", "missing": False, "use_soundtrack": soundtrack, "roles": roles}
+
+
+@requires_node
+def test_a_new_image_source_drops_edits_only():
+    got = _run("""(() => {
+        const reference = {file: 'a.png', crop: [0, 0, 0.5, 1], roles: ['reference_generation']};
+        changeReferenceSource(reference, 'image', 'b.png', false);
+        return reference;
+    })()""")
+
+    assert got == {"file": "b.png", "missing": False, "roles": ["reference_generation"]}
+
+
+@requires_node
+def test_toggled_roles_keep_the_option_order():
+    got = _run("""(() => {
+        const refs = fromReferencesEnvelope({references: [{kind: 'video', file: 'v.mp4'}]});
+        const video = refs.videos[0];
+        toggleTaskRole(refs, 'video', video, 'audio_reuse', true);
+        toggleTaskRole(refs, 'video', video, 'video_editing', true);
+        return video.roles;
+    })()""")
+
+    assert got == ["video_editing", "audio_reuse"]
 
 
 @requires_node

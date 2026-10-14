@@ -69,3 +69,57 @@ def run(body: str, *modules: str, timeout: float = 10) -> Any:
 def evaluate(expression: str, *modules: str, setup: str = "", timeout: float = 10) -> Any:
     """The JSON value of `expression` (awaited) after `setup`, with `modules` imported."""
     return run(f"{setup}\nconsole.log(JSON.stringify(await ({expression})));\n", *modules, timeout=timeout)
+
+
+# A fake DOM just deep enough to build and click the lib/*_ui.js dialogs under node:
+# elements keep their children, classes, dataset, style and every listener; `fire`
+# runs an element's listeners for one event. Install it with `setup=FAKE_DOM`.
+# Lookups walk the tree (`all`, `byClass`, `byText`) rather than parsing selectors, so
+# querySelectorAll finds nothing.
+FAKE_DOM = """
+class Element {
+    constructor(tag) {
+        this.tag = tag; this.children = []; this.style = {}; this.dataset = {}; this.attributes = {};
+        this.handlers = {}; this.textContent = ''; this.value = ''; this.disabled = false;
+        const classes = new Set(); this.classes = classes;
+        this.classList = {add: name => classes.add(name), remove: name => classes.delete(name),
+            contains: name => classes.has(name),
+            toggle: (name, force) => (force ?? !classes.has(name)) ? classes.add(name) : classes.delete(name)};
+    }
+    set className(value) { this.classes.clear(); String(value).split(' ').filter(Boolean).forEach(c => this.classes.add(c)); }
+    get className() { return [...this.classes].join(' '); }
+    appendChild(child) { this.children.push(child); child.parentElement = this; return child; }
+    remove() { const parent = this.parentElement; if (parent) parent.children.splice(parent.children.indexOf(this), 1); this.parentElement = null; }
+    setAttribute(name, value) { this.attributes[name] = value; }
+    getAttribute(name) { return this.attributes[name]; }
+    addEventListener(name, callback) { (this.handlers[name] ||= []).push(callback); }
+    removeEventListener(name, callback) { this.handlers[name] = (this.handlers[name] || []).filter(c => c !== callback); }
+    replaceChildren(...children) { this.children = []; children.forEach(child => this.appendChild(child)); }
+    querySelectorAll() { return []; }
+    dispatchEvent(event) { fire(this, event.type, event); }
+    focus() { document.activeElement = this; }
+    getBoundingClientRect() { return {left: 0, top: 0, width: 100, height: 100}; }
+    pause() { this.paused = true; }
+    play() { this.paused = false; return Promise.resolve(); }
+}
+function fire(element, name, event = {}) {
+    const full = {target: element, preventDefault() {}, stopPropagation() {}, ...event};
+    const property = element['on' + name];
+    if (typeof property === 'function') property(full);
+    for (const callback of element.handlers[name] || []) callback(full);
+}
+const all = root => [root, ...root.children.flatMap(all)];
+const byClass = (root, name) => all(root).filter(el => el.classList && el.classList.contains(name));
+const byText = (root, text) => all(root).find(el => el.textContent === text);
+globalThis.document = Object.assign(new Element('#document'), {
+    body: new Element('body'), activeElement: null,
+    createElement: tag => new Element(tag),
+    createTextNode: text => Object.assign(new Element('#text'), {textContent: text}),
+});
+globalThis.window = new Element('window');
+globalThis.requestAnimationFrame = () => 0;
+// RefPack's log lines (lib/log.js) collect here: on stdout they would precede the JSON result.
+const logged = [];
+console.info = console.debug = console.warn = (line) => logged.push(line);
+globalThis.cancelAnimationFrame = () => {};
+"""
