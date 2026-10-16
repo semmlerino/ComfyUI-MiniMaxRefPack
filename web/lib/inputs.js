@@ -1,4 +1,4 @@
-import { fixedSize, layoutExposedInputs } from "./layout.js";
+import { nodeSize, layoutExposedInputs } from "./layout.js";
 
 // Optional sockets are exposed individually; their backend schema is always present.
 export const REFERENCE_INPUTS = Object.fromEntries([
@@ -30,7 +30,7 @@ export function installInputControls(node, { redraw, connectionsChanged }) {
                 callback: () => {
                     if (index >= 0) this.removeInput(index);
                     else this.addInput(name, type);
-                    this.setSize(fixedSize(this));
+                    this.setSize(nodeSize(this));
                     this.setDirtyCanvas(true, true);
                     redraw(this);
                 },
@@ -46,8 +46,8 @@ export function installInputControls(node, { redraw, connectionsChanged }) {
     const previousDraw = node.onDrawBackground;
     node.onDrawBackground = function () {
         // Widget positions can change after provider switches and workflow restore.
-        const size = fixedSize(this);
-        if (this.size[1] !== size[1]) this.setSize(size);
+        const size = nodeSize(this);
+        if (this.size[0] !== size[0] || this.size[1] !== size[1]) this.setSize(size);
         previousDraw?.apply(this, arguments);
     };
     const previousConnectionPos = node.getConnectionPos;

@@ -7,6 +7,7 @@ One node that manages every reference for **MiniMax H3 Reference to Video**, wri
 ## Features
 
 - **Select or upload instead of wiring.** Use each asset's source dropdown for files already in ComfyUI's input directory, use the upload buttons for new files, or drop a mixed group anywhere on the node. Preview them, play them and delete them without loader nodes or links.
+- **Resizable manager.** Drag the node's resize handle to change its width and height. The prompt area follows the height, narrow reference rows scroll horizontally, and workflows remember the chosen size.
 - **References and controls, wired once.** Connect the 18 reference sockets plus `prompt` into `MiniMax H3 Reference to Video`. The `width` / `height` outputs carry the target canvas; the appended `control_video` output connects to native **Apply MiniMax H3 Fun ControlNet**. Existing output slots retain their positions.
 - **Generate or reuse control maps.** Open **ControlNet**, drop or select a clip, frame it with the crop box and trim handles, choose Pose, Depth or Edges, and click **Generate**. Or switch to **Use a map I already have** to check a saved map without its original source video or detector. Play the map beside its source before queueing the render separately. Control videos do not consume reference tags or soundtrack slots.
 - **Auto prompting.** A multimodal model looks at your references, reads your direction text, and writes a full MiniMax H3 prompt in the exact six-section format the model expects.

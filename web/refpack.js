@@ -16,16 +16,11 @@
  * without pasting into ⚙. Named pins replace packaged six-section; a non-blank ⚙
  * `system_prompt` still wins.
  *
- * FIXED SIZE, per spec: "I would like this node to have a fixed size that cannot be
- * moved" / "I don't want the canvas to change at all — always the same row. It just
- * adds or removes content." So: node.resizable = false, and onResize / setSize /
- * computeSize all clamp to fixedSize() regardless of input — a restored workflow, a
- * paste, or a frontend quirk cannot put the node at another size. The three rows are
- * always drawn at full tile height whether they hold 0 or 9 items; only their
- * CONTENTS change. Every piece of machinery that existed to cope with a changing
- * size (content measurement, resize-driven relayout, width floors, the
- * restored-size protection) is deleted — the geometry below is arithmetic over
- * constants, not measurement.
+ * RESIZING: the node keeps the user's width and height, including workflow restores.
+ * The prompt grows with the node; the toolbar wraps and the reference canvas scrolls
+ * horizontally on narrow nodes. The three reference rows keep their tile geometry
+ * whether they hold 0 or 9 items, so painting and hit testing share one coordinate
+ * system. lib/layout.js supplies the default size and minimum content dimensions.
  *
  * RENDERING: the reference rows are a single <canvas>, not per-cell DOM — the LTX
  * Director hybrid (ltx_director.js draws its timeline onto one canvas at :2703 but
@@ -41,7 +36,7 @@
  * PLAYABLE PREVIEWS: click the drawn ▶ on a video or audio tile to play it, click
  * again (or click the playing video) to stop. ONE shared <video> overlay and ONE
  * shared <audio> element per node — never per-cell DOM. The overlay is a child of
- * the block, so ComfyUI's zoom transform applies to it automatically; positioning
+ * the gallery, so ComfyUI's zoom transform applies to it automatically; positioning
  * is plain CSS-px math off the tile rect. Clicking a tile anywhere OUTSIDE the ▶
  * selects it, exactly as before.
  *
@@ -127,7 +122,10 @@ import { DROP_KINDS, bucketDroppedFiles, isVideoFile } from "./lib/drop.js";
 import { createEditUi } from "./lib/edit_ui.js";
 import { editSummary, hasEdit } from "./lib/edits.js";
 import { installInputControls } from "./lib/inputs.js";
-import { CANVAS_ROWS, CAPS, CL, CONTENT, KINDS, SECTION_LABEL, fixedSize } from "./lib/layout.js";
+import {
+    CANVAS_ROWS, CAPS, CL, CONTENT, KINDS, SECTION_LABEL,
+    blockSize, defaultSize, installSizeGuards, nodeSize,
+} from "./lib/layout.js";
 import { mdebug, mlog, mwarn } from "./lib/log.js";
 import { appendFileOptions, createPlannerModal } from "./lib/modal.js";
 import {
@@ -1232,7 +1230,7 @@ function togglePreview(node, hit) {
         const v = body.previewVideo;
         v.src = fileUrl(hit.file);
         if (trim) v.currentTime = trim[0];
-        // Same coordinate space as the canvas — the block is the offsetParent for
+        // Same coordinate space as the canvas — the gallery is the offsetParent for
         // both, and ComfyUI's zoom transform applies to the overlay automatically.
         v.style.left = `${body.canvas.offsetLeft + hit.tileX}px`;
         v.style.top = `${body.canvas.offsetTop + hit.tileY}px`;
@@ -1357,7 +1355,7 @@ function removeRef(node, kind, index) {
 }
 
 // The DOM-side reaction to a state change: button disabled states, probes, repaint.
-// No sizing here — the geometry is fixed, only the canvas's CONTENTS change.
+// Reference changes repaint the canvas without resetting the user's node size.
 function renderNodeBody(node) {
     const body = node._mmrpBody;
     if (!body) return;
@@ -1484,8 +1482,7 @@ function buildCustomBlock(node) {
     localBtn.onclick = () => openLocalServerModal(node, localBtn);
     uploadRow.appendChild(localBtn);
     // Only meaningful while prompt_provider is `local`, so it is hidden otherwise rather
-    // than sitting there inert. The row is nowrap and content-sized, so removing it from
-    // layout just shortens the group; the node's fixed height is unaffected.
+    // than sitting there inert. Removing it from layout shortens the toolbar.
     node._mmrpLocalBtn = localBtn;
     syncLocalBtn(node);
 
@@ -1498,9 +1495,15 @@ function buildCustomBlock(node) {
 
     container.appendChild(uploadRow);
 
+    const gallery = document.createElement("div");
+    gallery.className = "mmrp-gallery";
+    gallery.style.height = `${CANVAS_ROWS.height + CONTENT.scrollbarH}px`;
+    container.appendChild(gallery);
+
     const canvas = document.createElement("canvas");
     canvas.className = "mmrp-canvas";
     canvas.style.height = `${CANVAS_ROWS.height}px`; // fixed, set once
+    canvas.style.minWidth = `${CONTENT.width - CONTENT.pad * 2}px`;
     canvas.addEventListener("mousedown", (e) => onCanvasMouseDown(node, e));
     canvas.addEventListener("dblclick", (e) => onCanvasDblClick(node, e));
     // Painted tiles are not DOM, so a native drag would pick up the whole canvas
@@ -1520,22 +1523,25 @@ function buildCustomBlock(node) {
     // Keep litegraph's node context menu off the tiles (matches the reference's
     // per-item contextmenu swallow).
     canvas.addEventListener("contextmenu", (e) => e.stopPropagation());
-    container.appendChild(canvas);
+    gallery.appendChild(canvas);
 
-    // Fires exactly once in practice — when V3 asynchronously mounts the block and
-    // the canvas goes 0 -> real size. That first fire is the initial paint trigger;
-    // the geometry never changes afterwards.
-    const resizeObserver = new ResizeObserver(() => scheduleDraw(node));
+    // Paint after V3 mounts the block and after resizing. A wrapping toolbar can
+    // increase the minimum height, but never resets a larger user-chosen size.
+    const resizeObserver = new ResizeObserver(() => {
+        const size = nodeSize(node);
+        if (node.size[0] !== size[0] || node.size[1] !== size[1]) node.setSize(size);
+        scheduleDraw(node);
+    });
     resizeObserver.observe(canvas);
+    resizeObserver.observe(uploadRow);
 
-    // The shared preview pair (see togglePreview). Children of the block so the
-    // canvas and the overlay share an offsetParent and a zoom transform.
+    // The preview shares the canvas's scrolling offsetParent and zoom transform.
     const previewVideo = document.createElement("video");
     previewVideo.className = "mmrp-preview";
     previewVideo.playsInline = true;
     previewVideo.addEventListener("ended", () => stopPreview(node));
     previewVideo.addEventListener("click", () => stopPreview(node));
-    container.appendChild(previewVideo);
+    gallery.appendChild(previewVideo);
 
     const previewAudio = document.createElement("audio");
     previewAudio.addEventListener("ended", () => stopPreview(node));
@@ -1662,6 +1668,7 @@ function buildCustomBlock(node) {
 
     node._mmrpBody = {
         root: container,
+        uploadRow,
         uploadButtons,
         fileInputs,
         planButton,
@@ -1841,7 +1848,7 @@ function syncLocalBtn(node) {
     if (node.setSize) {
         setTimeout(() => {
             try {
-                node.setSize(fixedSize(node));
+                node.setSize(nodeSize(node));
                 app.graph?.setDirtyCanvas(true, true);
             } catch (_) {}
         }, 0);
@@ -2129,44 +2136,6 @@ function installSelectionHandlers(node) {
 }
 
 // ---------------------------------------------------------------------------
-// Fixed-size enforcement. resizable = false removes litegraph's resize handle;
-// the three overrides are belt and braces so NOTHING — a restored workflow, a
-// paste, a frontend quirk — can put the node at any other size. This supersedes
-// the old "never stomp a restored size" rule: there is no user-chosen size.
-// ---------------------------------------------------------------------------
-
-function installSizeGuards(node) {
-    node.resizable = false;
-
-    const origOnResize = node.onResize;
-    node.onResize = function (size) {
-        const f = fixedSize(this);
-        size[0] = f[0];
-        size[1] = f[1];
-        if (origOnResize) origOnResize.call(this, size);
-    };
-
-    const origComputeSize = node.computeSize;
-    node.computeSize = function () {
-        // origComputeSize still runs for its side effects on some frontends, but its
-        // answer is discarded — the size is a constant.
-        if (origComputeSize) origComputeSize.apply(this, arguments);
-        const f = fixedSize(this);
-        this.min_size = [f[0], f[1]];
-        return [f[0], f[1]];
-    };
-
-    const origSetSize = node.setSize;
-    node.setSize = function (size) {
-        const f = fixedSize(this);
-        size[0] = f[0];
-        size[1] = f[1];
-        if (origSetSize) origSetSize.call(this, size);
-        else this.size = size;
-    };
-}
-
-// ---------------------------------------------------------------------------
 // Extension registration
 // ---------------------------------------------------------------------------
 
@@ -2221,9 +2190,7 @@ app.registerExtension({
             // a LoadImage node. Keeping the overlay live is what stops that.
             const domWidget = node.addDOMWidget("mmrp_block", "custom", bodyEl, { serialize: false, hideOnZoom: false });
             node._mmrpDomWidget = domWidget;
-            // Constant, by construction: the CSS pins the DOM heights this arithmetic
-            // assumes (uploadsH/promptH/gap), the canvas height is CANVAS_ROWS.height.
-            domWidget.computeSize = () => [CONTENT.width - CONTENT.pad * 2, CONTENT.height];
+            domWidget.computeSize = () => blockSize(node);
             liveNodes.add(node);
 
             node._mmrpBody.directionInput.value = directionWidget ? directionWidget.value || "" : "";
@@ -2239,7 +2206,8 @@ app.registerExtension({
                 if (originalWidget.callback) originalWidget.callback(originalWidget.value);
             });
 
-            installSizeGuards(node);
+            installSizeGuards(node, scheduleDraw);
+            node.setSize(defaultSize(node));
             installSelectionHandlers(node);
             watchProviderWidget(node);
             syncLocalBtn(node);
@@ -2301,16 +2269,15 @@ app.registerExtension({
                 }
                 this._mmrpSelected = null;
                 // configure() writes the serialized size straight onto node.size,
-                // bypassing our setSize wrapper — re-assert the fixed size.
-                this.setSize(fixedSize(this));
+                // bypassing our setSize wrapper — preserve it within content minimums.
+                this.setSize(nodeSize(this));
                 renderNodeBody(this);
                 return out;
             };
 
-            // last_y isn't assigned until litegraph's first layout pass — re-assert
-            // the fixed size once it exists so the height lands on the real widget top.
+            // last_y settles after the first layout; grow only if content needs room.
             setTimeout(() => {
-                node.setSize(fixedSize(node));
+                node.setSize(nodeSize(node));
                 app.graph?.setDirtyCanvas(true, true);
                 scheduleDraw(node);
             }, 50);

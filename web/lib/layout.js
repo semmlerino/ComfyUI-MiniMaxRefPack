@@ -1,4 +1,4 @@
-// The node's fixed geometry: reference rows, the DOM block and exposed input sockets.
+// Reference rows, resizable node geometry and exposed input sockets.
 
 export const KINDS = ["image", "video", "audio"];
 export const CAPS = { image: 9, video: 3, audio: 3 };
@@ -37,7 +37,7 @@ export const CL = {
 CL.stripH = CL.stripPad * 2 + CL.tile;
 
 // The rows never move: every section is always drawn at full tile height, 0 items or
-// 9. Static layout, computed once — this is the whole point of the fixed-size node.
+// 9. Narrow nodes scroll the canvas horizontally instead of changing tile sizes.
 export const CANVAS_ROWS = (() => {
     const rows = [];
     let y = CL.padTop;
@@ -49,34 +49,83 @@ export const CANVAS_ROWS = (() => {
     return { rows, height: y };
 })();
 
-// Fixed block geometry. The DOM heights (uploadsH, promptH, gap) are pinned in
-// refpack.css to the same values — the two must agree, there is no measurement.
-// THE WIDTH PRESERVES THE NO-SCROLL INVARIANT: the longest row is 9 image tiles
-// (9×131 + 8×6 = 1227px) plus the 24px add-gap and the 44px add square, which is
-// drawn dimmed even at cap = 1295px of row viewport; +2×10 slab padding = 1315
-// canvas; +2×10 block inset = 1335 node — fixed at 1340 for slack. That invariant
-// is why no scroll machinery exists; change tile/gap/x0/pad/addBtn/addGap only
-// together with this width.
+// The default width fits all nine images and their add button. The prompt takes
+// the remaining height when resized; the toolbar can wrap on narrower nodes.
 export const CONTENT = {
     width: 1340,
+    minWidth: 600,
     pad: 10, // side inset of the DOM block within the node
-    uploadsH: 30, // .mmrp-uploads fixed height
-    promptH: 880, // .mmrp-direction fixed height — tall enough to show a full shot prompt without scrolling
+    uploadsH: 30, // minimum toolbar height
+    promptH: 880, // default prompt height
+    minPromptH: 110,
+    scrollbarH: 16,
     originalH: 88, // label + .mmrp-original — keeps the idea after Auto Prompt rewrites direction
     gap: 8, // .mmrp-block flex gap
 };
 CONTENT.height =
-    CONTENT.uploadsH + CONTENT.gap + CANVAS_ROWS.height + CONTENT.gap + CONTENT.promptH
-    + CONTENT.gap + CONTENT.originalH;
+    CONTENT.uploadsH + CANVAS_ROWS.height + CONTENT.scrollbarH + CONTENT.promptH
+    + CONTENT.gap * 4 + CONTENT.originalH;
 
-// The ONE node size. Height floors against the 19 output sockets; widgetY is where
-// litegraph placed the DOM block below the native widgets (fallback for the beat
-// before the first layout assigns last_y).
-export function fixedSize(node) {
+function widgetTop(node) {
+    return node._mmrpDomWidget?.last_y || 80;
+}
+
+function minimumBlockHeight(node) {
+    const toolbarH = node._mmrpBody?.uploadRow?.offsetHeight || CONTENT.uploadsH;
+    return CONTENT.height - CONTENT.promptH + CONTENT.minPromptH + toolbarH - CONTENT.uploadsH;
+}
+
+export function minimumSize(node) {
     const inputsMin = layoutExposedInputs(node);
-    const widgetY = (node._mmrpDomWidget && node._mmrpDomWidget.last_y) || 80;
     const outputsMin = Math.max(node.outputs?.length || 1, node.inputs?.length || 1) * 20 + 40;
-    return [CONTENT.width, Math.max(widgetY + CONTENT.height + CONTENT.pad, outputsMin, inputsMin)];
+    return [CONTENT.minWidth, Math.max(widgetTop(node) + minimumBlockHeight(node) + CONTENT.pad,
+        outputsMin, inputsMin)];
+}
+
+export function defaultSize(node) {
+    const min = minimumSize(node);
+    return [CONTENT.width, Math.max(widgetTop(node) + CONTENT.height + CONTENT.pad, min[1])];
+}
+
+// Clamp only the minimum; workflow restores and automatic layout keep user sizes.
+export function nodeSize(node, requested = node.size) {
+    const min = minimumSize(node);
+    const fallback = defaultSize(node);
+    return min.map((floor, i) => Math.max(floor, Number.isFinite(requested?.[i]) ? requested[i] : fallback[i]));
+}
+
+export function blockSize(node) {
+    const size = nodeSize(node);
+    return [size[0] - CONTENT.pad * 2, size[1] - widgetTop(node) - CONTENT.pad];
+}
+
+export function installSizeGuards(node, resized) {
+    node.resizable = true;
+    const previousResize = node.onResize;
+    node.onResize = function (size) {
+        const clamped = nodeSize(this, size);
+        size[0] = clamped[0];
+        size[1] = clamped[1];
+        previousResize?.call(this, size);
+        const root = this._mmrpBody?.root;
+        if (root) root.style.height = `${blockSize(this)[1]}px`;
+        resized?.(this);
+    };
+    const previousCompute = node.computeSize;
+    node.computeSize = function () {
+        previousCompute?.apply(this, arguments);
+        this.min_size = minimumSize(this);
+        return [...this.min_size];
+    };
+    const previousSet = node.setSize;
+    node.setSize = function (size) {
+        const clamped = nodeSize(this, size);
+        if (previousSet) previousSet.call(this, clamped);
+        else {
+            this.size = clamped;
+            this.onResize(clamped);
+        }
+    };
 }
 
 export function layoutExposedInputs(node) {
