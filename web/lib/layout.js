@@ -61,7 +61,7 @@ export const CONTENT = {
     width: 1340,
     pad: 10, // side inset of the DOM block within the node
     uploadsH: 30, // .mmrp-uploads fixed height
-    promptH: 110, // .mmrp-direction fixed height — clearly smaller than a canvas row
+    promptH: 880, // .mmrp-direction fixed height — tall enough to show a full shot prompt without scrolling
     originalH: 88, // label + .mmrp-original — keeps the idea after Auto Prompt rewrites direction
     gap: 8, // .mmrp-block flex gap
 };
