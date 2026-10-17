@@ -18,6 +18,9 @@
     flex-direction: column;
     gap: 8px;
     width: 100%;
+    /* Fill the frontend's DOM-widget container; a pixel height computed from
+       node.size ignores its top inset and pushed the last box onto the node edge. */
+    height: 100%;
     min-width: 0;
     min-height: 0;
     box-sizing: border-box;

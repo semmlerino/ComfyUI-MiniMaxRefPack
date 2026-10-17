@@ -42,7 +42,7 @@ def test_resize_can_shrink_and_grow_and_restored_size_is_preserved():
     node.setSize(requested);
     const small = [...node.size];
     const smallBlock = blockSize(node);
-    const rootHeight = node._mmrpBody.root.style.height;
+    const rootHeight = node._mmrpBody.root.style.height ?? null;
     const min = node.computeSize();
     node.setSize([1700, 2100]);
     const large = [...node.size];
@@ -59,7 +59,7 @@ def test_resize_can_shrink_and_grow_and_restored_size_is_preserved():
     '''
     got = run(script, "layout")
     assert got == {
-        "small": [760, 1300], "smallBlock": [740, 1010], "rootHeight": "1010px",
+        "small": [760, 1300], "smallBlock": [740, 1010], "rootHeight": None,
         "large": [1700, 2100], "restored": [900, 1450], "resizable": True,
         "inputUnchanged": True, "canShrink": True, "floor": True,
         "previousResizes": 4, "previousComputes": 1, "redraws": 4,

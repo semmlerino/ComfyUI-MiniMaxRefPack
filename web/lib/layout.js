@@ -55,6 +55,9 @@ export const CONTENT = {
     width: 1340,
     minWidth: 600,
     pad: 10, // side inset of the DOM block within the node
+    // The frontend insets the DOM widget's container 10px below last_y and ends it
+    // 16px above the node's bottom (measured, frontend 1.53.6); the block fills it.
+    frameH: 26,
     uploadsH: 30, // minimum toolbar height
     promptH: 880, // default prompt height
     minPromptH: 110,
@@ -78,13 +81,13 @@ function minimumBlockHeight(node) {
 export function minimumSize(node) {
     const inputsMin = layoutExposedInputs(node);
     const outputsMin = Math.max(node.outputs?.length || 1, node.inputs?.length || 1) * 20 + 40;
-    return [CONTENT.minWidth, Math.max(widgetTop(node) + minimumBlockHeight(node) + CONTENT.pad,
+    return [CONTENT.minWidth, Math.max(widgetTop(node) + minimumBlockHeight(node) + CONTENT.frameH,
         outputsMin, inputsMin)];
 }
 
 export function defaultSize(node) {
     const min = minimumSize(node);
-    return [CONTENT.width, Math.max(widgetTop(node) + CONTENT.height + CONTENT.pad, min[1])];
+    return [CONTENT.width, Math.max(widgetTop(node) + CONTENT.height + CONTENT.frameH, min[1])];
 }
 
 // Clamp only the minimum; workflow restores and automatic layout keep user sizes.
@@ -107,8 +110,6 @@ export function installSizeGuards(node, resized) {
         size[0] = clamped[0];
         size[1] = clamped[1];
         previousResize?.call(this, size);
-        const root = this._mmrpBody?.root;
-        if (root) root.style.height = `${blockSize(this)[1]}px`;
         resized?.(this);
     };
     const previousCompute = node.computeSize;
