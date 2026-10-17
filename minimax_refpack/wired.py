@@ -39,6 +39,14 @@ class WiredCache(media.MediaCache):
             return self.overrides[path]
         return super().audio(path, trim=trim)
 
+    def vlm_video(self, path, *, crop=None, trim=None, audio=True):
+        if path in self.overrides:
+            # An upstream tensor has no file to stream, even for a vlm_only cache.
+            frames, sound = self.overrides[path]
+            data, muxed = media.encode_reference_mp4(frames, 24, sound if audio else None)
+            return data, muxed, audio and sound is not None
+        return super().vlm_video(path, crop=crop, trim=trim, audio=audio)
+
 
 def resolve(reference_set, inputs, input_dir):
     """Replace occupied slots or append consecutive slots; never silently renumber gaps.

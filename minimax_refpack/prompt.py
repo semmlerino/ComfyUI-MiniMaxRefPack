@@ -620,9 +620,9 @@ def _build_content(
             # it. Edited and untouched clips take the SAME path now: the old untouched
             # fast path inlined the original file, which sent a 22s plate as ~33MB of
             # base64 to a provider that reads it at ~1fps and 768px anyway.
-            frames, audio = cache.video(path, target_fps=24, crop=t.ref.crop, trim=t.ref.trim)
-            data, muxed = media.encode_reference_mp4(
-                frames, 24, audio if t.audio_tag is not None else None
+            # A vlm_only cache (the off-pod freezer) streams this copy without the stack.
+            data, muxed, sound_read = cache.vlm_video(
+                path, crop=t.ref.crop, trim=t.ref.trim, audio=t.audio_tag is not None
             )
             parts.append(
                 _text_part(f"video_reference {t.tag} ({t.file}) - the next video, whole:")
@@ -639,7 +639,7 @@ def _build_content(
                     # assign_tags() has already minted this <Audio N>, so silence has to
                     # be DECLARED rather than left to be inferred. The wording is what
                     # both system prompts key their "invent nothing for it" rule off.
-                    reason = "could not be read" if audio is None else "could not be encoded"
+                    reason = "could not be encoded" if sound_read else "could not be read"
                     manifest.append(
                         f"  ({t.audio_tag}: {t.file}'s soundtrack {reason} - NOT sent with {t.tag})"
                     )

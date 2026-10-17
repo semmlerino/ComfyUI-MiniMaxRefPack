@@ -27,6 +27,7 @@ patch the accessor, not the (unimportable) real module.
 
 from __future__ import annotations
 
+import itertools
 import math
 import mimetypes
 from typing import Any
@@ -465,6 +466,105 @@ class _FrameSink:
     def take(self, n_out: int):
         return self._buf[:n_out]
 
+    def wants(self, start: int, count: int, frame) -> bool:
+        """Every slot is kept, so every frame is converted."""
+        return True
+
+
+def _frame_signature(frame) -> tuple[str, int, int, int]:
+    """What decides the shape and the conversion of a frame's array."""
+    return frame.format.name, frame.width, frame.height, frame.rotation
+
+
+def _sink_geometry(img, crop) -> tuple[Any, int, int]:
+    """(crop box or None, height, width) of a sink sized from its first converted frame."""
+    height, width = int(img.shape[0]), int(img.shape[1])
+    box = _crop_box(crop, width, height) if crop is not None else None
+    if box is not None:
+        left, top, right, bottom = box
+        height, width = bottom - top, right - left
+    return box, height, width
+
+
+class _VlmSink:
+    """The VLM's copy of a reference, filled by the same pass `_FrameSink` is.
+
+    Keeps only the 24 fps slots `encode_reference_mp4` can select - every slot while the
+    clip could still be short enough to go out whole, then the slots its 8 fps resample
+    reads - each put through the full path's own steps: float32 0..1, `_chunk_to_uint8`,
+    swscale to the encode size. `wants` lets the pass skip converting a frame no kept
+    slot reads, which is most of the decode's arithmetic. No stack is ever built: a 10 s
+    1080p clip keeps ~80 frames of 768px instead of ~6 GB of float32.
+
+    It refuses what the stack refuses. A frame whose format, size or rotation differs
+    from the first is converted even when no kept slot reads it, and `write` raises when
+    it no longer fills the first frame's shape, where the stack's slice assignment does.
+    Once the slots so far would put the stack over the decode budget it keeps nothing
+    more, and the caller raises `DecodeBudgetExceeded` on the clip's true count.
+    """
+
+    def __init__(
+        self, height: int, width: int, scale: bool, long_edge: int, target_fps: int,
+        signature: tuple[str, int, int, int],
+    ):
+        self.height, self.width = height, width
+        self.out_w, self.out_h = _vlm_size(width, height, long_edge)
+        self._scale = scale
+        self._target_fps = target_fps
+        self._signature = signature
+        # Below this many slots the clip goes out whole (_vlm_selection's short rule).
+        self._whole_below = next(
+            n for n in itertools.count(1)
+            if len(resample_indices(n, _STACK_FPS, target_fps)) >= _MIN_VLM_FRAMES
+        )
+        self.kept: dict[int, Any] = {}
+        self.filled = 0
+        self.over_budget = False
+
+    @classmethod
+    def build(cls, frame, img, crop, scale: bool, long_edge: int, target_fps: int):
+        """(sink, crop box) from the first converted frame, as `_build_sink` does."""
+        box, height, width = _sink_geometry(img, crop)
+        sink = cls(height, width, scale, long_edge, target_fps, _frame_signature(frame))
+        return sink, box
+
+    def _keeps(self, slot: int) -> bool:
+        if slot < self._whole_below:
+            return True
+        k = slot * self._target_fps // _STACK_FPS
+        return any(_source_index(c, _STACK_FPS, self._target_fps) == slot for c in (k, k + 1))
+
+    def wants(self, start: int, count: int, frame) -> bool:
+        if self.over_budget:
+            return False
+        if _frame_signature(frame) != self._signature:
+            return True
+        return any(self._keeps(i) for i in range(start, start + count))
+
+    def write(self, img, count: int) -> None:
+        """`img` is the cropped frame for the next `count` slots, or None when `wants`
+        said no slot of them is kept."""
+        if img is not None and tuple(img.shape[:2]) != (self.height, self.width):
+            raise RuntimeError(
+                f"a {img.shape[1]}x{img.shape[0]} frame cannot fill a "
+                f"{self.width}x{self.height} reference: the video changed size mid-stream"
+            )
+        start = self.filled
+        self.filled += count
+        if self.filled * self.height * self.width * 3 * 4 > _decode_budget():
+            self.over_budget = True
+            self.kept.clear()
+        if img is None or self.over_budget:
+            return
+        rgb = None
+        for slot in range(start, self.filled):
+            if not self._keeps(slot):
+                continue
+            if rgb is None:
+                rgb = _vlm_rgb(img, self._scale)
+            # A fresh frame per slot, as the stack path makes one per selected slot.
+            self.kept[slot] = _vlm_video_frame(rgb, self.out_w, self.out_h)
+
 
 class _PassResult:
     """What one demux pass learned. `needs_recount` means the caller must run another."""
@@ -724,13 +824,7 @@ def _decode_video(path, target_fps, crop, trim, fields):
     # wrong, so moving this check onto it would reject valid clips off bad metadata. It
     # looks like an obvious optimisation, which is why this says so.
     indices = resample_indices(n_src, src_fps, target_fps)
-    if len(indices) < 5:
-        clip_seconds = (n_src / src_fps) if src_fps else 0.0
-        window = f" trimmed to {trim[0]:.2f}-{trim[1]:.2f}s" if trim is not None else ""
-        raise ValueError(
-            f"reference video {path!r}{window} has only {len(indices)} frame(s) at {target_fps}fps "
-            f"(source: {n_src} frames, {clip_seconds:.2f}s) - MiniMax H3 needs at least 5"
-        )
+    _require_min_frames(path, trim, len(indices), n_src, src_fps, target_fps)
 
     out = result.sink.take(len(indices))
     fields["frames"] = len(indices)
@@ -738,12 +832,27 @@ def _decode_video(path, target_fps, crop, trim, fields):
     return out, result.audio
 
 
-def _decode_pass(path, target_fps, crop, start_time, duration, *, n_src_hint, want_audio):
+def _require_min_frames(path, trim, n_out, n_src, src_fps, target_fps) -> None:
+    if n_out < 5:
+        clip_seconds = (n_src / src_fps) if src_fps else 0.0
+        window = f" trimmed to {trim[0]:.2f}-{trim[1]:.2f}s" if trim is not None else ""
+        raise ValueError(
+            f"reference video {path!r}{window} has only {n_out} frame(s) at {target_fps}fps "
+            f"(source: {n_src} frames, {clip_seconds:.2f}s) - MiniMax H3 needs at least 5"
+        )
+
+
+def _decode_pass(
+    path, target_fps, crop, start_time, duration, *, n_src_hint, want_audio, vlm_sink=None
+):
     """One demux pass: select, rotate, crop and fill, reproducing video_types.py:308-448.
 
     `n_src_hint` is the true source-frame count when a previous pass counted it, else
     None (the capacity comes from metadata, and may be absent or wrong). A pass with a
     hint never asks for another.
+
+    `vlm_sink(frame, img, crop, scale) -> (sink, box)` swaps the tensor for a `_VlmSink`,
+    which grows as it goes: no capacity, so no estimate, budget bust or recount.
     """
     import av
     import av.error
@@ -768,7 +877,9 @@ def _decode_pass(path, target_fps, crop, start_time, duration, *, n_src_hint, wa
             container.seek(start_pts, stream=video_stream)
 
         capacity = None
-        if n_src_hint is not None:
+        if vlm_sink is not None:
+            capacity = math.inf
+        elif n_src_hint is not None:
             capacity = _capacity_for(n_src_hint, src_fps, target_fps)
         else:
             estimate = _estimate_source_frames(container, video_stream, start_time, duration)
@@ -838,8 +949,14 @@ def _decode_pass(path, target_fps, crop, start_time, duration, *, n_src_hint, wa
                                 result.needs_recount = True
                                 result.reason = "capacity"
                             else:
-                                img = converter.convert(frame)
-                                if sink is None:
+                                img = (
+                                    converter.convert(frame)
+                                    if sink is None or sink.wants(next_out, count, frame)
+                                    else None
+                                )
+                                if sink is None and vlm_sink is not None:
+                                    sink, box = vlm_sink(frame, img, crop, converter.scale)
+                                elif sink is None:
                                     sink, box = _build_sink(
                                         img, capacity, crop, converter.scale,
                                         path=path, src_fps=src_fps,
@@ -850,7 +967,7 @@ def _decode_pass(path, target_fps, crop, start_time, duration, *, n_src_hint, wa
                                         result.needs_recount = True
                                         result.reason = "budget"
                                 if sink is not None:
-                                    sink.write(_cropped(img, box), count)
+                                    sink.write(None if img is None else _cropped(img, box), count)
                         # Retained unconditionally: the EOF clamp fills [next_out, n_out)
                         # from source frame n_src-1, which is not always itself selected
                         # (src_fps=12, target_fps=24, n_src=12 -> n_out=24, next_out=23).
@@ -875,7 +992,9 @@ def _decode_pass(path, target_fps, crop, start_time, duration, *, n_src_hint, wa
 
         n_out = len(resample_indices(n_seen, src_fps, target_fps)) if n_seen else 0
         if sink is not None and last_frame is not None and next_out < n_out:
-            sink.write(_cropped(converter.convert(last_frame), box), n_out - next_out)
+            tail = n_out - next_out
+            img = converter.convert(last_frame) if sink.wants(next_out, tail, last_frame) else None
+            sink.write(None if img is None else _cropped(img, box), tail)
 
         audio = collector.result()
         if audio is not None:
@@ -895,23 +1014,22 @@ def _build_sink(img, capacity, crop, scale, *, path, src_fps, estimated):
     capacity degrades to the count-first pass and the ceiling is enforced against the
     true `n_src` on the next one.
     """
-    height, width = int(img.shape[0]), int(img.shape[1])
-    box = _crop_box(crop, width, height) if crop is not None else None
-    if box is not None:
-        left, top, right, bottom = box
-        height, width = bottom - top, right - left
-
-    nbytes = capacity * height * width * 3 * 4
-    if nbytes > _decode_budget():
+    box, height, width = _sink_geometry(img, crop)
+    if capacity * height * width * 3 * 4 > _decode_budget():
         if estimated:
             return None, None
-        raise DecodeBudgetExceeded(
-            f"reference video {path!r} exceeds the decode budget: {src_fps:g}fps implies "
-            f"{capacity} frames of {width}x{height}, {nbytes / 2**30:.2f} GiB, against a "
-            f"limit of {_decode_budget() / 2**30:.2f} GiB "
-            f"(raise {_DECODE_BUDGET_ENV} to override)"
-        )
+        raise _budget_exceeded(path, src_fps, capacity, width, height)
     return _FrameSink(capacity, height, width, scale), box
+
+
+def _budget_exceeded(path, src_fps, capacity, width, height) -> DecodeBudgetExceeded:
+    nbytes = capacity * height * width * 3 * 4
+    return DecodeBudgetExceeded(
+        f"reference video {path!r} exceeds the decode budget: {src_fps:g}fps implies "
+        f"{capacity} frames of {width}x{height}, {nbytes / 2**30:.2f} GiB, against a "
+        f"limit of {_decode_budget() / 2**30:.2f} GiB "
+        f"(raise {_DECODE_BUDGET_ENV} to override)"
+    )
 
 
 # ---- one preparation per reference, per build ------------------------------------
@@ -947,8 +1065,33 @@ class MediaCache:
     same reference never see the same object.
     """
 
-    def __init__(self):
+    def __init__(self, *, vlm_only: bool = False):
         self._entries: dict[tuple[Any, ...], Any] = {}
+        # Set by a caller that wants no socket tensors, only the VLM's copy (the off-pod
+        # freezer): vlm_video() then streams a video it has not decoded yet straight to
+        # its encode size. A node build never sets it.
+        self.vlm_only = vlm_only
+
+    def vlm_video(
+        self, path: str, *, crop=None, trim=None, audio: bool = True
+    ) -> tuple[bytes, bool, bool]:
+        """(mp4 bytes, soundtrack muxed, soundtrack read): the VLM's copy of the pixels
+        `video()` serves for the same arguments.
+
+        Encoded from the 24 fps stack - decoding it if this build has not - unless the
+        cache is `vlm_only` and holds no stack, when `vlm_reference_mp4` streams the same
+        bytes without one. `audio=False` neither sends nor reads a soundtrack, so the
+        third value is then False.
+        """
+        stack = ("video", _abspath(path), _STACK_FPS, _cache_key(crop), _cache_key(trim))
+        if self.vlm_only and stack not in self._entries:
+            key = ("vlm_video", _abspath(path), _cache_key(crop), _cache_key(trim), bool(audio))
+            return self._get(
+                key, path, lambda: vlm_reference_mp4(path, crop=crop, trim=trim, audio=audio)
+            )
+        frames, sound = self.video(path, target_fps=_STACK_FPS, crop=crop, trim=trim)
+        data, muxed = encode_reference_mp4(frames, _STACK_FPS, sound if audio else None)
+        return data, muxed, audio and sound is not None
 
     def image(self, path: str, *, crop=None, max_edge: int = 0):
         key = ("image", _abspath(path), _cache_key(crop), int(max_edge))
@@ -1057,40 +1200,189 @@ def encode_reference_mp4(
     if n_src == 0:
         raise ValueError("cannot encode a reference video with no frames")
 
-    indices = resample_indices(n_src, src_fps, target_fps)
-    fps: float = target_fps
-    if len(indices) < _MIN_VLM_FRAMES:
-        indices = list(range(n_src))
-        fps = src_fps
-
+    indices, fps = _vlm_selection(n_src, src_fps, target_fps)
     height, width = int(frames[0].shape[0]), int(frames[0].shape[1])
+    out_w, out_h = _vlm_size(width, height, long_edge)
+    return _encode_vlm(
+        lambda: _stack_video_frames(frames, indices, out_w, out_h),
+        len(indices), fps, out_w, out_h, audio,
+    )
+
+
+# The rate `_build_content` decodes a reference at and hands `encode_reference_mp4`.
+_STACK_FPS = 24
+
+
+def vlm_reference_mp4(
+    path: str,
+    *,
+    crop=None,
+    trim=None,
+    audio: bool = True,
+    long_edge: int = VLM_VIDEO_LONG_EDGE,
+    target_fps: int = VLM_VIDEO_FPS,
+) -> tuple[bytes, bool, bool]:
+    """(mp4 bytes, soundtrack muxed, soundtrack read): byte for byte what
+    `encode_reference_mp4(*load_video(path, 24, crop, trim))` sends, without the stack.
+
+    For a prompt writer that needs nothing but the VLM's copy - the off-pod freezer, by
+    `MediaCache(vlm_only=True)` - where the 24 fps float32 stack is ~6 GB per 10 s of
+    1080p that the encode then shrinks to ~1 MB. The same `_decode_pass` cursor fills a
+    `_VlmSink`, so every kept slot holds the frame the stack holds there; the selection,
+    the five-frame minimum and the decode budget are the full path's, so a clip that
+    fails to load on a pod fails here too. `audio=False` leaves the soundtrack out of
+    the mp4, as a reference without an `<Audio N>` tag never sends it, but still decodes
+    it: the full path always does, and a soundtrack that fails to decode fails both.
+    """
+    import os
+
+    start_time, duration = _trim_window(trim)
+    with logs.timed("vlm_video", file=os.path.basename(path), crop=crop, trim=trim) as fields:
+        result = _decode_pass(
+            path, _STACK_FPS, crop, start_time, duration, n_src_hint=None, want_audio=True,
+            vlm_sink=lambda frame, img, crop_, scale: _VlmSink.build(
+                frame, img, crop_, scale, long_edge, target_fps
+            ),
+        )
+        n_src, src_fps = result.n_src, result.src_fps
+        # The budget before the five-frame minimum: the full path's exact pass raises it
+        # at its first frame, before the count the minimum is checked on exists.
+        _require_vlm_budget(path, result.sink, n_src, src_fps)
+        n_out = len(resample_indices(n_src, src_fps, _STACK_FPS))
+        _require_min_frames(path, trim, n_out, n_src, src_fps, _STACK_FPS)
+        sink = result.sink
+        fields["src_frames"] = n_src
+        fields["kept"] = len(sink.kept)
+
+    indices, fps = _vlm_selection(n_out, _STACK_FPS, target_fps)
+    sound = result.audio if audio else None
+    if len(set(indices)) < len(indices) or any(i not in sink.kept for i in indices):
+        # Unreachable at 8 fps, where the selection is every third slot, each once. Above
+        # 24 fps a slot repeats, and one kept frame cannot be encoded twice (the encode
+        # stamps its pts), so a change of rate degrades to the full path instead.
+        logs.warn("vlm_video_fallback", file=os.path.basename(path))
+        frames, full_sound = load_video(path, _STACK_FPS, crop=crop, trim=trim)
+        data, muxed = encode_reference_mp4(
+            frames, _STACK_FPS, full_sound if audio else None,
+            long_edge=long_edge, target_fps=target_fps,
+        )
+        return data, muxed, audio and full_sound is not None
+    data, muxed = _encode_vlm(
+        lambda: (sink.kept[i] for i in indices),
+        len(indices), fps, sink.out_w, sink.out_h, sound,
+    )
+    return data, muxed, audio and result.audio is not None
+
+
+def _require_vlm_budget(path, sink, n_src, src_fps) -> None:
+    """Raise what the full path's exact pass raises for the stack `sink` stands in for."""
+    if sink is None:
+        return
+    capacity = _capacity_for(n_src, src_fps, _STACK_FPS)
+    if capacity * sink.height * sink.width * 3 * 4 > _decode_budget():
+        raise _budget_exceeded(path, src_fps, capacity, sink.width, sink.height)
+
+
+class _FirstFrame(Exception):
+    """Ends `video_frame_size`'s pass at the frame that sizes the stack."""
+
+    def __init__(self, width: int, height: int):
+        super().__init__(width, height)
+        self.width, self.height = width, height
+
+
+def video_frame_size(path: str, crop=None, trim=None) -> tuple[int, int]:
+    """(width, height) of the frames `load_video(path, crop=crop, trim=trim)` emits: what
+    `match_video_aspect` reads off the tensor, for a caller that has no tensor (the
+    off-pod freezer).
+
+    From the decoder's own pass, stopped at the first frame of the window, which is the
+    one the stack is sized from. The probe's size is the file's first decodable frame,
+    so it is wrong for a stream whose size changes before the trim, and unrotated when
+    that frame fails to decode.
+    """
+    start_time, duration = _trim_window(trim)
+
+    def first(frame, img, crop_, scale):
+        _box, height, width = _sink_geometry(img, crop_)
+        raise _FirstFrame(width, height)
+
+    try:
+        _decode_pass(
+            path, _STACK_FPS, crop, start_time, duration, n_src_hint=None, want_audio=False,
+            vlm_sink=first,
+        )
+    except _FirstFrame as size:
+        return size.width, size.height
+    window = f" in {trim[0]:.2f}-{trim[1]:.2f}s" if trim is not None else ""
+    raise ValueError(f"reference video {path!r} decoded no frame{window}")
+
+
+def _vlm_selection(n_src: int, src_fps: float, target_fps: int) -> tuple[list[int], float]:
+    """(stack indices, output fps) the VLM's copy is encoded from."""
+    indices = resample_indices(n_src, src_fps, target_fps)
+    if len(indices) < _MIN_VLM_FRAMES:
+        return list(range(n_src)), src_fps
+    return indices, target_fps
+
+
+def _vlm_size(width: int, height: int, long_edge: int) -> tuple[int, int]:
     scale = min(1.0, long_edge / max(width, height))
     # h264 needs even dimensions. `dim & ~1` rather than `dim - dim % 2` because
     # _crop_box guarantees only that a box is never zero-width: a legal 1px crop would
     # build a 0-sized encoder through the subtraction and avcodec_open2 fails EINVAL.
-    out_w = max(2, int(width * scale) & ~1)
-    out_h = max(2, int(height * scale) & ~1)
+    return max(2, int(width * scale) & ~1), max(2, int(height * scale) & ~1)
 
-    with logs.timed(
-        "video_bytes", w=out_w, h=out_h, fps=fps, frames=len(indices)
-    ) as fields:
+
+def _vlm_rgb(img, scale: bool):
+    """One cropped decoded frame -> the uint8 the stack path's encode reads for it:
+    `_FrameSink.write`'s float32 0..1, then `_chunk_to_uint8`."""
+    import torch
+
+    tensor = torch.from_numpy(img)
+    tensor = tensor.float().div_(255.0) if scale else tensor.to(torch.float32)
+    return _chunk_to_uint8(tensor)
+
+
+def _vlm_video_frame(rgb, out_w: int, out_h: int):
+    import av
+    import numpy as np
+
+    # Downscale with swscale, AFTER the uint8 conversion: measured 3.97s for 80 1080p
+    # frames against 6.35s for a resize-first OpenCV variant on the same real data, and
+    # PyAV is already a hard dependency where OpenCV is not a ComfyUI core one.
+    return av.VideoFrame.from_ndarray(np.ascontiguousarray(rgb), format="rgb24").reformat(
+        width=out_w, height=out_h, format="yuv420p"
+    )
+
+
+def _stack_video_frames(frames, indices, out_w: int, out_h: int):
+    for start in range(0, len(indices), _ENCODE_CHUNK):
+        block = _chunk_to_uint8(frames[indices[start : start + _ENCODE_CHUNK]])
+        for i in range(block.shape[0]):
+            yield _vlm_video_frame(block[i], out_w, out_h)
+
+
+def _encode_vlm(make_frames, count, fps, out_w, out_h, audio) -> tuple[bytes, bool]:
+    """Encode the `count` frames of `make_frames()`; rebuilt video-only, from a second
+    call, when the soundtrack fails after the header (_AudioMuxFailed)."""
+    with logs.timed("video_bytes", w=out_w, h=out_h, fps=fps, frames=count) as fields:
         try:
-            data, muxed = _encode_mp4(frames, indices, fps, out_w, out_h, audio)
+            data, muxed = _encode_mp4(make_frames(), fps, out_w, out_h, audio)
         except _AudioMuxFailed as e:
             logs.warn("video_audio_dropped", stage="encode", error=str(e))
-            data, muxed = _encode_mp4(frames, indices, fps, out_w, out_h, None)
+            data, muxed = _encode_mp4(make_frames(), fps, out_w, out_h, None)
         fields["bytes"] = len(data)
         fields["audio"] = muxed
         return data, muxed
 
 
-def _encode_mp4(frames, indices, fps, out_w, out_h, audio) -> tuple[bytes, bool]:
+def _encode_mp4(video_frames, fps, out_w, out_h, audio) -> tuple[bytes, bool]:
     """One pass: build the container, declare every stream, then write."""
     import io
     from fractions import Fraction
 
     import av
-    import numpy as np
 
     buf = io.BytesIO()
     container = av.open(buf, "w", format="mp4")
@@ -1102,18 +1394,9 @@ def _encode_mp4(frames, indices, fps, out_w, out_h, audio) -> tuple[bytes, bool]
         # EVERY output stream must exist before the first mux(). See _AudioMuxFailed.
         sound = None if audio is None else _open_audio_stream(container, audio)
 
-        for start in range(0, len(indices), _ENCODE_CHUNK):
-            block = _chunk_to_uint8(frames[indices[start : start + _ENCODE_CHUNK]])
-            for i in range(block.shape[0]):
-                # Downscale with swscale, AFTER the uint8 conversion: measured 3.97s for
-                # 80 1080p frames against 6.35s for a resize-first OpenCV variant on the
-                # same real data, and PyAV is already a hard dependency where OpenCV is
-                # not a ComfyUI core one.
-                frame = av.VideoFrame.from_ndarray(
-                    np.ascontiguousarray(block[i]), format="rgb24"
-                ).reformat(width=out_w, height=out_h, format="yuv420p")
-                for packet in video.encode(frame):
-                    container.mux(packet)
+        for frame in video_frames:
+            for packet in video.encode(frame):
+                container.mux(packet)
         for packet in video.encode():
             container.mux(packet)
 
