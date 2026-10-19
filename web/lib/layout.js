@@ -60,7 +60,7 @@ export const CONTENT = {
     // 1.53.6); the block fills the container.
     frameH: 20,
     uploadsH: 30, // minimum toolbar height
-    promptH: 880, // default prompt height
+    promptH: 300, // default prompt height; resize the node to read a long shot prompt whole
     minPromptH: 110,
     scrollbarH: 16,
     originalH: 88, // label + .mmrp-original — keeps the idea after Auto Prompt rewrites direction
