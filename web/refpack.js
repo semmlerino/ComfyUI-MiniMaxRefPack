@@ -124,7 +124,7 @@ import { editSummary, hasEdit } from "./lib/edits.js";
 import { installInputControls } from "./lib/inputs.js";
 import {
     CANVAS_ROWS, CAPS, CL, CONTENT, KINDS, SECTION_LABEL,
-    blockSize, defaultSize, installSizeGuards, nodeSize,
+    addBlockWidget, defaultSize, installSizeGuards, nodeSize,
 } from "./lib/layout.js";
 import { mdebug, mlog, mwarn } from "./lib/log.js";
 import { appendFileOptions, createPlannerModal } from "./lib/modal.js";
@@ -1843,7 +1843,7 @@ function syncLocalBtn(node) {
             setWidgetVisible(widgetByName(node, field), provider === name);
         }
     }
-    // last_y only settles after litegraph's next layout pass, so re-assert on the frame
+    // The block's y only settles after litegraph's next layout pass, so re-assert on the frame
     // after rather than reading a stale height now.
     if (node.setSize) {
         setTimeout(() => {
@@ -2188,9 +2188,7 @@ app.registerExtension({
             // threshold the overlay stops taking pointer events, and a drop on the
             // zoomed-out node then lands on the litegraph canvas and gets hijacked into
             // a LoadImage node. Keeping the overlay live is what stops that.
-            const domWidget = node.addDOMWidget("mmrp_block", "custom", bodyEl, { serialize: false, hideOnZoom: false });
-            node._mmrpDomWidget = domWidget;
-            domWidget.computeSize = () => blockSize(node);
+            addBlockWidget(node, bodyEl, { serialize: false, hideOnZoom: false });
             liveNodes.add(node);
 
             node._mmrpBody.directionInput.value = directionWidget ? directionWidget.value || "" : "";
@@ -2268,6 +2266,7 @@ app.registerExtension({
                     this._mmrpBody.originalInput.value = ow ? ow.value || "" : "";
                 }
                 this._mmrpSelected = null;
+                if (info && info.size) this._mmrpRestored = true;
                 // configure() writes the serialized size straight onto node.size,
                 // bypassing our setSize wrapper — preserve it within content minimums.
                 this.setSize(nodeSize(this));
@@ -2275,9 +2274,10 @@ app.registerExtension({
                 return out;
             };
 
-            // last_y settles after the first layout; grow only if content needs room.
+            // The block's y is known only after the first layout pass: a new node takes
+            // its default size again from the real y, a restored one keeps its saved size.
             setTimeout(() => {
-                node.setSize(nodeSize(node));
+                node.setSize(node._mmrpRestored ? nodeSize(node) : defaultSize(node));
                 app.graph?.setDirtyCanvas(true, true);
                 scheduleDraw(node);
             }, 50);

@@ -55,9 +55,10 @@ export const CONTENT = {
     width: 1340,
     minWidth: 600,
     pad: 10, // side inset of the DOM block within the node
-    // The frontend insets the DOM widget's container 10px below last_y and ends it
-    // 16px above the node's bottom (measured, frontend 1.53.6); the block fills it.
-    frameH: 26,
+    // The frontend gives the DOM widget the node height left below its arranged y and
+    // insets the container by the widget's 10px margin at top and bottom (frontend
+    // 1.53.6); the block fills the container.
+    frameH: 20,
     uploadsH: 30, // minimum toolbar height
     promptH: 880, // default prompt height
     minPromptH: 110,
@@ -69,12 +70,19 @@ CONTENT.height =
     CONTENT.uploadsH + CANVAS_ROWS.height + CONTENT.scrollbarH + CONTENT.promptH
     + CONTENT.gap * 4 + CONTENT.originalH;
 
+// y is set by the frontend's layout pass; last_y only by the next draw, so it lags a
+// widget that moved and is unset on a node not yet drawn.
 function widgetTop(node) {
-    return node._mmrpDomWidget?.last_y || 80;
+    const widget = node._mmrpDomWidget;
+    return widget?.y || widget?.last_y || 80;
 }
 
 function minimumBlockHeight(node) {
-    const toolbarH = node._mmrpBody?.uploadRow?.offsetHeight || CONTENT.uploadsH;
+    // Until the frontend first positions it the widget's container is 0px wide, which
+    // wraps every toolbar button onto its own row (296px); only a toolbar with a width
+    // has its real height.
+    const row = node._mmrpBody?.uploadRow;
+    const toolbarH = (row?.offsetWidth && row.offsetHeight) || CONTENT.uploadsH;
     return CONTENT.height - CONTENT.promptH + CONTENT.minPromptH + toolbarH - CONTENT.uploadsH;
 }
 
@@ -97,9 +105,17 @@ export function nodeSize(node, requested = node.size) {
     return min.map((floor, i) => Math.max(floor, Number.isFinite(requested?.[i]) ? requested[i] : fallback[i]));
 }
 
-export function blockSize(node) {
-    const size = nodeSize(node);
-    return [size[0] - CONTENT.pad * 2, size[1] - widgetTop(node) - CONTENT.pad];
+// The block reports only a minimum height. The frontend's layout pass gives it all the
+// height left below its y and grows the node only when that is less, so the block's
+// size never feeds back into the node's. A computeSize derived from node.size did:
+// before the first draw it measured from the fallback top, and every layout pass grew
+// the node by the difference (620px twice per new or reloaded node).
+export function addBlockWidget(node, element, options) {
+    node._mmrpDomWidget = node.addDOMWidget("mmrp_block", "custom", element, {
+        ...options,
+        getMinHeight: () => minimumBlockHeight(node) + CONTENT.frameH,
+    });
+    return node._mmrpDomWidget;
 }
 
 export function installSizeGuards(node, resized) {
