@@ -227,7 +227,9 @@ class MiniMaxH3ReferencePack:
                 "openrouter_model": (prompt.available_models(), {
                     "default": prompt.DEFAULT_MODEL,
                     "tooltip": "Used only when prompt_provider is 'openrouter'. Lists "
-                               "models that accept text, images, audio and video.",
+                               "models that accept text, images, audio and video, then "
+                               "models that take text and images only (Grok, Claude, "
+                               "GPT): those get videos as still frames and no audio.",
                 }),
 
                 # OpenRouter-only, so it lives in the OpenRouter group and hides with it.

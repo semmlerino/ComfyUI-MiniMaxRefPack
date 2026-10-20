@@ -31,17 +31,22 @@ def _models_payload(entries):
     return {"data": entries}
 
 
-def _model(model_id, modalities):
-    return {"id": model_id, "architecture": {"input_modalities": modalities}}
+def _model(model_id, modalities, outputs=None):
+    arch = {"input_modalities": modalities}
+    if outputs is not None:
+        arch["output_modalities"] = outputs
+    return {"id": model_id, "architecture": arch}
 
 
 @pytest.fixture(autouse=True)
 def _reset_models_cache():
     prompt._models_cache = None
     prompt._models_cache_at = 0.0
+    prompt._model_inputs = {}
     yield
     prompt._models_cache = None
     prompt._models_cache_at = 0.0
+    prompt._model_inputs = {}
 
 
 def img(name):
@@ -83,19 +88,21 @@ def fake_load_video_no_audio(path, target_fps=24, crop=None, trim=None):
 # ---- available_models: modality filter --------------------------------------
 
 
-def test_filters_to_the_four_modality_superset(monkeypatch):
+def test_lists_full_house_models_first_then_text_image_models(monkeypatch):
+    """Text+image models (Grok, Claude, GPT) are listed after every model that takes all
+    four modalities, so the full tier keeps its place at the top of the dropdown."""
     payload = _models_payload(
         [
+            _model("aaa/text-image-only", ["text", "image", "file"], ["text"]),
             _model(prompt.DEFAULT_MODEL, ["text", "image", "file", "audio", "video"]),
-            _model("some/text-image-only", ["text", "image"]),
             _model("some/full-house", ["text", "image", "audio", "video"]),
+            _model("zzz/text-only", ["text"]),
+            _model("some/image-generator", ["text", "image"], ["image"]),
         ]
     )
     monkeypatch.setattr(prompt.requests, "get", lambda *a, **k: FakeResponse(200, payload))
     models = prompt.available_models()
-    assert "some/text-image-only" not in models
-    assert prompt.DEFAULT_MODEL in models
-    assert "some/full-house" in models
+    assert models == [prompt.DEFAULT_MODEL, "some/full-house", "aaa/text-image-only"]
 
 
 def test_default_model_is_sorted_first_when_present(monkeypatch):
@@ -123,6 +130,30 @@ def test_available_models_caches_between_calls(monkeypatch):
     prompt.available_models()
     prompt.available_models()
     assert len(calls) == 1
+
+
+def test_model_accepts_narrows_openrouter_to_what_the_model_takes(monkeypatch):
+    payload = _models_payload(
+        [
+            _model("x-ai/grok-4.7", ["text", "image", "file"], ["text"]),
+            _model("some/full-house", ["text", "image", "audio", "video"]),
+        ]
+    )
+    monkeypatch.setattr(prompt.requests, "get", lambda *a, **k: FakeResponse(200, payload))
+    openrouter = prompt._endpoint.resolve("openrouter")
+    assert prompt._model_accepts("x-ai/grok-4.7", openrouter) == frozenset({"text", "image"})
+    assert prompt._model_accepts("some/full-house", openrouter) == openrouter.accepts
+
+
+def test_model_accepts_keeps_the_endpoint_set_for_an_unknown_model(monkeypatch):
+    """A model the list never reported (the list fetch failed, or a hand-typed id) keeps
+    today's full payload rather than silently losing its video and audio."""
+    def boom(*a, **k):
+        raise requests.exceptions.ConnectionError("down")
+
+    monkeypatch.setattr(prompt.requests, "get", boom)
+    openrouter = prompt._endpoint.resolve("openrouter")
+    assert prompt._model_accepts("x-ai/grok-4.7", openrouter) == openrouter.accepts
 
 
 # ---- available_models: must never raise, must never hang --------------------

@@ -80,6 +80,8 @@ Leave `openrouter_api_key` empty. Local servers ignore it, and the node will not
 
 **What you give up.** A local server takes text and images, not video or audio. So a reference video is sent as 6 still frames from across the clip, and no audio is sent at all, neither a video's soundtrack nor a standalone clip. The writer is told this and is instructed not to describe motion, cut rhythm or voices it was never given. Expect a weaker prompt than `openrouter` produces, especially for anything that depends on sound. The node says so on the canvas, in the log, and in the `debug` output, so you are never guessing which path ran.
 
+**Image-only OpenRouter models.** The `openrouter_model` dropdown lists every model that takes text, images, audio and video first, then the models that take only text and images (Grok, Claude, GPT and others). A model from the second group gets exactly the `local` treatment above: videos as 6 still frames, no audio, and the same DEGRADED line in the log and the `debug` output.
+
 Each provider reads its own model field and cannot see the other's: `openrouter` reads the `openrouter_model` dropdown, `local` reads `local_model_slug`. That is deliberate. A single shared field meant that configuring a local run and switching back to `openrouter` sent your local model id to OpenRouter, which answered `400: ... is not a valid model ID`.
 
 ## Install

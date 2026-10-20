@@ -11,6 +11,7 @@ or a returned string. No retry framework, no keyring, no proxy layer.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import io
 import math
 import os
@@ -44,6 +45,10 @@ _MODELS_TIMEOUT = 5
 _CHAT_TIMEOUT = 120
 
 _REQUIRED_MODALITIES = {"text", "image", "audio", "video"}
+# The second tier: models that see stills but not video or audio (Grok, Claude, GPT on
+# OpenRouter, 2026-10-20). They get the same degraded payload as `local` - a clip as
+# still frames, no audio - so they are listed after every full-house model.
+_STILLS_MODALITIES = {"text", "image"}
 _MODELS_CACHE_TTL = 3600
 
 # Never invent extra ids here — this is the "the models endpoint is unreachable"
@@ -112,6 +117,9 @@ _CLASSIFY_SYSTEM = (
 
 _models_cache: list[str] | None = None
 _models_cache_at: float = 0.0
+# Every listed model's reported input modalities, filled with the list. write_prompt
+# reads it to send an image-only model the degraded payload.
+_model_inputs: dict[str, frozenset] = {}
 
 
 class PromptError(RuntimeError):
@@ -122,7 +130,8 @@ class PromptError(RuntimeError):
 
 
 def available_models(ep=None) -> list[str]:
-    """Models whose input_modalities is a superset of {text,image,audio,video}.
+    """Models whose input_modalities is a superset of {text,image,audio,video}, then the
+    text-out models that take {text,image} but not both of video and audio.
 
     Never raises and never hangs: short timeout, and on any failure (network,
     bad body, empty result) falls back to a hardcoded list headed by DEFAULT_MODEL.
@@ -138,7 +147,7 @@ def available_models(ep=None) -> list[str]:
     if not ep.is_openrouter:
         return list(_FALLBACK_MODELS)
 
-    global _models_cache, _models_cache_at
+    global _models_cache, _models_cache_at, _model_inputs
     now = time.time()
     if _models_cache is not None and (now - _models_cache_at) < _MODELS_CACHE_TTL:
         return _models_cache
@@ -147,24 +156,43 @@ def available_models(ep=None) -> list[str]:
         resp = requests.get(ep.models_url, timeout=ep.models_timeout)
         resp.raise_for_status()
         data = resp.json().get("data", [])
-        models = sorted(
-            {
-                m["id"]
-                for m in data
-                if isinstance(m, dict)
-                and m.get("id")
-                and _REQUIRED_MODALITIES <= set((m.get("architecture") or {}).get("input_modalities") or [])
-            }
-        )
+        inputs: dict[str, frozenset] = {}
+        full: set[str] = set()
+        stills: set[str] = set()
+        for m in data:
+            if not (isinstance(m, dict) and m.get("id")):
+                continue
+            arch = m.get("architecture") or {}
+            accepts = frozenset(arch.get("input_modalities") or [])
+            if _REQUIRED_MODALITIES <= accepts:
+                full.add(m["id"])
+            elif _STILLS_MODALITIES <= accepts and "text" in (arch.get("output_modalities") or ["text"]):
+                stills.add(m["id"])
+            else:
+                continue
+            inputs[m["id"]] = accepts
+        models = sorted(full) + sorted(stills)
         if not models:
             raise ValueError("no models matched the modality filter")
         if DEFAULT_MODEL in models:
             models = [DEFAULT_MODEL] + [m for m in models if m != DEFAULT_MODEL]
         _models_cache = models
         _models_cache_at = now
+        _model_inputs = inputs
         return models
     except Exception:
         return list(_FALLBACK_MODELS)
+
+
+def _model_accepts(model: str, ep) -> frozenset:
+    """What `model` on `ep` can take: the endpoint's set, narrowed by the model's own
+    reported modalities on OpenRouter. A model the list never reported keeps the
+    endpoint's set, so a failed list fetch never strips video and audio silently."""
+    if not ep.is_openrouter:
+        return ep.accepts
+    available_models(ep)
+    reported = _model_inputs.get(model)
+    return ep.accepts if reported is None else ep.accepts & reported
 
 
 # ---- key resolution -----------------------------------------------------------
@@ -853,6 +881,7 @@ def write_prompt(
     stubs in tests/test_nodes.py that patch THIS name, sending every one of them into
     the real writer and out to live HTTP."""
     ep = _endpoint.resolve(provider, api_base)
+    ep = dataclasses.replace(ep, accepts=_model_accepts(model, ep))
     key = _key_for(ep, api_key)
 
     explicit_plan = task_plan.resolve(references)
@@ -932,7 +961,7 @@ def write_prompt(
         if ep.degrades:
             missing = ", ".join(sorted(_DEFAULT_ENDPOINT.accepts - ep.accepts))
             routing += (
-                f"\nDEGRADED: this endpoint does not accept {missing}. Videos were sent "
+                f"\nDEGRADED: {model} on {ep.describe()} does not accept {missing}. Videos were sent "
                 f"as {_DEGRADED_FRAMES} still frames and no audio was sent at all."
             )
         debug.append(routing + "\n" + render_payload(payload, ep))

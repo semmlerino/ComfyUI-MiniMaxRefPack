@@ -265,3 +265,35 @@ def test_the_render_carries_direction_target_format_and_manifest(fake_media, tmp
 
 def test_the_system_prompt_is_shown_in_full(fake_media, tmp_path):
     assert "SYSTEM RULES" in _rendered(tmp_path)
+
+
+def test_an_image_only_openrouter_model_degrades_like_local(fake_media, tmp_path, monkeypatch):
+    """Grok on OpenRouter takes text and images only: its video goes as still frames, no
+    audio is sent, and the debug output says so - the same contract as `local`."""
+    monkeypatch.setattr(prompt, "_model_inputs", {
+        "x-ai/grok-4.7": frozenset({"text", "image", "file"}),
+    })
+    monkeypatch.setattr(prompt, "_models_cache", ["x-ai/grok-4.7"])
+    monkeypatch.setattr(prompt, "_models_cache_at", float("inf"))
+    posted = []
+
+    def fake_post(url, json=None, **k):
+        posted.append((url, json))
+        return type("R", (), {
+            "status_code": 200, "headers": {},
+            "json": lambda self: {"choices": [{"message": {"content": "ok"}}]},
+        })()
+
+    monkeypatch.setattr(prompt.requests, "post", fake_post)
+    sink = []
+    prompt.write_prompt(
+        references=_one_of_each(tmp_path), input_dir=str(tmp_path), direction="go",
+        api_key="k", model="x-ai/grok-4.7", job_type="standard", debug=sink,
+    )
+    url, payload = posted[-1]
+    assert url.startswith(ep.OPENROUTER_BASE)
+    kinds = _kinds(payload["messages"][1]["content"])
+    assert "video_url" not in kinds and "input_audio" not in kinds
+    assert kinds.count("image_url") == 1 + prompt._DEGRADED_FRAMES
+    assert "DEGRADED" in sink[0] and "x-ai/grok-4.7" in sink[0]
+    assert "reasoning" in payload
